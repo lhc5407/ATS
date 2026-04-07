@@ -1,0 +1,83 @@
+{
+    "api_keys": {
+        "access_key": "upbit_access_key",
+        "secret_key": "upbit_secret_key",
+        "gemini_api_key": "gemini_api_key"
+    },
+    "telegram": {
+        "token": "bot_token",
+        "chat_id": "user_id"
+    },
+    "strategy": {
+        "tickers": [],
+        "sleep_depth_threshold": 0,
+        "btc_short_term_vol_threshold": 0.8,
+        "pass_score_threshold": 80,
+        "guard_score_threshold": 58,
+        "sell_score_threshold": 35,
+        "success_reference_count": 7,
+        "failure_reference_count": 7,
+        "max_concurrent_trades": 5,
+        "risk_per_trade": 1.5,
+        "fgi_v_curve_bottom": 40.0,
+        "fgi_v_curve_max": 2.5,  
+        "fgi_v_curve_min": 0.4,
+        "fgi_v_curve_greed_max": 1.0,
+        "scoring_modifiers": {
+            "bonus_golden_combo": 35, 
+            "bonus_mtf_panic_dip": 25,
+            "bonus_btc_panic_dip": 20,
+            "bonus_st_oversold_bounce": 20,
+            "penalty_st_downtrend": -5, 
+            "penalty_rs_weakness": -25
+        },
+        "indicator_weights": {
+            "z_score": 2.0,
+            "volume": 2.0,
+            "rsi": 2.0,
+            "bollinger": 2.0, 
+            "macd": 1.5,
+            "stochastics": 1.8,
+            "ssl_channel": 1.5,
+            "supertrend": 0.5, 
+            "vwap": 1.5
+        },
+        "trend_active_logic": [
+            "z_score", "volume", "rsi", "bollinger", "macd", "stochastics"
+        ],
+        "range_active_logic": [
+            "rsi", "bollinger", "stochastics", "ssl_channel", "vwap", "z_score"
+        ],
+        "high_vol_params": {
+            "target_atr_multiplier": 5.0,
+            "stop_loss": -3.0,
+            "atr_mult": 3.0,
+            "timeout_candles": 3, 
+            "adaptive_breakeven_buffer": 0.005,
+            "adx_strong_trend_threshold": 30.0
+        },
+        "mid_vol_params": {
+            "target_atr_multiplier": 3.5,
+            "stop_loss": -2.0,
+            "atr_mult": 2.8,
+            "timeout_candles": 4,
+            "adaptive_breakeven_buffer": 0.005,
+            "adx_strong_trend_threshold": 22.0
+        },
+        "major_params": {
+            "target_atr_multiplier": 3.0,
+            "stop_loss": -1.5,
+            "atr_mult": 2.8,
+            "timeout_candles": 5,
+            "adaptive_breakeven_buffer": 0.005,
+            "adx_strong_trend_threshold": 18.0
+        },
+        "interval": "minute15",
+        "deep_scan_interval": 1200,
+        "max_slippage_pct": 0.3,
+        "rsi_low_threshold": 30.0,
+        "rsi_high_threshold": 65.0,
+        "vol_factor": 2.5,
+        "exit_plan_guideline": "매수 진입 후 1.0% 이상의 수익 발생 시, 즉시 손절가를 본절 위로 이동시키는 'Rapid Breakeven Lock'을 가동합니다. 바닥 잡기 전략이므로 타임아웃 캔들 내에 강한 V자 반등이 나오지 않으면 즉시 'Time-Decay'로 털고 나옵니다."
+    }
+}
