@@ -1718,7 +1718,6 @@ async def run_full_scan(is_deep_scan=False):
     SYSTEM_STATUS = new_status 
 
     if is_deep_scan: 
-        await send_msg(f"🕵️ <b>시장 Regime 감지</b>: {new_status} 모드 가동")
         # 🟢 [추가] 딥 스캔 시 거래대금 상위 종목 리스트를 갱신하여 최신 유동성 반영
         await update_top_volume_tickers()
 
