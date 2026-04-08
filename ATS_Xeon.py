@@ -1815,7 +1815,7 @@ async def run_full_scan(is_deep_scan=False):
         if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
         
         # 🟢 mode 변수를 그대로 넘겨줍니다.
-        python_passed.append({"t": t, "score": score, "data": curr, "mtf": await get_mtf_trend(t), "mode": mode})
+        python_passed.append({"t": t, "score": score, "data": curr, "prev_data": prev, "mtf": await get_mtf_trend(t), "mode": eval_mode})
 
     # 🟢 [수정 5] for 루프 종료 후, LATEST_TOP_PASS_SCORE 덮어쓰기!
     LATEST_TOP_PASS_SCORE = current_loop_max_score
@@ -1845,6 +1845,16 @@ async def run_full_scan(is_deep_scan=False):
         ai_data = extract_ai_essential_data(p['data'].to_dict()) if hasattr(p['data'], 'to_dict') else p['data']
         ai_data['strategy_mode'] = p['mode']
         ai_data['python_pass_score'] = p['score']
+        
+        # 🟢 추가 로직: AI의 눈을 뜨게 해줄 필수 데이터 공급
+        ai_data['prev_close'] = p['prev_data'].get('close', '알수없음') if isinstance(p.get('prev_data'), dict) else '알수없음'
+        
+        ob = await execute_upbit_api(pyupbit.get_orderbook, p['t'])
+        if ob and 'total_bid_size' in ob and 'total_ask_size' in ob:
+            tb, ta = ob['total_bid_size'], ob['total_ask_size']
+            ai_data['ob_imbalance'] = round(ta / tb, 2) if tb > 0 else "알수없음"
+        else:
+            ai_data['ob_imbalance'] = "알수없음"
         
         ana = await ai_analyze(p['t'], ai_data, mode="BUY", eval_mode=p['mode'], ignore_cooldown=True, mtf_trend=p['mtf'], market_regime=regime)
         if ana and ana['decision'] == "BUY":
@@ -2698,11 +2708,20 @@ async def main():
                         btc_buy_p = t.get('btc_buy_price', btc_sell_p)
                         btc_change = ((btc_sell_p - btc_buy_p) / btc_buy_p * 100) if btc_buy_p > 0 else 0
                         
+                        elapsed_sec = now_ts - t.get('buy_ts', now_ts)
+                        
+                        # 🟢 [해결 완료] 현재 코인의 데이터를 바탕으로 max_p_rate를 즉석에서 안전하게 재계산합니다!
+                        invested_high_krw = avg_p * 1.0005
+                        earned_high_krw = t.get('high_p', avg_p) * 0.9995
+                        max_p_rate_local = ((earned_high_krw - invested_high_krw) / invested_high_krw) * 100 if invested_high_krw > 0 else 0.0
+                        
                         analyze_payload = {
                             'p_rate': round(p_rate, 2), 'buy_ind': t.get('buy_ind'), 'sell_ind': curr.to_dict() if curr is not None else {},
                             'actual_sell_reason': sell_reason_str, 'original_buy_reason': t.get('buy_reason', ''), 'original_exit_plan': t.get('exit_plan', {}),
-                            'btc_buy_price': btc_buy_p, 'btc_sell_price': btc_sell_p, 'btc_change': btc_change,
-                            'strategy_mode': t.get('strategy_mode', 'QUANTUM')
+                            'btc_buy_price': btc_buy_p, 'btc_sell_price': btc_sell_p, 'btc_change': round(btc_change, 2),
+                            'strategy_mode': t.get('strategy_mode', 'QUANTUM'),
+                            'max_p_rate': round(max_p_rate_local, 2), # 🟢 즉석에서 구한 값을 매칭!
+                            'elapsed_min': int(elapsed_sec / 60)
                         }
                         
                         last_sell_time[ticker] = now_ts
