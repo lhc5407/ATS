@@ -280,6 +280,43 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
         'volume': 1.0 + (1.5 * normalized_regime_val)
     }
 
+# 🟢 [신규 추가] 중복을 제거한 공통 펀더멘탈 채점 엔진
+def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend):
+    eval_mode = determine_eval_mode(current_regime_mode, curr_i)
+    logic_list = get_logic_list_for_mode(eval_mode, curr_i) 
+    indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
+    weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
+    
+    earned_score, total_w = 0.0, 0.0
+    curr_close = safe_float(curr_i.get('close'))
+    
+    for name in logic_list:
+        w = safe_float(weights.get(name, 1.0), 1.0)
+        m = safe_float(indicator_mults.get(name, 1.0), 1.0)
+        s = safe_float(get_strategy_score(name, prev_i, curr_i, curr_close, mode=eval_mode), 0.0)
+        earned_score += (s * m * w)
+        total_w += (m * w)
+    
+    score = int(earned_score / total_w) if total_w > 0 else 0
+
+    current_score_mods = get_dynamic_strat_value('scoring_modifiers', mode=eval_mode, default={})
+    if eval_mode == "QUANTUM":
+        if curr_close >= safe_float(curr_i.get('bb_u')): score += current_score_mods.get('bonus_volume_explosion', 30)
+        if btc_short_trend == "단기 하락": score += current_score_mods.get('penalty_btc_weakness', -15)
+    else: # CLASSIC
+        if fgi_val <= 35 and safe_float(curr_i.get('rsi')) < 35: score += current_score_mods.get('bonus_golden_combo', 35)
+        if btc_short_trend == "단기 하락": score += current_score_mods.get('bonus_btc_panic_dip', 10)
+        if curr_i.get('ST_DIR', 1) == -1 and safe_float(curr_i.get('rsi')) < 35: score += current_score_mods.get('bonus_st_oversold_bounce', 10)
+
+    fatal_flaw = False
+    if eval_mode == "QUANTUM":
+        if curr_i.get('ST_DIR', 1) == -1 or curr_close < curr_i.get('sma_long', 0): fatal_flaw = True
+    else: # CLASSIC
+        if safe_float(curr_i.get('rsi')) > 55 or safe_float(curr_i.get('macd_h_diff')) < -safe_float(curr_i.get('macd_h_diff_sma'), 0) * 0.5: fatal_flaw = True 
+    
+    score = max(0, min(100, score))
+    return score, fatal_flaw, eval_mode
+
 # 🟢 [FIX: 슬리피지 수학 공식 교정] 원화(KRW)를 기준으로 몇 개의 코인을 샀는지 부피(Volume)를 역산하여 정확한 VWAP 산출
 async def calculate_expected_slippage(ticker, buy_amt_krw):
     """호가창 5호가 뎁스를 확인하여 체결 물량(Volume) 기반으로 예상 슬리피지(%)를 정확히 계산합니다."""
@@ -595,6 +632,19 @@ async def get_performance_stats_db():
     total_profit = sum(t['profit_krw'] for t in history)
     return win_rate, total_cnt, len(wins), total_profit, wins, losses
 
+# [OHLCV 정리용 헬퍼 함수 추가]
+def clean_unused_caches():
+    global OHLCV_CACHE, INDICATOR_CACHE, STRAT, trade_data
+    active_tickers = set(STRAT.get('tickers', []) + list(trade_data.keys()) + ["KRW-BTC"])
+    
+    # 딕셔너리 크기가 변경되므로 list로 키를 복사해서 순회
+    for t in list(OHLCV_CACHE.keys()):
+        if t not in active_tickers:
+            del OHLCV_CACHE[t]
+    for t in list(INDICATOR_CACHE.keys()):
+        if t not in active_tickers:
+            del INDICATOR_CACHE[t]
+
 async def update_top_volume_tickers():
     global STRAT
     try:
@@ -627,10 +677,13 @@ async def update_top_volume_tickers():
         CLASSIC_CONF['strategy']['tickers'] = top_tickers
         await save_config_async(QUANTUM_CONF, CONFIG_PATH)
         await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH)
+        clean_unused_caches()  # 불필요한 OHLCV/지표 캐시 정리
         return top_tickers
     except Exception as e:
         logging.error(f"❌ update_top_volume_tickers 오류: {e}")
+        clean_unused_caches()  # 오류가 나도 캐시 정리는 시도
         return STRAT.get('tickers', [])
+    
 
 FGI_CACHE = {"data": {"fear_and_greed": "50 (Neutral)"}, "timestamp": 0}
 
@@ -963,6 +1016,11 @@ def is_highly_correlated(t1, t2):
             return corr >= 0.85
         return False
     except: return False
+
+def extract_ai_essential_data(curr_data):
+    # AI가 차트를 판단하는 데 꼭 필요한 핵심 지표만 필터링
+    essential_keys = ['close', 'volume', 'rsi', 'macd_h', 'ST_DIR', 'adx', 'z_score', 'bb_bw']
+    return {k: round(v, 4) for k, v in curr_data.items() if k in essential_keys}
 
 # --- [4. AI 분석 엔진] ---
 async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hours=0.0, win_rate=50.0, recent_wins=None, mtf_trend="알수없음", buy_price=0.0, market_regime=None, ignore_cooldown=False):
@@ -1697,70 +1755,27 @@ async def run_full_scan(is_deep_scan=False):
     for t, prev, curr in indicator_results:
         if curr is None or prev is None: continue
         
-        # 🟢 [최종 수정] Pylance 타입 방어막 통과를 위한 딕셔너리 강제 변환!
+        # 🟢 Pylance 방어 및 딕셔너리 변환
         if isinstance(prev, pd.Series): prev = prev.to_dict()
         if isinstance(curr, pd.Series): curr = curr.to_dict()
         if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-        # --- [1. 전략 선택 및 지표 설정] ---
-        eval_mode = determine_eval_mode(current_regime_mode, curr)
-        logic_list = get_logic_list_for_mode(eval_mode, curr)
+        # 🟢 [적용 1] 복잡했던 수십 줄의 코드를 단 한 줄로 압축! (변수명 prev, curr 매칭)
+        score, fatal, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'])
 
-        # --- [2. 가중치 및 배율을 통한 기본 점수 계산] ---
-        indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
-        weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
-        
-        earned_score, total_w = 0.0, 0.0
-        curr_close = safe_float(curr.get('close'))
-        
-        for name in logic_list:
-            w = safe_float(weights.get(name, 1.0), 1.0)
-            m = safe_float(indicator_mults.get(name, 1.0), 1.0)
-            s = safe_float(get_strategy_score(name, prev, curr, curr_close, mode=eval_mode))
-            earned_score += (s * m * w)
-            total_w += (m * w)
-        
-        pass_score = int(earned_score / total_w) if total_w > 0 else 0
+        if fatal:
+            score = -999
 
-        # --- [3. 모드별 보너스 및 페널티 부여] ---
-        current_score_mods = get_dynamic_strat_value('scoring_modifiers', mode=eval_mode, default={})
-        
-        if eval_mode == "QUANTUM":
-            b_vol_exp_local = current_score_mods.get('bonus_volume_explosion', 30)
-            p_btc_weak_local = current_score_mods.get('penalty_btc_weakness', -15)
-            if curr_close >= safe_float(curr.get('bb_u')): pass_score += b_vol_exp_local
-            if btc_short['trend'] == "단기 하락": pass_score += p_btc_weak_local
-        else: # CLASSIC
-            b_golden_local = current_score_mods.get('bonus_golden_combo', 35)
-            b_btc_panic_local = current_score_mods.get('bonus_btc_panic_dip', 10)
-            b_st_bounce_local = current_score_mods.get('bonus_st_oversold_bounce', 10)
-            if "Fear" in fgi_str and safe_float(curr.get('rsi')) < 35: pass_score += b_golden_local
-            if btc_short['trend'] == "단기 하락": pass_score += b_btc_panic_local
-            if curr.get('ST_DIR', 1) == -1 and safe_float(curr.get('rsi')) < 35: pass_score += b_st_bounce_local
+        # 🟢 pass_score라는 변수 대신 score를 사용합니다.
+        current_loop_max_score = max(current_loop_max_score, score)
 
-        # 🟢 [수정 1] 하드락(Fatal Flaw) 조건 분리 및 명확화
-        fatal_flaw = False
-        
-        if eval_mode == "QUANTUM":
-            if curr.get('ST_DIR', 1) == -1 or curr_close < curr.get('sma_long', 0): 
-                fatal_flaw = True
-        else: # CLASSIC
-            if safe_float(curr.get('rsi')) > 55 or safe_float(curr.get('macd_h_diff')) < -safe_float(curr.get('macd_h_diff_sma'), 0) * 0.5: 
-                fatal_flaw = True 
-
-        # 🟢 [수정 2] 결함이 있으면 -999점으로 강등하여 '최고 점수'에 랭크되지 못하게 막음
-        if fatal_flaw:
-            pass_score = -999
-
-        # 🟢 [수정 3] 하드락으로 깎인 점수를 제외한 '진짜 펀더멘탈 최고점'을 여기서 기록!
-        current_loop_max_score = max(current_loop_max_score, pass_score)
-
-        # 🟢 [수정 4] 컷오프(Cut-off): 결함이 있거나, 점수가 미달이면 여기서 버림
-        if pass_score < get_dynamic_strat_value('pass_score_threshold', mode=eval_mode, default=80): 
+        if score < get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80): 
             continue
 
         if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
-        python_passed.append({"t": t, "score": pass_score, "data": curr, "mtf": await get_mtf_trend(t), "mode": eval_mode})
+        
+        # 🟢 mode 변수를 그대로 넘겨줍니다.
+        python_passed.append({"t": t, "score": score, "data": curr, "mtf": await get_mtf_trend(t), "mode": mode})
 
     # 🟢 [수정 5] for 루프 종료 후, LATEST_TOP_PASS_SCORE 덮어쓰기!
     LATEST_TOP_PASS_SCORE = current_loop_max_score
@@ -1787,7 +1802,7 @@ async def run_full_scan(is_deep_scan=False):
     ai_rejected = []
 
     for p in python_passed:
-        ai_data = p['data'].to_dict() if hasattr(p['data'], 'to_dict') else p['data']
+        ai_data = extract_ai_essential_data(p['data'].to_dict()) if hasattr(p['data'], 'to_dict') else p['data']
         ai_data['strategy_mode'] = p['mode']
         ai_data['python_pass_score'] = p['score']
         
@@ -2047,6 +2062,8 @@ COMMAND_HELP_MSG = """⌨️ <b>[사용 가능한 텔레그램 명령어]</b>
 • <b>제안</b> : 누적된 AI 사후 분석 리포트(TXT 파일) 추출
 • <b>점수</b> : 🔍 [디버그] 감시 대상 종목 실시간 점수 랭킹 확인
 """
+
+
 async def send_score_debug_report():
     await send_msg("🔍 <b>실시간 점수 집계 중... (잠시만 기다려주세요)</b>")
     
@@ -2063,9 +2080,7 @@ async def send_score_debug_report():
     else:
         current_regime_mode = "HYBRID" 
 
-    eval_mode = "CLASSIC" if current_regime_mode == "HYBRID" else current_regime_mode
     tickers = STRAT.get('tickers', [])
-    
     if not tickers:
         await send_msg("⚠️ 감시 중인 종목이 없습니다.")
         return
@@ -2082,52 +2097,10 @@ async def send_score_debug_report():
             if isinstance(c, pd.Series): c = c.to_dict()
             if not isinstance(p, dict) or not isinstance(c, dict): return None
             
-            t_eval_mode = determine_eval_mode(current_regime_mode, c) if current_regime_mode == "HYBRID" else eval_mode
-            logic_list = get_logic_list_for_mode(t_eval_mode, c) 
-            indicator_mults = get_indicator_multipliers(t_eval_mode, fgi_val)
-            weights = get_dynamic_strat_value('indicator_weights', mode=t_eval_mode, default={})
+            # 🟢 [적용 2] 디버그 모드 역시 단 한 줄로 압축 완료!
+            score, fatal, mode = evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
+            return {"t": t, "score": score, "fatal": fatal, "mode": mode}
             
-            earned_score, total_w = 0.0, 0.0
-            curr_close = safe_float(c.get('close'))
-            
-            for name in logic_list:
-                w = safe_float(weights.get(name, 1.0), 1.0)
-                m = safe_float(indicator_mults.get(name, 1.0), 1.0)
-                s = safe_float(get_strategy_score(name, p, c, curr_close, mode=t_eval_mode), 0.0)
-                earned_score += (s * m * w)
-                total_w += (m * w)
-            
-            pass_score = int(earned_score / total_w) if total_w > 0 else 0
-            
-            # 보너스 점수 적용
-            current_score_mods = get_dynamic_strat_value('scoring_modifiers', mode=t_eval_mode, default={})
-            if t_eval_mode == "QUANTUM":
-                b_vol_exp_local = current_score_mods.get('bonus_volume_explosion', 30)
-                p_btc_weak_local = current_score_mods.get('penalty_btc_weakness', -15)
-                if curr_close >= safe_float(c.get('bb_u')): pass_score += b_vol_exp_local
-                if btc_short['trend'] == "단기 하락": pass_score += p_btc_weak_local
-            else:
-                b_golden_local = current_score_mods.get('bonus_golden_combo', 35)
-                b_btc_panic_local = current_score_mods.get('bonus_btc_panic_dip', 10)
-                b_st_bounce_local = current_score_mods.get('bonus_st_oversold_bounce', 10)
-                if "Fear" in fgi_str and safe_float(c.get('rsi')) < 35: pass_score += b_golden_local
-                if btc_short['trend'] == "단기 하락": pass_score += b_btc_panic_local
-                if c.get('ST_DIR', 1) == -1 and safe_float(c.get('rsi')) < 35: pass_score += b_st_bounce_local
-            
-            # 🟢 [추가] 디버그 모드에도 하드락(Fatal Flaw) 로직 동일하게 적용
-            fatal_flaw = False
-            if t_eval_mode == "QUANTUM":
-                if c.get('ST_DIR', 1) == -1 or curr_close < c.get('sma_long', 0): 
-                    fatal_flaw = True
-            else: # CLASSIC
-                if safe_float(c.get('rsi')) > 55 or safe_float(c.get('macd_h_diff')) < -safe_float(c.get('macd_h_diff_sma'), 0) * 0.5: 
-                    fatal_flaw = True 
-            
-            pass_score = max(0, min(100, pass_score))
-            
-            # 🟢 [추가] 하드락에 걸린 코인은 플래그(fatal)를 True로 반환
-            return {"t": t, "score": pass_score, "mode": t_eval_mode, "fatal": fatal_flaw}
-
     tasks = [fetch_and_score(t) for t in tickers]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -2140,12 +2113,10 @@ async def send_score_debug_report():
     msg = f"📊 <b>[디버그] 실시간 종목 점수 (기준: {current_regime_mode})</b>\n\n"
     for i, res in enumerate(score_results[:20]): 
         icon = "🚀" if res['mode'] == "QUANTUM" else "📉"
-        # 🟢 [추가] 하드락에 걸린 종목은 직관적인 안내 태그 부착
         fatal_tag = " 💀(하드락 탈락)" if res['fatal'] else ""
         msg += f"{i+1}. {res['t']} : <b>{res['score']}점</b> ({icon}){fatal_tag}\n"
         
     await send_msg(msg)
-
 async def handle_telegram_updates():
     global is_running, last_update_id, trade_data
     logging.info("텔레그램 명령 처리 태스크 시작")
@@ -2260,6 +2231,107 @@ async def handle_telegram_updates():
         
         await asyncio.sleep(0.5)
 
+# 🟢 [신규 추가] 매도 조건 검사 전용 모듈 (스파게티 코드 분리)
+def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score):
+    global STRAT, INDICATOR_CACHE
+    
+    exit_plan = t.get('exit_plan', {})
+    entry_atr = t.get('entry_atr', 0)
+    target_atr_multiplier = exit_plan.get('target_atr_multiplier', 4.5)
+    
+    target_p_price = avg_p + (entry_atr * target_atr_multiplier)
+    target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
+    hard_s = exit_plan.get('stop_loss', -3.0) 
+
+    current_atr_mult = exit_plan.get('atr_mult', STRAT.get('atr_multiplier_for_stoploss', 1.8))
+    
+    entry_rsi = t.get('buy_ind', {}).get('rsi', 50)
+    if entry_rsi >= 70.0:
+        current_atr_mult = min(current_atr_mult, 1.5) 
+
+    invested_high_krw = avg_p * 1.0005
+    earned_high_krw = t['high_p'] * 0.9995
+    max_p_rate = ((earned_high_krw - invested_high_krw) / invested_high_krw) * 100 if invested_high_krw > 0 else 0
+    
+    dynamic_mult = current_atr_mult
+    if max_p_rate >= 5.0: dynamic_mult = current_atr_mult * 0.3  
+    elif max_p_rate >= 3.0: dynamic_mult = current_atr_mult * 0.5
+    elif max_p_rate >= 1.0: dynamic_mult = current_atr_mult * 0.7
+        
+    atr_stop = t['high_p'] - (entry_atr * dynamic_mult)
+    chandelier_stop = t['high_p'] * 0.98 if max_p_rate >= 3.0 else 0
+    stop_p = max(atr_stop, chandelier_stop)
+    
+    adaptive_buffer = exit_plan.get('adaptive_breakeven_buffer', 0.003)
+    
+    if t.get('breakeven_locked') or (t.get('guard') and max_p_rate > 0.6): 
+        hard_breakeven_floor = avg_p * 1.005 
+        calculated_guard_p = t['high_p'] * (1 - adaptive_buffer)
+        stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
+    else: 
+        stop_p = max(stop_p, avg_p + (avg_p * (hard_s / 100.0)))
+    if entry_atr == 0: stop_p = max(stop_p, avg_p * 0.98) 
+    
+    if t.get('is_runner', False):
+        stop_p = max(stop_p, avg_p * 1.007)
+
+    if max_p_rate >= 1.0:
+        t['breakeven_locked'] = True
+        
+    if t.get('breakeven_locked', False):
+        stop_p = max(stop_p, avg_p * 1.005)
+    
+    scale_out_step = t.get('scale_out_step', 0)
+
+    timeout_candles = exit_plan.get('timeout', STRAT.get('timeout_candles', 8))
+    
+    interval_str = STRAT.get('interval', 'minute15')
+    if interval_str.startswith('minute'):
+        interval_sec = int(interval_str.replace('minute', '')) * 60
+    elif interval_str == 'day': interval_sec = 86400  
+    elif interval_str == 'week': interval_sec = 604800 
+    elif interval_str == 'month': interval_sec = 2592000 
+    else: interval_sec = 900 
+        
+    elapsed_sec = now_ts - t.get('buy_ts', now_ts)
+
+    full_timeout_sec = timeout_candles * interval_sec
+    half_timeout_sec = full_timeout_sec / 2
+    micro_timeout_sec = interval_sec * 1 
+
+    curr_i_safe = INDICATOR_CACHE[ticker][2] if ticker in INDICATOR_CACHE else {}
+    
+    is_fundamental_broken = False
+    if current_live_score is not None and ma_live_score < STRAT.get('sell_score_threshold', 40):
+        atr_1x_pct = (entry_atr / avg_p) * 100 if avg_p > 0 else 1.5
+        fundamental_bailout_limit = -max(1.0, min(3.0, atr_1x_pct))
+        if elapsed_sec > (interval_sec * 2) or p_rate < fundamental_bailout_limit:
+            is_fundamental_broken = True
+    
+    macd_diff_val = curr_i_safe.get('macd_h_diff', 0)
+    if macd_diff_val is None: macd_diff_val = 0
+    
+    curr_p_rate = float(p_rate) if p_rate is not None else 0.0
+    curr_ma_score = float(ma_live_score) if ma_live_score is not None else 0.0
+    
+    sell_conditions = [
+        (curr_p_rate >= (target_p * 1.5) and curr_i_safe.get('rsi', 50) >= 85 and scale_out_step == 0, "추세 과열 1차 익절 (RSI > 85)", 0.3, 1, "NORMAL"),
+        (curr_p_rate >= (target_p * 2.5) and scale_out_step <= 1, "목표 수익 돌파 2차 익절", 0.5, 2, "NORMAL"),
+        (curr_p_rate <= hard_s, "절대 손절선 이탈", 1.0, 0, "HIGH"),
+        (real_price <= stop_p, "트레일링 스탑 이탈 (수익 보존/손절)", 1.0, 0, "HIGH"),
+        (is_fundamental_broken, f"모멘텀 붕괴 ({ma_live_score}점)", 1.0, 0, "HIGH"),
+        (elapsed_sec > full_timeout_sec and curr_p_rate <= 0.5, f"추세 정체 타임아웃 ({timeout_candles}캔들)", 1.0, 0, "NORMAL"),
+        (elapsed_sec > half_timeout_sec and curr_p_rate < 0.0 and (macd_diff_val < 0 or curr_ma_score < 60), "⏳ 조기 타임아웃 (돌파 동력 상실)", 1.0, 0, "HIGH"),                        
+        (elapsed_sec > micro_timeout_sec and curr_p_rate <= -1.0, "⏳ 가짜 돌파 컷 (즉각 탈출)", 1.0, 0, "HIGH"),
+        (elapsed_sec > micro_timeout_sec and curr_p_rate <= -0.5 and macd_diff_val < 0, "⏳ 모멘텀 역전 컷 (돌파 실패)", 1.0, 0, "HIGH")
+    ]
+
+    for condition, reason, ratio, step, urgency_level in sell_conditions:
+        if condition:
+            # 조건 만족 시: is_sell, is_partial_sell, sell_qty_ratio, sell_reason_str, urgency, next_step
+            return True, (ratio != 1.0), ratio, reason, urgency_level, step
+            
+    return False, False, 1.0, "", "NORMAL", scale_out_step
 
 # 🟢 [수술 완료] 메인 감시 루프의 딜레이를 없애기 위한 백그라운드 매도 리포트 생성기
 async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, sell_reason_str, analyze_payload):
@@ -2290,7 +2362,8 @@ async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, se
         await send_msg(f"🔕 <b>최종 청산 완료 (비상 모드)</b> ({ticker})\n- 사유: {sell_reason_str}\n- 수익률: {p_rate:+.2f}%\n- 수익금: {p_krw:,.0f}원\n- AI: 구글 서버 지연으로 사후 분석 생략")
 
 async def main():
-    global trade_data, last_global_buy_time, BALANCE_CACHE, last_sell_time, last_buy_time, is_running, last_update_id
+    # 🟢 [수정 완료] 안 쓰는 last_buy_time, last_update_id 삭제
+    global trade_data, last_global_buy_time, BALANCE_CACHE, last_sell_time, is_running
 
     global instance_lock
     import socket, random
@@ -2333,7 +2406,10 @@ async def main():
     last_daily_report_day = datetime.now().day
     last_proposal_day = None
     
-    
+    # 🟢 [추가] 루프 밖에서 한 번만 안전하게 초기화
+    if 'BALANCE_CACHE' not in globals(): 
+        BALANCE_CACHE = {"data": None, "timestamp": 0}
+
     await init_db()
     trade_data = await load_trade_status_db()
     asyncio.create_task(websocket_ticker_task())
@@ -2403,6 +2479,8 @@ async def main():
     asyncio.create_task(background_scan_task(True)) # 🟢 [수정] 프로그램 시작 시 바로 딥 스캔 시작
     asyncio.create_task(db_flush_task())
     await asyncio.sleep(3)
+
+    
     
     while True:
         try:
@@ -2414,7 +2492,7 @@ async def main():
             
             now_ts, now_dt = time.time(), datetime.now()
             
-            if 'BALANCE_CACHE' not in globals(): BALANCE_CACHE = {"data": None, "timestamp": 0}
+            
             if now_ts - BALANCE_CACHE['timestamp'] > BALANCE_CACHE_SEC: 
                 BALANCE_CACHE['data'] = await execute_upbit_api(upbit.get_balances)
                 BALANCE_CACHE['timestamp'] = now_ts
@@ -2441,14 +2519,32 @@ async def main():
             monitoring_tickers = list(set(STRAT.get('tickers', []) + list(held.keys())))
             btc_short = await get_btc_short_term_data()
 
+            # 🟢 [추가] 반복문을 돌기 전에 현재 시장의 날씨(Regime)를 딱 한 번만 파악합니다! (속도 대폭 향상)
+            regime = await get_market_regime()
+            fgi_str = regime.get('fear_and_greed', '')
+            try: fgi_val = int(re.search(r'\d+', fgi_str).group()) if re.search(r'\d+', fgi_str) else 50
+            except: fgi_val = 50
+
+            if fgi_val <= 35 or (btc_short.get('trend') == "단기 하락" and fgi_val <= 50):
+                current_regime_mode = "CLASSIC" 
+            elif fgi_val >= 65 or (btc_short.get('trend') == "단기 상승" and fgi_val >= 50):
+                current_regime_mode = "QUANTUM" 
+            else:
+                current_regime_mode = "HYBRID"
+
+            # 이제 개별 코인 검사를 시작합니다.
             for ticker in monitoring_tickers:
                 current_live_score = None
                 if ticker not in held and ticker in last_sell_time and (now_ts - last_sell_time.get(ticker, 0)) < 1800: 
                     continue                    
 
                 if ticker in held:
-                    # 🟢 보유 종목의 지표를 백그라운드에서 주기적으로 새로고침
-                    asyncio.create_task(get_indicators(ticker))
+                    # 🟢 [수정 완료] 15초에 한 번만 지표를 갱신하도록 쿨타임 적용
+                    t = trade_data.get(ticker, {})
+                    if now_ts - t.get('last_ind_update_ts', 0) > 15:
+                        asyncio.create_task(get_indicators(ticker))
+                        t['last_ind_update_ts'] = now_ts
+                        TRADE_DATA_DIRTY = True
                     
                     coin = held[ticker]
                     # 🟢 [Pylance 추가 방어] coin 딕셔너리에서 평단가를 꺼낼 때도 정수기(safe_float)를 통과시킵니다.
@@ -2488,47 +2584,9 @@ async def main():
                         if isinstance(curr_i, pd.Series): curr_i = curr_i.to_dict()
                         
                         if isinstance(prev_i, dict) and isinstance(curr_i, dict):
-                            # --- [종목별 전략 맞춤 실시간 점수 계산] ---
-                            active_logic_list = get_logic_list_for_mode(eval_mode,curr_i)
-                            
-                            regime = await get_market_regime()
-                            fgi_str = regime.get('fear_and_greed', '')
-                            try: fgi_val = int(re.search(r'\d+', fgi_str).group()) if re.search(r'\d+', fgi_str) else 50
-                            except: fgi_val = 50
-
-                            # 🟢 [수정 1] 동적 배율(m) 및 모드별 가중치 완벽 적용
-                            indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
-                            weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
-                            
-                            earned_weighted_score, dynamic_total_weight = 0.0, 0.0
-                            for name in active_logic_list:
-                                w = safe_float(weights.get(name, 1.0), 1.0)
-                                m = safe_float(indicator_mults.get(name, 1.0), 1.0) # 배율 추가
-                                s = safe_float(get_strategy_score(name, prev_i, curr_i, real_price, mode=eval_mode), 0.0)
-                                earned_weighted_score += (s * m * w)
-                                dynamic_total_weight += (m * w)
-                            
-                            current_live_score = int(earned_weighted_score / dynamic_total_weight) if dynamic_total_weight > 0 else 0
-                            
-                            # 🟢 [수정 2] 실시간 점수에도 전략별 보너스/페널티 완벽 이식 (점수 억까 폭락 방지)
-                            current_score_mods = get_dynamic_strat_value('scoring_modifiers', mode=eval_mode, default={})
-                            b_vol_exp_local = current_score_mods.get('bonus_volume_explosion', 30)
-                            p_btc_weak_local = current_score_mods.get('penalty_btc_weakness', -15)
-                            b_golden_local = current_score_mods.get('bonus_golden_combo', 35)
-                            b_btc_panic_local = current_score_mods.get('bonus_btc_panic_dip', 10)
-                            b_st_bounce_local = current_score_mods.get('bonus_st_oversold_bounce', 10)
-
-                            if eval_mode == "QUANTUM":
-                                # 실시간 가격이 밴드 상단 위에 있으면 돌파 유지로 간주하여 보너스 수여
-                                if real_price >= safe_float(curr_i.get('bb_u')): current_live_score += b_vol_exp_local
-                                if btc_short['trend'] == "단기 하락": current_live_score += p_btc_weak_local
-                            else: # CLASSIC
-                                if "Fear" in fgi_str and safe_float(curr_i.get('rsi')) < 35: current_live_score += b_golden_local
-                                if btc_short['trend'] == "단기 하락": current_live_score += b_btc_panic_local
-                                if curr_i.get('ST_DIR', 1) == -1 and safe_float(curr_i.get('rsi')) < 35: current_live_score += b_st_bounce_local
-
-                            # 최종 점수 가두기
-                            current_live_score = max(0, min(100, current_live_score))
+                            # 🟢 [최적화 완료] 위에서 미리 구해둔 시장 날씨를 채점 함수에 넘겨주기만 하면 끝입니다.
+                            btc_short_trend = btc_short.get('trend', "혼조세")
+                            current_live_score, _, _ = evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend)
                     ma_live_score = current_live_score # 기본값
                     if current_live_score is not None:
                         score_hist = t.get('score_history', [])
@@ -2550,137 +2608,10 @@ async def main():
                     
                     if changed: TRADE_DATA_DIRTY = True
 
-
-                    exit_plan = t.get('exit_plan', {})
-                    entry_atr = t.get('entry_atr', 0)
-                    target_atr_multiplier = exit_plan.get('target_atr_multiplier', 4.5)
-                    
-                    target_p_price = avg_p + (entry_atr * target_atr_multiplier)
-                    target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
-                    hard_s = exit_plan.get('stop_loss', -3.0) 
-
-                    current_atr_mult = exit_plan.get('atr_mult', STRAT.get('atr_multiplier_for_stoploss', 1.8))
-                    
-                    entry_rsi = t.get('buy_ind', {}).get('rsi', 50)
-                    if entry_rsi >= 70.0:
-                        current_atr_mult = min(current_atr_mult, 1.5) 
-
-                    invested_high_krw = avg_p * 1.0005
-                    earned_high_krw = t['high_p'] * 0.9995
-                    max_p_rate = ((earned_high_krw - invested_high_krw) / invested_high_krw) * 100 if invested_high_krw > 0 else 0
-                    
-                    # 통합: 이익이 커질수록 트레일링 스탑을 더 타이트하게 조여 수익을 보존
-                    dynamic_mult = current_atr_mult
-                    if max_p_rate >= 5.0: dynamic_mult = current_atr_mult * 0.3  # 강력한 추세에서는 바짝 붙음
-                    elif max_p_rate >= 3.0: dynamic_mult = current_atr_mult * 0.5
-                    elif max_p_rate >= 1.0: dynamic_mult = current_atr_mult * 0.7
-                        
-                    atr_stop = t['high_p'] - (entry_atr * dynamic_mult)
-                    # 샹들리에 스탑 강화: 고점 대비 -2% 이탈 시 즉시 청산 (수익 보존)
-                    chandelier_stop = t['high_p'] * 0.98 if max_p_rate >= 3.0 else 0
-                    stop_p = max(atr_stop, chandelier_stop)
-                    
-                    adaptive_buffer = exit_plan.get('adaptive_breakeven_buffer', 0.003)
-                    
-                    # 통합: 본절 방어막 강화 (+1.0% 이상 도달 시 작동)
-                    if t.get('breakeven_locked') or (t.get('guard') and max_p_rate > 0.6): 
-                        hard_breakeven_floor = avg_p * 1.005 # 최소 0.5% 수익 확보
-                        calculated_guard_p = t['high_p'] * (1 - adaptive_buffer)
-                        stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
-                    else: 
-                        # 기본 손절선 (매우 타이트하게)
-                        stop_p = max(stop_p, avg_p + (avg_p * (hard_s / 100.0)))
-                    if entry_atr == 0: stop_p = max(stop_p, avg_p * 0.98) 
-                    
-                    # 🟢 [FIX: 러너 스탑 방어막 논리 일관성 수정] 기존 트레일링 스탑 계산과 융합하여 무조건 본절 + 0.7% 위에서 청산되도록 수정
-                    if t.get('is_runner', False):
-                        stop_p = max(stop_p, avg_p * 1.007)
-
-                    if max_p_rate >= 1.0:
-                        t['breakeven_locked'] = True
-                        
-                    # 브레이크이븐 락이 걸렸다면, 그 어떤 상황에서도 평단가 + 수수료(약 0.2%) 위에서 방어
-                    if t.get('breakeven_locked', False):
-                        stop_p = max(stop_p, avg_p * 1.005)
-                    
-                    scale_out_step = t.get('scale_out_step', 0)
-                    is_sell, is_partial_sell = False, False
-                    sell_reason_str, urgency = "", "NORMAL"
-                    sell_qty_ratio = 1.0
-                    next_step = scale_out_step
-
-                    # 🟢 [개선] 1. 미리 시간을 계산해 둡니다.
-                    timeout_candles = exit_plan.get('timeout', STRAT.get('timeout_candles', 8))
-                    
-                    # 🟢 [수술 완료] 업비트가 지원하는 모든 차트 주기에 대응하도록 초 단위 정확히 할당
-                    interval_str = STRAT.get('interval', 'minute15')
-                    if interval_str.startswith('minute'):
-                        interval_sec = int(interval_str.replace('minute', '')) * 60
-                    elif interval_str == 'day':
-                        interval_sec = 86400  # 24시간
-                    elif interval_str == 'week':
-                        interval_sec = 604800 # 7일
-                    elif interval_str == 'month':
-                        interval_sec = 2592000 # 30일
-                    else:
-                        interval_sec = 900 # 알 수 없는 값일 경우 기본 15분으로 방어
-                        
-                    elapsed_sec = now_ts - t.get('buy_ts', now_ts)
-
-                    # 타임아웃 관련 변수 정의
-                    full_timeout_sec = timeout_candles * interval_sec
-                    half_timeout_sec = full_timeout_sec / 2
-                    micro_timeout_sec = interval_sec * 1 # 1캔들 타임아웃으로 설정
-
-                    curr_i_safe = INDICATOR_CACHE[ticker][2] if ticker in INDICATOR_CACHE else {}
-                    
-                    # 🟢 [수술 완료] 2. 펀더멘탈 붕괴 여부를 Elif 늪에 빠지지 않게 미리 판단(Boo
-                    #lean)해 둡니다.
-                    is_fundamental_broken = False
-                    if current_live_score is not None and ma_live_score < STRAT.get('sell_score_threshold', 40):
-                        atr_1x_pct = (entry_atr / avg_p) * 100 if avg_p > 0 else 1.5
-                        fundamental_bailout_limit = -max(1.0, min(3.0, atr_1x_pct))
-                        if elapsed_sec > (interval_sec * 2) or p_rate < fundamental_bailout_limit:
-                            is_fundamental_broken = True
-                    
-                    rsi_high_limit = STRAT.get('rsi_high_threshold', 60.0)
-                    # 매도 조건 로직 리팩토링
-                    macd_diff_val = curr_i_safe.get('macd_h_diff', 0)
-                    if macd_diff_val is None: macd_diff_val = 0
-                    
-                    # 타입 체커를 위한 명시적 타입 변환 및 None 방어
-                    curr_p_rate = float(p_rate) if p_rate is not None else 0.0
-                    curr_ma_score = float(ma_live_score) if ma_live_score is not None else 0.0
-                    
-                    sell_conditions = [
-                        # 통합: 추세가 강력하면 익절을 미루고 트레일링 스탑에 맡김 (Let winners run)
-                        (curr_p_rate >= (target_p * 1.5) and curr_i_safe.get('rsi', 50) >= 85 and scale_out_step == 0, "추세 과열 1차 익절 (RSI > 85)", 0.3, 1, "NORMAL"),
-                        (curr_p_rate >= (target_p * 2.5) and scale_out_step <= 1, "목표 수익 돌파 2차 익절", 0.5, 2, "NORMAL"),
-                        
-                        (curr_p_rate <= hard_s, "절대 손절선 이탈", 1.0, 0, "HIGH"),
-                        (real_price <= stop_p, "트레일링 스탑 이탈 (수익 보존/손절)", 1.0, 0, "HIGH"),
-                        (is_fundamental_broken, f"모멘텀 붕괴 ({ma_live_score}점)", 1.0, 0, "HIGH"),
-                        
-                        (elapsed_sec > full_timeout_sec and curr_p_rate <= 0.5, f"추세 정체 타임아웃 ({timeout_candles}캔들)", 1.0, 0, "NORMAL"),
-                        (elapsed_sec > half_timeout_sec and curr_p_rate < 0.0 and (macd_diff_val < 0 or curr_ma_score < 60), "⏳ 조기 타임아웃 (돌파 동력 상실)", 1.0, 0, "HIGH"),                        
-                        (elapsed_sec > micro_timeout_sec and curr_p_rate <= -1.0, "⏳ 가짜 돌파 컷 (즉각 탈출)", 1.0, 0, "HIGH"),
-                        (elapsed_sec > micro_timeout_sec and curr_p_rate <= -0.5 and macd_diff_val < 0, "⏳ 모멘텀 역전 컷 (돌파 실패)", 1.0, 0, "HIGH")
-                    ]
-
-                    for condition, reason, ratio, step, urgency_level in sell_conditions:
-                        if condition:
-                            is_sell = (ratio == 1.0)
-                            is_partial_sell = not is_sell
-                            sell_qty_ratio = ratio
-                            sell_reason_str = reason
-                            urgency = urgency_level
-                            next_step = step
-                            break
-                    else: # 모든 조건에 해당하지 않을 경우
-                        is_sell, is_partial_sell = False, False
-                        sell_reason_str, urgency = "", "NORMAL"
-                        sell_qty_ratio = 1.0
-                        next_step = scale_out_step
+                    # 🟢 [수술 완료] 약 100줄의 매도 판별 스파게티 코드를 모듈화하여 단 3줄로 종결!
+                    is_sell, is_partial_sell, sell_qty_ratio, sell_reason_str, urgency, next_step = evaluate_sell_conditions(
+                        ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score
+                    )
 
                     if is_sell or is_partial_sell:
                         # 🟢 라이브 호가 갱신
