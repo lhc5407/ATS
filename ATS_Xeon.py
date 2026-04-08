@@ -281,9 +281,10 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
     }
 
 # 🟢 [신규 추가] 중복을 제거한 공통 펀더멘탈 채점 엔진
-def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend):
-    eval_mode = determine_eval_mode(current_regime_mode, curr_i)
-    logic_list = get_logic_list_for_mode(eval_mode, curr_i) 
+def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None):
+    # force_eval_mode가 주어지면 시장 상황을 무시하고 그 모드로만 채점합니다.
+    eval_mode = force_eval_mode if force_eval_mode else determine_eval_mode(current_regime_mode, curr_i)
+    logic_list = get_logic_list_for_mode(eval_mode, curr_i)
     indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
     
@@ -882,7 +883,7 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
         logging.error(f"TA 연산 중 스레드 오류: {e}")
         return None, None
 
-INDICATOR_CACHE, INDICATOR_CACHE_SEC = {}, 60
+INDICATOR_CACHE, INDICATOR_CACHE_SEC = {}, 14
 OHLCV_CACHE = {} 
 BALANCE_CACHE, BALANCE_CACHE_SEC = {"data": None, "timestamp": 0}, 10
 
@@ -1036,6 +1037,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         allowed_keys = [k for k in STRAT.keys() if k not in forbidden_keys]
         s_count = STRAT.get('success_reference_count', 8)
         f_count = STRAT.get('failure_reference_count', 8)
+        success_hist = recent_wins[-s_count:] if isinstance(recent_wins, list) and len(recent_wins) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
+        failure_hist = clean_data[-f_count:] if isinstance(clean_data, list) and len(clean_data) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
         
         if 'indicator_weights' not in allowed_keys: allowed_keys.append('indicator_weights')
         if 'scoring_modifiers' not in allowed_keys: allowed_keys.append('scoring_modifiers')
@@ -1068,8 +1071,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             """
             critical_rule = "CRITICAL RULE: You MUST include 'z_score' in BOTH 'trend_active_logic' and 'range_active_logic'. It is the core statistical indicator. Do not drop it."
             mission = f"""
-            Success History: {recent_wins[-s_count:] if isinstance(recent_wins, list) else "None"}
-            Failure History: {clean_data[-f_count:] if isinstance(clean_data, list) else "None"}
+            Success History: {success_hist}
+            Failure History: {failure_hist}
             Mission:
             1. Swap or update indicators in 'trend_active_logic' and 'range_active_logic' to match the current market regime (e.g., Use more oscillators in ranging markets).
             2. Tune indicator_weights, scoring_modifiers, Tier-params, and the FGI V-Curve parameters.
@@ -1086,8 +1089,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             """
             critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Focus on catching the early stage of a trend."
             mission = f"""
-            Success History: {recent_wins[-s_count:] if isinstance(recent_wins, list) else "None"}
-            Failure History: {clean_data[-f_count:] if isinstance(clean_data, list) else "None"}
+            Success History: {success_hist}
+            Failure History: {failure_hist}
             Mission:
             1. Swap or update indicators in 'trend_active_logic' and 'range_active_logic' to match a trend-following regime.
             2. Tune indicator_weights and scoring_modifiers to punish consolidation and reward momentum.
@@ -1818,12 +1821,14 @@ async def run_full_scan(is_deep_scan=False):
             safe_reason = str(ana.get('reason', '사유 없음')).replace('<', '&lt;').replace('>', '&gt;')
             ai_rejected.append({"t": p['t'], "reason": safe_reason})
 
-    # 🟢 [복원 2] AI 2차 면접 결과 보고 (전원 탈락 vs 부분 탈락)
+    # 🟢 [복원 2] AI 2차 면접 결과 보고 (글자수 제한 방어 추가)
     reject_msg_str = ""
     if ai_rejected:
         reject_msg_str = "\n\n🚫 <b>[AI 2차 면접 탈락 사유]</b>\n"
-        for r in ai_rejected:
+        for r in ai_rejected[:5]: # 🟢 너무 길어지는 것을 막기 위해 상위 5개만 텍스트 생성
             reject_msg_str += f"• <b>{r['t']}</b>: {r['reason']}\n"
+        if len(ai_rejected) > 5:
+            reject_msg_str += f"...외 {len(ai_rejected) - 5}건 탈락\n"
 
     if not ai_approved:
         if is_deep_scan:
@@ -2235,6 +2240,8 @@ async def handle_telegram_updates():
 def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score):
     global STRAT, INDICATOR_CACHE
     
+    eval_mode = t.get('strategy_mode', 'QUANTUM')
+    
     exit_plan = t.get('exit_plan', {})
     entry_atr = t.get('entry_atr', 0)
     target_atr_multiplier = exit_plan.get('target_atr_multiplier', 4.5)
@@ -2283,7 +2290,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     
     scale_out_step = t.get('scale_out_step', 0)
 
-    timeout_candles = exit_plan.get('timeout', STRAT.get('timeout_candles', 8))
+    timeout_candles = exit_plan.get('timeout', get_dynamic_strat_value('timeout_candles', mode=eval_mode, default=8))
     
     interval_str = STRAT.get('interval', 'minute15')
     if interval_str.startswith('minute'):
@@ -2302,7 +2309,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     curr_i_safe = INDICATOR_CACHE[ticker][2] if ticker in INDICATOR_CACHE else {}
     
     is_fundamental_broken = False
-    if current_live_score is not None and ma_live_score < STRAT.get('sell_score_threshold', 40):
+    if current_live_score is not None and ma_live_score < get_dynamic_strat_value('sell_score_threshold', mode=eval_mode, default=40):
         atr_1x_pct = (entry_atr / avg_p) * 100 if avg_p > 0 else 1.5
         fundamental_bailout_limit = -max(1.0, min(3.0, atr_1x_pct))
         if elapsed_sec > (interval_sec * 2) or p_rate < fundamental_bailout_limit:
@@ -2584,9 +2591,9 @@ async def main():
                         if isinstance(curr_i, pd.Series): curr_i = curr_i.to_dict()
                         
                         if isinstance(prev_i, dict) and isinstance(curr_i, dict):
-                            # 🟢 [최적화 완료] 위에서 미리 구해둔 시장 날씨를 채점 함수에 넘겨주기만 하면 끝입니다.
                             btc_short_trend = btc_short.get('trend', "혼조세")
-                            current_live_score, _, _ = evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend)
+                            # 🟢 [수정 완료] 코인에 내재된 eval_mode를 강제로 주입하여 잣대의 일관성 유지!
+                            current_live_score, _, _ = evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=eval_mode)
                     ma_live_score = current_live_score # 기본값
                     if current_live_score is not None:
                         score_hist = t.get('score_history', [])
@@ -2600,7 +2607,7 @@ async def main():
                         ma_live_score = round(sum(score_hist) / len(score_hist), 1)
                     
                     # 🟢 (이후 기존 방어 로직 계속)
-                    if p_rate > 0.6 and current_live_score is not None and ma_live_score < STRAT.get('guard_score_threshold', 60):
+                    if p_rate > 0.6 and current_live_score is not None and ma_live_score < get_dynamic_strat_value('guard_score_threshold', mode=eval_mode, default=60):
                         if not t.get('guard', False):
                             t['guard'] = True
                             changed = True
