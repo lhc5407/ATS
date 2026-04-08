@@ -1033,70 +1033,74 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         if (time.time() - last_coin_ai_call.get(ticker, 0)) < 300: return None
     
     if mode == "OPTIMIZE":
-        forbidden_keys = ['tickers', 'max_concurrent_trades', 'interval', 'report_interval_seconds', 'history_win_count', 'history_loss_count', 'exit_plan_guideline']
-        allowed_keys = [k for k in STRAT.keys() if k not in forbidden_keys]
-        s_count = STRAT.get('success_reference_count', 8)
-        f_count = STRAT.get('failure_reference_count', 8)
-        success_hist = recent_wins[-s_count:] if isinstance(recent_wins, list) and len(recent_wins) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
-        failure_hist = clean_data[-f_count:] if isinstance(clean_data, list) and len(clean_data) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
+        # 🟢 [수정 1] 전역 STRAT이 아닌, 최적화하려는 '해당 모드'의 진짜 설정값을 가져옵니다.
+        target_strat = get_strat_for_mode(eval_mode)
         
-        if 'indicator_weights' not in allowed_keys: allowed_keys.append('indicator_weights')
-        if 'scoring_modifiers' not in allowed_keys: allowed_keys.append('scoring_modifiers')
-        if 'btc_short_term_vol_threshold' not in allowed_keys: allowed_keys.append('btc_short_term_vol_threshold')
-        if 'sleep_depth_threshold' not in allowed_keys: allowed_keys.append('sleep_depth_threshold')
-        if 'risk_per_trade' not in allowed_keys: allowed_keys.append('risk_per_trade')
-        if 'high_vol_params' not in allowed_keys: allowed_keys.append('high_vol_params')
-        if 'mid_vol_params' not in allowed_keys: allowed_keys.append('mid_vol_params')
-        if 'major_params' not in allowed_keys: allowed_keys.append('major_params')
-        if 'success_reference_count' not in allowed_keys: allowed_keys.append('success_reference_count')
-        if 'failure_reference_count' not in allowed_keys: allowed_keys.append('failure_reference_count')
+        forbidden_keys = ['tickers', 'max_concurrent_trades', 'interval', 'report_interval_seconds', 'history_win_count', 'history_loss_count', 'exit_plan_guideline']
+        allowed_keys = [k for k in target_strat.keys() if k not in forbidden_keys]
+        s_count = target_strat.get('success_reference_count', 8)
+        f_count = target_strat.get('failure_reference_count', 8)
+        
+        # 기본 공통 허용 키
+        common_keys = ['indicator_weights', 'scoring_modifiers', 'btc_short_term_vol_threshold', 'sleep_depth_threshold', 'risk_per_trade', 'high_vol_params', 'mid_vol_params', 'major_params', 'success_reference_count', 'failure_reference_count']
+        for k in common_keys:
+            if k not in allowed_keys: allowed_keys.append(k)
 
+        # 🟢 [수정 2] 클래식과 퀀텀 모드의 Allowed Keys와 Important Ranges 철저히 분리
         if eval_mode == "CLASSIC":
-            if 'bonus_mtf_panic_dip' not in allowed_keys: allowed_keys.append('bonus_mtf_panic_dip')
-            if 'bonus_btc_panic_dip' not in allowed_keys: allowed_keys.append('bonus_btc_panic_dip')
-
-
-        filtered_strat = {k: STRAT[k] for k in allowed_keys if k in STRAT}
-
-        if eval_mode == "CLASSIC":
+            classic_keys = ['bonus_mtf_panic_dip', 'bonus_btc_panic_dip', 'bonus_golden_combo', 'bonus_st_oversold_bounce', 'penalty_st_downtrend', 'penalty_rs_weakness']
+            for k in classic_keys: 
+                if k not in allowed_keys: allowed_keys.append(k)
+                
             strategy = "Deep Dip / Oversold Mean Reversion (낙폭 과대 역추세 매매)"
             important_ranges = """
             - pass_score_threshold: MUST be between 75 and 85
             - guard_score_threshold: MUST be between 50 and 60
             - sell_score_threshold: MUST be between 30 and 40
-            - bonus_mtf_panic_dip: MUST be between 5 and 30
-            - bonus_btc_panic_dip: MUST be between 5 and 20
-            - deep_scan_interval: MUST be between 900 and 1800
-            - success_reference_count, failure_reference_count: MUST be between 5 and 15 (Use smaller values for fast-changing volatile markets, larger for stable regimes)
+            - bonus_golden_combo: MUST be between 25 and 45
+            - bonus_mtf_panic_dip: MUST be between 15 and 35
+            - bonus_btc_panic_dip: MUST be between 10 and 25
+            - bonus_st_oversold_bounce: MUST be between 10 and 25
+            - penalty_st_downtrend: MUST be between -15 and 0 (Keep it low, we buy in downtrends)
+            - penalty_rs_weakness: MUST be between -30 and -10
+            - deep_scan_interval: MUST be between 900 and 1500
             """
-            critical_rule = "CRITICAL RULE: You MUST include 'z_score' in BOTH 'trend_active_logic' and 'range_active_logic'. It is the core statistical indicator. Do not drop it."
-            mission = f"""
-            Success History: {success_hist}
-            Failure History: {failure_hist}
-            Mission:
-            1. Swap or update indicators in 'trend_active_logic' and 'range_active_logic' to match the current market regime (e.g., Use more oscillators in ranging markets).
-            2. Tune indicator_weights, scoring_modifiers, Tier-params, and the FGI V-Curve parameters.
-            3. You MUST keep thresholds and bonuses strictly within the [IMPORTANT RANGES].
-            Provide ONLY valid JSON.
-            """
-        else:
+            critical_rule = "CRITICAL RULE: You MUST include 'z_score' and 'bollinger' in BOTH 'trend_active_logic' and 'range_active_logic'. Remove breakout modifiers like 'bonus_volume_explosion'."
+            
+        else: # QUANTUM
+            quantum_keys = ['bonus_all_time_high', 'bonus_volume_explosion', 'penalty_btc_weakness', 'penalty_weak_momentum', 'penalty_overbought_rsi']
+            for k in quantum_keys: 
+                if k not in allowed_keys: allowed_keys.append(k)
+                
             strategy = "Trend Follower & Breakout Trader (추세 추종 및 돌파 매매)"
             important_ranges = """
             - pass_score_threshold: MUST be between 75 and 85
             - guard_score_threshold: MUST be between 60 and 70
             - sell_score_threshold: MUST be between 40 and 50
-            - deep_scan_interval: MUST be between 900 and 1800
+            - bonus_volume_explosion: MUST be between 25 and 45
+            - bonus_all_time_high: MUST be between 20 and 40
+            - penalty_btc_weakness: MUST be between -30 and -15
+            - penalty_weak_momentum: MUST be between -25 and -10
+            - deep_scan_interval: MUST be between 1200 and 1800
             """
-            critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Focus on catching the early stage of a trend."
-            mission = f"""
-            Success History: {success_hist}
-            Failure History: {failure_hist}
-            Mission:
-            1. Swap or update indicators in 'trend_active_logic' and 'range_active_logic' to match a trend-following regime.
-            2. Tune indicator_weights and scoring_modifiers to punish consolidation and reward momentum.
-            3. You MUST keep thresholds strictly within the [IMPORTANT RANGES].
-            Provide ONLY valid JSON.
-            """
+            critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Remove panic dip bonuses."
+
+        # 🟢 [수정 3] AI에게 오염된 전역 STRAT이 아닌, 깨끗한 target_strat을 넘깁니다.
+        filtered_strat = {k: target_strat[k] for k in allowed_keys if k in target_strat}
+        
+        success_hist = recent_wins[-s_count:] if isinstance(recent_wins, list) and len(recent_wins) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
+        failure_hist = clean_data[-f_count:] if isinstance(clean_data, list) and len(clean_data) > 0 else "데이터 없음 (현재 기본 설정 유지 권장)"
+
+        mission = f"""
+        Success History: {success_hist}
+        Failure History: {failure_hist}
+        Mission:
+        1. Swap or update indicators in 'trend_active_logic' and 'range_active_logic' to match the '{strategy}' regime.
+        2. Tune indicator_weights, scoring_modifiers, Tier-params, and the FGI V-Curve parameters.
+        3. You MUST keep thresholds and bonuses strictly within the [IMPORTANT RANGES].
+        4. If History is "데이터 없음", make VERY MINIMAL changes.
+        Provide ONLY valid JSON.
+        """
 
         prompt = f"""
         [X_OPTIMIZE]
@@ -1116,13 +1120,24 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             strategy_desc = "Mean Reversion"
         else:
             strategy_desc = "Trend Following"
+            
+        # 🟢 [추가 및 보강] 최고 도달 수익률, 보유 시간, 원래 계획을 모두 프롬프트에 노출시킵니다!
         prompt = f"""
         [X_SELL_REASON]
-        Ticker: {ticker} | Mode: {strategy_mode} | Profit: {clean_data.get('p_rate')}% | BTC Change: {clean_data.get('btc_change')}%
+        Ticker: {ticker} | Mode: {strategy_mode}
+        Final Profit: {clean_data.get('p_rate')}% | Max Reached Profit: {clean_data.get('max_p_rate', '알수없음')}%
+        Hold Duration: {clean_data.get('elapsed_min', '알수없음')} minutes
+        BTC Change: {clean_data.get('btc_change')}%
+        
+        Original Buy Reason: {clean_data.get('original_buy_reason')}
+        Original Exit Plan: {clean_data.get('original_exit_plan')}
+        
         Buy Indicators: {clean_data.get('buy_ind')}
         Sell Indicators: {clean_data.get('sell_ind')}
         Actual Sell Reason: {clean_data.get('actual_sell_reason')}
-        Mission: Rate the trade performance (0-100) based on the {strategy_desc} strategy, and suggest improvements in Korean. Provide JSON.
+        
+        Mission: Rate the trade performance (0-100) based on the {strategy_desc} strategy, and suggest improvements in Korean.
+        Did it follow the Original Exit Plan? Should it have taken profit earlier based on Max Reached Profit? Provide JSON.
         """
         
     elif mode == "BUY": 
@@ -1132,18 +1147,23 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         
         if eval_mode == "CLASSIC":
             strategy_desc = "Deep Dip / Oversold Mean Reversion (낙폭 과대 역추세 매매)"
-            mission_detail = "Look for oversold conditions with a strong probability of a technical bounce."
+            mission_detail = "Look for oversold conditions with a strong probability of a technical bounce. Check Orderbook imblance and Drop Velocity."
         else:
             strategy_desc = "Trend Follower & Breakout Trader (추세 추종 및 돌파 매매)"
-            mission_detail = "Look for strong breakouts with confirmed volume."
+            mission_detail = "Look for strong breakouts with confirmed volume. Check Orderbook for massive sell walls."
         
+        # 🟢 [추가] AI가 매도 벽과 패닉셀 속도를 감지할 수 있도록 직전 캔들과 호가창 힌트 추가
         prompt = f"""
         [X_BUY]
         Ticker: {ticker} | Strategy Mode: {strategy_mode} | MTF: {mtf_trend} | Regime: {market_regime}
+        Current Price: {clean_data.get('close')} | Prev Close: {clean_data.get('prev_close', '알수없음')}
+        Orderbook Ask/Bid Imbalance: {clean_data.get('ob_imbalance', '알수없음')}
+        
         Indicators: {clean_data}
         Python Score: {clean_data.get('python_pass_score')}
         Guideline: {guideline}
         {warning_msg}
+        
         Mission: You are the FINAL GATEKEEPER for the {strategy_desc} strategy. Evaluate risk/reward and provide JSON. {mission_detail}
         - If mode is CLASSIC, look for extreme oversold conditions, Bollinger lower-band bounce, and strong reversal volume.
         - If mode is QUANTUM, look for breakout confirmation, momentum expansion, and trend continuation evidence.
@@ -1527,29 +1547,41 @@ async def execute_smart_sell(ticker, qty, current_price, urgency="NORMAL"):
                 if actual_rem * current_price >= 5000:
                     await execute_upbit_api(upbit.sell_market_order, ticker, actual_rem)
 
+# 🟢 [수정 완료] 스마트 매수 실패 시 구체적인 사유를 함께 반환합니다.
 async def execute_smart_buy(ticker, buy_amt, limit_price_threshold):
     orderbook = await execute_upbit_api(pyupbit.get_orderbook, ticker)
-    if not orderbook: return False
+    if not orderbook: return False, "호가창(Orderbook) 조회 실패"
+    
     total_bid, total_ask = orderbook['total_bid_size'], orderbook['total_ask_size']
-    if total_bid == 0 or total_ask == 0: return False
+    if total_bid == 0 or total_ask == 0: return False, "호가창 물량 없음 (거래 정지 의심)"
     
     imbalance_ratio = total_ask / total_bid
     if imbalance_ratio > 5.0 or imbalance_ratio < 0.2:
-        await send_msg(f"⚠️ <b>휩소 필터링</b>: {ticker} 호가창 불균형")
-        return False
+        await send_msg(f"⚠️ <b>휩소 필터링</b>: {ticker} 호가창 극심한 불균형")
+        return False, "호가창 극심한 불균형 (휩소 필터링)"
 
     remaining_amt = buy_amt
     for attempt in range(3):
         if remaining_amt < 6000: break
+        
         ob = await execute_upbit_api(pyupbit.get_orderbook, ticker)
-        if not ob: break
+        if not ob: return False, f"매수 중 호가창 갱신 실패 (시도 {attempt+1})"
+        
         best_ask = ob['orderbook_units'][0]['ask_price']
-        if best_ask > limit_price_threshold: break
+        
+        # 지정가 컷오프 (가격 급등 방어)
+        if best_ask > limit_price_threshold: 
+            return False, f"순간적인 가격 급등 (1호가 {best_ask}원이 마지노선 {limit_price_threshold}원 초과)"
+            
         buy_qty = remaining_amt / best_ask
         res = await execute_upbit_api(upbit.buy_limit_order, ticker, best_ask, buy_qty)
-        if not res or 'uuid' not in res: break
+        
+        if not res or 'uuid' not in res: 
+            return False, "매수 주문 API 거절 (잔고 부족 또는 한도 초과)"
+            
         uuid = res['uuid']
         await asyncio.sleep(1.0) 
+        
         order_info = await execute_upbit_api(upbit.get_order, uuid)
         if order_info and order_info.get('state') == 'wait':
             await execute_upbit_api(upbit.cancel_order, uuid)
@@ -1558,7 +1590,11 @@ async def execute_smart_buy(ticker, buy_amt, limit_price_threshold):
             remaining_amt -= (exec_vol * best_ask)
         else:
             remaining_amt = 0; break
-    return True if (buy_amt - remaining_amt) >= 6000 else False
+            
+    if (buy_amt - remaining_amt) >= 6000:
+        return True, "매수 성공"
+    else:
+        return False, "3회 분할 매수 시도 후에도 최소 체결 금액(6,000원) 미달"
 
 async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_score, eval_mode="QUANTUM"):
     global trade_data
@@ -1616,7 +1652,8 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
                 return False
 
         max_tolerable_price = curr_data['close'] * 1.005 
-        buy_success = await execute_smart_buy(ticker, buy_amt, max_tolerable_price)
+        # 🟢 [수정 완료] 성공 여부와 실패 사유를 동시에 받아옵니다.
+        buy_success, fail_reason = await execute_smart_buy(ticker, buy_amt, max_tolerable_price)
         
         if buy_success:
             # 🟢 [FIX: 실제 체결가(평단가) 확인. 바로 현재가(current_price)로 때려박으면 트레일링 스탑이 꼬임]
@@ -1677,7 +1714,8 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
                 await send_msg(f"✅ <b>참모회의 매수 승인</b>: {ticker} (파이썬:{pass_score}점 ➡️ AI:{score}점)\n- <b>매수 금액: {buy_amt:,.2f}원</b>\n- 분석: {safe_reason}")
             return True
         else:
-            await send_msg(f"🚫 <b>매수 취소</b>: {ticker} 스마트 매수 실패.")
+            # 🟢 [수정 완료] 실패 사유를 텔레그램 메시지에 추가
+            await send_msg(f"🚫 <b>매수 취소</b>: {ticker} 스마트 매수 실패.\n- 사유: {fail_reason}")
     return False
 
 async def run_full_scan(is_deep_scan=False):
@@ -1768,7 +1806,7 @@ async def run_full_scan(is_deep_scan=False):
         if fatal:
             score = -999
 
-        # 🟢 pass_score라는 변수 대신 score를 사용합니다.
+        # 🟢 pass_score라는 변수 대신 score를 사용합니다
         current_loop_max_score = max(current_loop_max_score, score)
 
         if score < get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80): 
