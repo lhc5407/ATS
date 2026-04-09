@@ -29,6 +29,7 @@ import ssl
 import certifi
 import websockets
 import math
+import concurrent.futures
 from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
@@ -36,6 +37,9 @@ import logging
 from logging.handlers import RotatingFileHandler
 import socket
 import random
+
+# 🟢 [최적화] TA 스레드 풀 고정 (OS 레벨 스레드 경합 방지 + 예측 가능한 성능)
+_TA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="TA_Worker")
 
 # 🟢 로그 파일 설정
 if getattr(sys, 'frozen', False): base_path = os.path.dirname(sys.executable)
@@ -504,6 +508,12 @@ GLOBAL_COOLDOWN, last_ai_call_time = 0.5, 0
 last_coin_ai_call, last_sell_time, last_buy_time = {}, {}, {}
 trade_data = {}  # 🟢 [추가] 빈 방패를 먼저 세워 에러 원천 차단!
 last_global_buy_time = 0  
+
+# 🟢 [BTC 급등 비정규 스캔 트리거] 한번에 1%+ 이상 스파이크 시 즉시 알트 매수 기회 포선을 위한 상태 변수
+BTC_SURGE_TRIGGERED = False      # 주 루프가 확인하는 트리거 플래그
+BTC_PRICE_WINDOW = {}            # {timestamp: price} 슬라이딩 윈도우
+BTC_SURGE_COOLDOWN_TS = 0        # 마지막 트리거 시각 (연속 트리거 방지)
+BTC_SURGE_THRESHOLD = 1.5        # 트리거 기준 상승률 (%) - AI OPTIMIZE로 조정 가능
 LATEST_TOP_PASS_SCORE = 0
 BOT_START_TIME = time.time()  
 last_auto_optimize_time = 0  
@@ -551,7 +561,7 @@ async def cache_cleanup_task():
     while True:
         try:
             await asyncio.sleep(3600)
-            clean_unused_caches()
+            await clean_unused_caches()
         except Exception as e:
             logging.error(f"캐시 청소 에러: {e}")
             await asyncio.sleep(60)
@@ -572,7 +582,12 @@ def safe_float(val: Any, default: float = 0.0) -> float:
     try:
         return float(val)
     except (ValueError, TypeError):
-        return float(default)
+        try:
+            # 🟢 AI가 '-1.5%' 처럼 기호를 섹어넣는 경우 숫자와 마이너스만 췘읠 변환한다
+            cleaned = re.sub(r'[^0-9.\-]', '', str(val))
+            return float(cleaned) if cleaned else float(default)
+        except (ValueError, TypeError):
+            return float(default)
 
 # 👇 [개선 로직] 타임아웃 15초로 연장 및 에러 타입(이름) 출력 기능 추가
 async def send_msg(text):
@@ -726,17 +741,20 @@ async def get_performance_stats_db():
     return win_rate, total_cnt, len(wins), total_profit, wins, losses
 
 # [OHLCV 정리용 헬퍼 함수 추가]
-def clean_unused_caches():
+async def clean_unused_caches():
     global OHLCV_CACHE, INDICATOR_CACHE, STRAT, trade_data
     active_tickers = set(STRAT.get('tickers', []) + list(trade_data.keys()) + ["KRW-BTC"])
     
-    # 딕셔너리 크기가 변경되므로 list로 키를 복사해서 순회
-    for t in list(OHLCV_CACHE.keys()):
-        if t not in active_tickers:
-            del OHLCV_CACHE[t]
-    for t in list(INDICATOR_CACHE.keys()):
-        if t not in active_tickers:
-            del INDICATOR_CACHE[t]
+    async with OHLCV_CACHE_LOCK:
+        for t in list(OHLCV_CACHE.keys()):
+            if t not in active_tickers:
+                del OHLCV_CACHE[t]
+
+    # 🟢 [버그픽스] INDICATOR_CACHE: Lock 보호 하에 안전하게 삭제
+    async with INDICATOR_CACHE_LOCK:
+        for t in list(INDICATOR_CACHE.keys()):
+            if t not in active_tickers:
+                del INDICATOR_CACHE[t]
             
     for t in list(REALTIME_CVD.keys()):
         if t not in active_tickers:
@@ -776,11 +794,11 @@ async def update_top_volume_tickers():
         CLASSIC_CONF['strategy']['tickers'] = top_tickers
         await save_config_async(QUANTUM_CONF, CONFIG_PATH)
         await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH)
-        clean_unused_caches()  # 불필요한 OHLCV/지표 캐시 정리
+        await clean_unused_caches()  # 불필요한 OHLCV/지표 캐시 정리
         return top_tickers
     except Exception as e:
         logging.error(f"❌ update_top_volume_tickers 오류: {e}")
-        clean_unused_caches()  # 오류가 나도 캐시 정리는 시도
+        await clean_unused_caches()  # 오류가 나도 캐시 정리는 시도
         return STRAT.get('tickers', [])
     
 
@@ -852,6 +870,9 @@ async def websocket_ticker_task():
                 await websocket.send(json.dumps(subscribe_fmt))
                 last_subscribed_tickers = set(current_tickers)
 
+                ws_recv_count = 0
+                ws_last_check_ts = time.time()
+
                 while True:
                     # 1. 중간에 코인이 매수/매도되거나 스캔 대상이 바뀌면 동적으로 웹소켓 '재구독' 처리
                     new_tickers = set(STRAT.get('tickers', []) + ["KRW-BTC"] + list(trade_data.keys()))
@@ -863,11 +884,21 @@ async def websocket_ticker_task():
                         ]
                         await websocket.send(json.dumps(subscribe_fmt))
                         last_subscribed_tickers = new_tickers
-                        logging.info(f"🔄 웹소켓 감시 종목 동적 갱신 (총 {len(new_tickers)}개)")
+                        logging.info(f"🔄 웹소켓 감시 종목 동적 갱신 (완료 {len(new_tickers)}개)")
+
+                    # 🟢 [Half-Open 감지] 30초마다 수신량 체크 후 '0건'이면 심폐소생
+                    now_ws = time.time()
+                    if now_ws - ws_last_check_ts >= 30:
+                        if ws_recv_count == 0:
+                            logging.warning("⚠️ 웹소켓 업슈 없음 (좏비 연결 감지). 강제 재연결...")
+                            break  # Inner loop 탈출 -> outer while: reconnect
+                        ws_recv_count = 0
+                        ws_last_check_ts = now_ws
 
                     # 2. 데이터 수신 (Timeout을 짧게 주어 루프가 멈추지 않고 종목 변경을 체크할 수 있게 함)
                     try:
                         raw_data = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+                        ws_recv_count += 1
                         if isinstance(raw_data, bytes):
                             data = json.loads(raw_data.decode('utf-8'))
                         elif isinstance(raw_data, str):
@@ -880,8 +911,28 @@ async def websocket_ticker_task():
                             code_str = str(data.get('code'))
                             
                             if data.get('type') == 'ticker':
-                                REALTIME_PRICES[code_str] = float(data['trade_price'])
+                                price = float(data['trade_price'])
+                                REALTIME_PRICES[code_str] = price
                                 REALTIME_PRICES_TS[code_str] = time.time()
+                                
+                                # 🟢 [BTC 급등 감지] BTC 가격을 슬라이딩 윈도우에 누적
+                                if code_str == 'KRW-BTC':
+                                    global BTC_SURGE_TRIGGERED, BTC_PRICE_WINDOW, BTC_SURGE_COOLDOWN_TS
+                                    now_ws = time.time()
+                                    BTC_PRICE_WINDOW[now_ws] = price
+                                    # 1분 답는 데이터만 유지 (60작 윈도우)
+                                    cutoff = now_ws - 60
+                                    BTC_PRICE_WINDOW = {t: p for t, p in BTC_PRICE_WINDOW.items() if t >= cutoff}
+                                    # 1분 전 기준값 vs 현재 가격으로 상승률 산정
+                                    if len(BTC_PRICE_WINDOW) >= 2:
+                                        oldest_price = min(BTC_PRICE_WINDOW.values())
+                                        if oldest_price > 0:
+                                            pct_change = (price - oldest_price) / oldest_price * 100
+                                            cooldown_ok = (now_ws - BTC_SURGE_COOLDOWN_TS) >= 180  # 3분 쿨다운
+                                            if pct_change >= BTC_SURGE_THRESHOLD and not BTC_SURGE_TRIGGERED and cooldown_ok:
+                                                BTC_SURGE_TRIGGERED = True
+                                                BTC_SURGE_COOLDOWN_TS = now_ws
+                                                logging.warning(f"🚨 BTC 급등 감지! 1분 +{pct_change:.2f}% → 비정규 딥스캔 트리거")
                                 
                             # 🟢 실시간 Taker Buy/Sell 누적 로직 (강력한 선행 지표)
                             elif data.get('type') == 'trade':
@@ -1021,7 +1072,7 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
         logging.error(f"TA 연산 중 스레드 오류: {e}")
         return None, None
 
-INDICATOR_CACHE, INDICATOR_CACHE_SEC = {}, 14
+INDICATOR_CACHE, INDICATOR_CACHE_SEC = {}, 60  # 🟢 [최적화] 14초→60초: 15분봉 불필요한 재계산 방지
 OHLCV_CACHE = {} 
 BALANCE_CACHE, BALANCE_CACHE_SEC = {"data": None, "timestamp": 0}, 10
 
@@ -1032,10 +1083,10 @@ async def get_indicators(ticker):
         if ticker in INDICATOR_CACHE and (now - INDICATOR_CACHE[ticker][0] < INDICATOR_CACHE_SEC):
             return INDICATOR_CACHE[ticker][1], INDICATOR_CACHE[ticker][2]
     try:
-        await asyncio.sleep(0.25) # 🟢 [FIX: API 보호용 미세 딜레이]
         async with OHLCV_CACHE_LOCK:
             cached = OHLCV_CACHE.get(ticker)
         if cached is None:
+            await asyncio.sleep(0.15)  # 🟢 [최적화] 캐시 미스 시에만 딜레이 (캐시 히트 시 12초 절약)
             df = await execute_upbit_api(pyupbit.get_ohlcv, ticker, interval=STRAT.get('interval', 'minute15'), count=200)
             if df is None or df.empty: return None, None
             async with OHLCV_CACHE_LOCK: OHLCV_CACHE[ticker] = df
@@ -1061,13 +1112,15 @@ async def get_indicators(ticker):
         df_copy = df.copy(deep=True)
         btc_copy = btc_df.copy(deep=True) if btc_df is not None else None
         
-        # ✨ 마법의 한 줄: CPU를 혹사시키는 계산 작업을 별도의 백그라운드 스레드로 던집니다.
-        prev_data, curr_data = await asyncio.to_thread(_calculate_ta_indicators, df_copy, btc_copy, STRAT)
+        # 🟢 [최적화] 고정된 스레드 풀으로 TA 계산 (스레드 경합 최소화 + 안정적 성능)
+        loop = asyncio.get_running_loop()
+        prev_data, curr_data = await loop.run_in_executor(_TA_EXECUTOR, _calculate_ta_indicators, df_copy, btc_copy, STRAT)
         
         if prev_data is None or curr_data is None:
             return None, None
             
-        INDICATOR_CACHE[ticker] = (now, prev_data, curr_data)
+        async with INDICATOR_CACHE_LOCK:
+            INDICATOR_CACHE[ticker] = (now, prev_data, curr_data)
         return prev_data, curr_data
         
     except Exception as e: 
@@ -1209,6 +1262,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             - penalty_st_downtrend: MUST be between -15 and 0 (Keep it low, we buy in downtrends)
             - penalty_rs_weakness: MUST be between -30 and -10
             - deep_scan_interval: MUST be between 900 and 1500
+            - btc_surge_threshold: MUST be between 1.0 and 3.0 (BTC 1분 상승률 트리거. 폭락장 = 낮게, 평온장 = 높게)
             """
             critical_rule = "CRITICAL RULE: You MUST include 'z_score' and 'bollinger' in BOTH 'trend_active_logic' and 'range_active_logic'. Remove breakout modifiers like 'bonus_volume_explosion'."
             
@@ -1226,7 +1280,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             - bonus_all_time_high: MUST be between 20 and 40
             - penalty_btc_weakness: MUST be between -30 and -15
             - penalty_weak_momentum: MUST be between -25 and -10
-            - deep_scan_interval: MUST be between 1200 and 1800
+            - deep_scan_interval: MUST be between 900 and 1800
+            - btc_surge_threshold: MUST be between 1.0 and 3.0 (BTC 1분 급등 트리거 기준%. 시장 변동성 높으면 낙게, 낙으면 높게 교정)
             """
             critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Remove panic dip bonuses."
 
@@ -1677,12 +1732,16 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     elif k == 'fgi_v_curve_max': v = max(1.5, min(3.0, float(v))) # FGI 최대 가중치
                     elif k == 'fgi_v_curve_min': v = max(0.5, min(1.0, float(v))) # FGI 최소 가중치
                     elif k == 'fgi_v_curve_greed_max': v = max(1.0, min(2.5, float(v))) # 기존 Greed Max는 삭제 (v_max, v_min으로 대체)
-                    elif k == 'deep_scan_interval': v = max(900, min(1800, int(v)))
+                    elif k == 'deep_scan_interval': v = max(900, min(1800, int(v)))  # 🟢 [최적화] 하한 900초 (15분)
                     elif k == 'pass_score_threshold': v = max(75, min(90, int(v))) # 통합: 통과 점수 상향
                     elif k == 'guard_score_threshold': v = max(60, min(75, int(v))) # 통합: 방어 점수 상향
                     elif k == 'sell_score_threshold': v = max(40, min(55, int(v))) # 통합: 매도 점수 상향
                     elif k == 'rsi_low_threshold': v = max(40.0, min(60.0, float(v))) # 통합: RSI 낮은 임계값 상향
                     elif k == 'rsi_high_threshold': v = max(70.0, min(85.0, float(v))) # 통합: RSI 높은 임계값 상향
+                    elif k == 'btc_surge_threshold':
+                        v = max(1.0, min(3.0, float(v)))
+                        global BTC_SURGE_THRESHOLD
+                        BTC_SURGE_THRESHOLD = v  # 전역 변수 즉시 반영
                     elif k == 'btc_short_term_vol_threshold': v = max(0.5, min(2.0, float(v)))
                     elif k == 'sleep_depth_threshold': v = max(0, min(1000000000, int(v)))
                     elif k == 'success_reference_count': v = max(5, min(15, int(v)))
@@ -2026,7 +2085,7 @@ async def run_full_scan(is_deep_scan=False):
         last_global_buy_time = time.time(); return
 
     indicator_results = []
-    scan_semaphore = asyncio.Semaphore(4)
+    scan_semaphore = asyncio.Semaphore(6)  # 🟢 [최적화] 4→6: 캐시 히트 시 병렬도 향상
     async def fetch_data(ticker):
         async with scan_semaphore:
             await asyncio.sleep(0.1)
@@ -2048,8 +2107,8 @@ async def run_full_scan(is_deep_scan=False):
         if isinstance(curr, pd.Series): curr = curr.to_dict()
         if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-        # 🟢 [적용 1] 복잡했던 수십 줄의 코드를 단 한 줄로 압축! (변수명 prev, curr 매칭)
-        mtf_dict = await get_mtf_trend(t)
+        # 🟢 MTF는 케시를 통해 선제적으로 프리페치 (2차 API 파도 방지)
+        mtf_dict = await get_mtf_trend(t)  # 표었으면 케시, 없으면 API 호출 후 자동 케시됨
         score, fatal, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=mtf_dict)
 
         if fatal:
@@ -2427,7 +2486,7 @@ async def send_score_debug_report():
         return
 
     score_results = []
-    scan_semaphore = asyncio.Semaphore(4)
+    scan_semaphore = asyncio.Semaphore(6)  # 🟢 [최적화] 4→6
 
     async def fetch_and_score(t):
         async with scan_semaphore:
@@ -2533,9 +2592,9 @@ async def handle_telegram_updates():
                             
                             # 🟢 [개선 3-①] 롤백 시 잔여 찌꺼기(캐시) 완전 초기화
                             global INDICATOR_CACHE, OHLCV_CACHE
-                            INDICATOR_CACHE.clear()
-                            OHLCV_CACHE.clear()
-                            clean_unused_caches()
+                            async with INDICATOR_CACHE_LOCK: INDICATOR_CACHE.clear()
+                            async with OHLCV_CACHE_LOCK: OHLCV_CACHE.clear()
+                            await clean_unused_caches()
                             
                             await send_msg("⏪ <b>[긴급 롤백 완료]</b>\n전략 복구 및 인디케이터 캐시 초기화가 완료되었습니다.")
                         else:
@@ -2682,7 +2741,9 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     half_timeout_sec = full_timeout_sec / 2
     micro_timeout_sec = interval_sec * 1 
 
-    curr_i_safe = INDICATOR_CACHE[ticker][2] if ticker in INDICATOR_CACHE else {}
+    # 🟢 [버그픽스] Lock 없이 INDICATOR_CACHE 접근 시 에러 방지 (단일 get으로 원자적 참조)
+    _ind_snap = INDICATOR_CACHE.get(ticker)
+    curr_i_safe = _ind_snap[2] if _ind_snap else {}
     
     is_fundamental_broken = False
     if current_live_score is not None and ma_live_score < get_dynamic_strat_value('sell_score_threshold', mode=eval_mode, default=40):
@@ -3001,8 +3062,10 @@ async def main():
                     if int(p_rate) >= 1 and int(p_rate) > t.get('last_notified_step', 0): await send_msg(f"📈 {ticker} 랠리! {p_rate:+.2f}%"); t['last_notified_step'] = int(p_rate); changed = True
                     
                     current_live_score = None
-                    if ticker in INDICATOR_CACHE:
-                        prev_i, curr_i = INDICATOR_CACHE[ticker][1], INDICATOR_CACHE[ticker][2]
+                    # 🟢 [버그픽스] 루프 도중 캐시 삭제로 인한 KeyError 방지
+                    _ind_snap = INDICATOR_CACHE.get(ticker)
+                    if _ind_snap:
+                        prev_i, curr_i = _ind_snap[1], _ind_snap[2]
                         
                         if isinstance(prev_i, pd.Series): prev_i = prev_i.to_dict()
                         if isinstance(curr_i, pd.Series): curr_i = curr_i.to_dict()
@@ -3161,8 +3224,17 @@ async def main():
                 except Exception as e:
                     logging.error(f"승률 기반 최적화 로직 오류: {e}")
             
+            # 5-A. 🚨 BTC 급등 감지 시 비정규 딥스캔 즉시 실행 (웹소켓 트리거 확인)
+            global BTC_SURGE_TRIGGERED
+            if BTC_SURGE_TRIGGERED and is_running:
+                BTC_SURGE_TRIGGERED = False
+                if not SCAN_IN_PROGRESS:
+                    await send_msg("🚨 <b>BTC 급등 포착!</b> 알트코인 연동 상승 기회를 즉시 탐색합니다.")
+                    asyncio.create_task(background_scan_task(True))
+                # 스캔 중이더라도 플래그는 리셋하여 중복 트리거 방지
+
             # 5. 딥 스캔 실행 조건
-            if is_running and (now_ts - last_global_buy_time >= STRAT.get("deep_scan_interval", 1800)):
+            if is_running and (now_ts - last_global_buy_time >= STRAT.get("deep_scan_interval", 900)):  # 🟢 [최적화] 기본값 1800→900초 (15분봉 주기 정렬)
                 if not SCAN_IN_PROGRESS: 
                     asyncio.create_task(background_scan_task(True))
                 else: 
