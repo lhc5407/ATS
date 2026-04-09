@@ -1,4 +1,4 @@
-import pyupbit
+﻿import pyupbit
 import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -33,6 +33,7 @@ from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
 import logging
+from logging.handlers import RotatingFileHandler
 import socket
 import random
 
@@ -49,7 +50,7 @@ log_filepath = os.path.join(log_dir, log_filename)
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     handlers=[
-                        logging.FileHandler(log_filepath, encoding='utf-8'),
+                        RotatingFileHandler(log_filepath, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
                         logging.StreamHandler(sys.__stderr__)
                     ])
 logging.getLogger().handlers[1].setLevel(logging.ERROR)
@@ -546,6 +547,15 @@ async def db_flush_task():
                 TRADE_DATA_DIRTY = True 
                 logging.error(f"DB 일괄 저장 중 에러: {e}")
 
+async def cache_cleanup_task():
+    while True:
+        try:
+            await asyncio.sleep(3600)
+            clean_unused_caches()
+        except Exception as e:
+            logging.error(f"캐시 청소 에러: {e}")
+            await asyncio.sleep(60)
+
 def robust_clean(data):
     if isinstance(data, dict): return {k: robust_clean(v) for k, v in data.items()}
     elif isinstance(data, list): return [robust_clean(v) for v in data]
@@ -626,7 +636,7 @@ async def execute_upbit_api(api_call, *args, **kwargs):
 DB_FILE = "ats_unified.db"
 
 async def init_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""CREATE TABLE IF NOT EXISTS trade_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, ticker TEXT, side TEXT, 
@@ -638,7 +648,7 @@ async def init_db():
         await db.commit()
 
 async def save_trade_status_db(trade_data_dict):
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         await db.execute("DELETE FROM trade_status") 
         for ticker, data in trade_data_dict.items():
             try:
@@ -661,7 +671,7 @@ async def save_trade_status_db(trade_data_dict):
 
 async def load_trade_status_db():
     trade_data_dict = {}
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         async with db.execute("SELECT ticker, data_json FROM trade_status") as cursor:
             async for row in cursor:
                 try: trade_data_dict[row[0]] = json.loads(row[1])
@@ -671,7 +681,7 @@ async def load_trade_status_db():
 # 🟢 [개선 2-① & 1-②] RAG 컨텍스트 추출 전용 함수 (중복 호출 방지 및 극단적 사례 포함)
 async def get_rag_context():
     try:
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
             db.row_factory = aiosqlite.Row
             # 1. 가장 크게 수익 난 사례 (최대 2건)
             c1 = await db.execute("SELECT ticker, profit_krw, reason FROM trade_history WHERE side='SELL' AND profit_krw > 0 ORDER BY profit_krw DESC LIMIT 2")
@@ -693,7 +703,7 @@ async def get_rag_context():
 # 🟢 [Pylance 방어] profit_krw의 기본값을 0.0(float)으로 명시하여 타입 에러를 해결합니다.
 async def record_trade_db(ticker, side, price, amount, profit_krw=0.0, reason="", status="UNKNOWN", rating=0, improvement="", pass_score=0):
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         await db.execute("""INSERT INTO trade_history 
             (timestamp, ticker, side, price, amount, profit_krw, reason, status, rating, improvement, pass_score) 
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", 
@@ -701,7 +711,7 @@ async def record_trade_db(ticker, side, price, amount, profit_krw=0.0, reason=""
         await db.commit()
 
 async def get_performance_stats_db():
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         db.row_factory = aiosqlite.Row 
         async with db.execute("SELECT ticker, side, price, amount, profit_krw, reason, status, rating, improvement FROM trade_history WHERE side='SELL' ORDER BY id DESC") as cursor:
             rows = await cursor.fetchall()
@@ -727,6 +737,13 @@ def clean_unused_caches():
     for t in list(INDICATOR_CACHE.keys()):
         if t not in active_tickers:
             del INDICATOR_CACHE[t]
+            
+    for t in list(REALTIME_CVD.keys()):
+        if t not in active_tickers:
+            if t in REALTIME_CVD: del REALTIME_CVD[t]
+            if t in REALTIME_VOL: del REALTIME_VOL[t]
+            if t in REALTIME_PRICES_TS: del REALTIME_PRICES_TS[t]
+            if t in REALTIME_PRICES: del REALTIME_PRICES[t]
 
 async def update_top_volume_tickers():
     global STRAT
@@ -1444,10 +1461,10 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
                 default_atr = 1.0 if strategy_mode == "QUANTUM" else 1.5
                 default_timeout = 5 if strategy_mode == "QUANTUM" else 10
                 exit_plan = {
-                    "target_atr_multiplier": max(1.0, min(10.0, float(raw_plan.get('target_atr_multiplier', 3.5)))),
-                    "stop_loss": max(-4.0, min(-0.5, float(raw_plan.get('stop_loss', default_stop)))),
-                    "atr_mult": max(0.5, min(4.0, float(raw_plan.get('atr_mult', default_atr)))),
-                    "timeout": max(2, min(15, int(raw_plan.get('timeout', default_timeout))))
+                    "target_atr_multiplier": max(1.0, min(10.0, safe_float(raw_plan.get('target_atr_multiplier', 3.5)))),
+                    "stop_loss": max(-4.0, min(-0.5, safe_float(raw_plan.get('stop_loss', default_stop)))),
+                    "atr_mult": max(0.5, min(4.0, safe_float(raw_plan.get('atr_mult', default_atr)))),
+                    "timeout": max(2, min(15, int(safe_float(raw_plan.get('timeout', default_timeout)))))
                 }
                 return {"score": score, "decision": decision, "reason": str(extracted_reason), "exit_plan": exit_plan}
                 
@@ -2013,6 +2030,7 @@ async def run_full_scan(is_deep_scan=False):
     scan_semaphore = asyncio.Semaphore(4)
     async def fetch_data(ticker):
         async with scan_semaphore:
+            await asyncio.sleep(0.1)
             p, c = await get_indicators(ticker)
             return ticker, p, c
 
@@ -2266,7 +2284,7 @@ async def daily_settlement_report():
     yesterday_str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
     
     # 2. DB에서 최근 24시간 동안 발생한 '매도(SELL)' 기록만 싹 긁어옵니다.
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT profit_krw FROM trade_history WHERE side='SELL' AND timestamp >= ?", (yesterday_str,)) as cursor:
             rows = await cursor.fetchall()
@@ -2304,7 +2322,7 @@ async def generate_daily_proposal(bot_name="Hybrid"):
     try:
         today_str = datetime.now().strftime('%Y%m%d')
         
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
             cursor = await db.execute(
                 "SELECT id, timestamp, ticker, status, reason, improvement "
                 "FROM trade_history "
@@ -2332,7 +2350,7 @@ async def generate_daily_proposal(bot_name="Hybrid"):
                 f.write(f"💡 제언: {r[5]}\n")
                 f.write("-" * 60 + "\n")
         
-        async with aiosqlite.connect(DB_FILE) as db:
+        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
             reported_ids = [r[0] for r in rows]
             placeholders = ','.join('?' for _ in reported_ids)
             await db.execute(f"UPDATE trade_history SET is_reported = 1 WHERE id IN ({placeholders})", reported_ids)
@@ -2818,7 +2836,7 @@ async def main():
     trade_data = await load_trade_status_db()
     asyncio.create_task(websocket_ticker_task())
     
-    async with aiosqlite.connect(DB_FILE) as db:
+    async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
         async with db.execute("SELECT ticker, timestamp FROM trade_history WHERE side='SELL' ORDER BY id DESC LIMIT 50") as cursor:
             async for row in cursor:
                 ticker, ts_str = row[0], row[1]
@@ -2882,6 +2900,7 @@ async def main():
     await send_msg(await build_report("초기 보고", True))
     asyncio.create_task(background_scan_task(True)) # 🟢 [수정] 프로그램 시작 시 바로 딥 스캔 시작
     asyncio.create_task(db_flush_task())
+    asyncio.create_task(cache_cleanup_task())
     await asyncio.sleep(3)
 
     
@@ -3085,7 +3104,13 @@ async def main():
                         
                         # 2. AI 반성문과 텔레그램 발송은 백그라운드 태스크로 던져버림 (Fire and Forget)
                         # ticker=ticker 형태로 바인딩
-                        task = asyncio.create_task(background_sell_report(ticker=ticker, real_price=real_price, sell_qty=sell_qty, p_krw=p_krw, p_rate=p_rate, sell_reason_str=sell_reason_str, analyze_payload=analyze_payload))
+                        async def delayed_report_wrap():
+                            try:
+                                await asyncio.wait_for(background_sell_report(ticker=ticker, real_price=real_price, sell_qty=sell_qty, p_krw=p_krw, p_rate=p_rate, sell_reason_str=sell_reason_str, analyze_payload=analyze_payload), timeout=120.0)
+                            except Exception as e:
+                                logging.error(f"[{ticker}] 백그라운드 리포트 태스크 타임아웃/에러: {e}")
+
+                        task = asyncio.create_task(delayed_report_wrap())
                         background_tasks.add(task)
                         task.add_done_callback(background_tasks.discard)
                         continue
