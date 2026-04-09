@@ -83,6 +83,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
 1. OUTPUT FORMAT (CRITICAL): You MUST output ONLY valid JSON. 
    - DO NOT wrap the JSON in markdown code blocks.
    - DO NOT output any text outside the JSON object.
+   - STRICT SCHEMA RULE: Do NOT hallucinate wrapper objects like 'chief_strategy_officer_opinion'. You MUST strictly use the exact top-level keys provided in the MODE-SPECIFIC OUTPUT SCHEMAS.
 
 2. LANGUAGE RULE: All string values MUST be written in Korean.
 
@@ -94,6 +95,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - Fake Breakout Defense: If orderbook shows a massive sell wall, reject the BUY (decision: "SKIP").
 
 4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
+   - Fatal Flaw Locks: Python Engine automatically blocks trades if: 1) RSI > 55, or 2) Both Current & Previous Volumes < 1.2x SMA. Do NOT re-evaluate basic volume or overbought RSI rules that Python already handles.
    - Rapid Breakeven Lock: If a trade reaches +1.0% net profit at any point, the Python engine mathematically locks the stop-loss to secure a guaranteed net profit. Do not penalize trades that exit here; it is an intended risk management feature.
    - NET PROFIT RULE (NEW): All performance metrics provided to you (p_rate, profit_krw) ALREADY deduct the 0.1% round-trip exchange fee. A `p_rate` of 0.0% means true absolute breakeven. Do not double-calculate fees in your logic.
    - Time-Decay Stop: If a trade fails to bounce within half of its timeout period and loses momentum, the Python engine will auto-eject early. Recognize this as a "Time-Decay" exit in your SELL_REASON.
@@ -106,6 +108,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
    - [SELL_REASON]: {"rating": int, "status": "string", "reason": "string", "improvement": "string"}
    - [OPTIMIZE]: {"reason": "string", "exit_plan_guideline": "string", "strategy": {...}}
+   - [EVOLVE_PROMPT]: {"new_guideline": "string", "reason": "string"}
 """
 
 AI_SYSTEM_INSTRUCTION_QUANTUM = """
@@ -116,6 +119,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
 1. OUTPUT FORMAT (CRITICAL): You MUST output ONLY valid JSON. 
    - DO NOT wrap the JSON in markdown code blocks.
    - DO NOT output any text outside the JSON object.
+   - STRICT SCHEMA RULE: Do NOT hallucinate wrapper objects like 'chief_strategy_officer_opinion'. You MUST strictly use the exact top-level keys provided in the MODE-SPECIFIC OUTPUT SCHEMAS.
 
 2. LANGUAGE RULE: All string values MUST be written in Korean.
 
@@ -127,6 +131,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - Fake Breakout Defense: If orderbook shows a massive sell wall and no buying pressure, reject the BUY (decision: "SKIP").
 
 4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
+   - Fatal Flaw Locks: Python Engine automatically blocks trades if: 1) Short-term Trend is DOWN, 2) CVD (Net Buying Volume) is NEGATIVE, or 3) 4H MACD < 0. Do NOT create duplicate rules about macro trend blocks.
    - Trailing Stop Lock: If a trade reaches +1.0% net profit, the system activates a tight trailing stop. Do not penalize early exits; it's a risk management feature.
    - NET PROFIT RULE: All performance metrics (p_rate, profit_krw) ALREADY deduct the 0.1% round-trip exchange fee.
    - Trend-Decay Exit: If momentum stalls for more than 2-3 candles after a breakout, the Python engine will auto-eject to preserve capital.
@@ -139,6 +144,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
    - [SELL_REASON]: {"rating": int, "status": "string", "reason": "string", "improvement": "string"}
    - [OPTIMIZE]: {"reason": "string", "exit_plan_guideline": "string", "strategy": {...}}
+   - [EVOLVE_PROMPT]: {"new_guideline": "string", "reason": "string"}
 """
 
 VALID_INDICATORS = [
@@ -1321,6 +1327,29 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         Situation: Python preemptive purchase based on {strategy_desc}.
         Mission: Re-verify entry quality. {mission_detail} decision is BUY or SKIP. Provide JSON.
         """
+        
+    elif mode == "EVOLVE_PROMPT":
+        target_strat = get_strat_for_mode(eval_mode)
+        current_guideline = target_strat.get('exit_plan_guideline', '없음')
+        proposals_text = clean_data 
+        
+        prompt = f"""
+        [X_EVOLVE_PROMPT]
+        Strategy Mode: {eval_mode}
+        Current AI Prompt (exit_plan_guideline): 
+        {current_guideline}
+        
+        New Post-Trade AI Suggestions:
+        {proposals_text}
+        
+        Mission: Read the New Suggestions systematically. If they contain valuable insights or logical corrections that are NOT already in the 'Current AI Prompt', rewrite the Prompt.
+        * IMPORTANT RULE: Do NOT add instructions for conditions that are ALREADY handled by the Python Engine's 'HARDCODED SYSTEM OVERRIDES' (e.g., Fatal Flaw locks, Volume validation, Trailing Stops). Focus on nuanced, agentic evaluations that Python cannot natively compute.
+        Your goal is to formulate a concise, powerful, and directive guideline (in Korean) that will guide future agentic trade analysis based on empirical failures.
+        Ensure it is less than 4 sentences. If no practical changes are needed, just output the Current AI Prompt exactly as it is.
+        
+        Output JSON: {{"new_guideline": "string", "reason": "string"}}
+        """
+
     else: return None
 
     if not prompt.strip(): return None 
@@ -1377,6 +1406,12 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             res_json = json.loads(raw_json, strict=False)
 
             if mode == "OPTIMIZE": return res_json
+            if mode == "EVOLVE_PROMPT":
+                return {
+                    "new_guideline": str(res_json.get('new_guideline', '')),
+                    "reason": str(res_json.get('reason', 'N/A'))
+                }
+                
             if mode == "SELL_REASON":
                 if not isinstance(res_json, dict): raise Exception("응답이 딕셔너리가 아닙니다.")
                 return {
@@ -1392,6 +1427,17 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
                 if mode == "POST_BUY_REPORT" and decision not in ('BUY', 'SKIP'): decision = 'BUY' if score >= 50 else 'SKIP'
                 if mode == "BUY" and decision not in ('BUY', 'SKIP'): decision = 'SKIP'
                 
+                # 🟢 [추가] AI가 'reason' 대신 CSO 객체 안에 사유를 숨겼을 경우를 대비한 셜록 홈즈 로직
+                extracted_reason = res_json.get('reason')
+                if not extracted_reason:
+                    cso_opinion = res_json.get('chief_strategy_officer_opinion')
+                    if isinstance(cso_opinion, dict): 
+                        extracted_reason = cso_opinion.get('reason', 'N/A')
+                    elif isinstance(cso_opinion, str): 
+                        extracted_reason = cso_opinion
+                    else: 
+                        extracted_reason = 'N/A'
+                        
                 raw_plan = res_json.get('exit_plan', {})
                 strategy_mode = clean_data.get('strategy_mode', 'QUANTUM')
                 default_stop = -1.6 if strategy_mode == "QUANTUM" else -2.5
@@ -1403,7 +1449,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
                     "atr_mult": max(0.5, min(4.0, float(raw_plan.get('atr_mult', default_atr)))),
                     "timeout": max(2, min(15, int(raw_plan.get('timeout', default_timeout))))
                 }
-                return {"score": score, "decision": decision, "reason": str(res_json.get('reason', 'N/A')), "exit_plan": exit_plan}
+                return {"score": score, "decision": decision, "reason": str(extracted_reason), "exit_plan": exit_plan}
                 
         except Exception as e:
             retry_interval = (attempt + 1) * 1.0 
@@ -2291,6 +2337,33 @@ async def generate_daily_proposal(bot_name="Hybrid"):
             placeholders = ','.join('?' for _ in reported_ids)
             await db.execute(f"UPDATE trade_history SET is_reported = 1 WHERE id IN ({placeholders})", reported_ids)
             await db.commit()
+
+        # 🟢 [추가] 자가 학습 (프롬프트 진화) 플로우
+        proposals_str = ""
+        for r in rows:
+            if r[5] and r[5] != '없음':
+                proposals_str += f"- [{r[2]} | {r[3]}] 제언: {r[5]}\n"
+        
+        if proposals_str.strip():
+            await send_msg("🧬 <b>AI 자가 학습 시작</b>: 누적된 제언을 분석하여 시스템 프롬프트를 진화시킵니다...")
+            
+            for e_mode in ["CLASSIC", "QUANTUM"]:
+                evolve_res = await ai_analyze("ALL", proposals_str, mode="EVOLVE_PROMPT", eval_mode=e_mode)
+                if evolve_res and evolve_res.get('new_guideline'):
+                    new_guide = evolve_res['new_guideline']
+                    conf = CLASSIC_CONF if e_mode == "CLASSIC" else QUANTUM_CONF
+                    conf_path = CLASSIC_CONFIG_PATH if e_mode == "CLASSIC" else CONFIG_PATH
+                    old_guide = conf['strategy'].get('exit_plan_guideline', '')
+                    
+                    # 🟢 변화가 존재할 경우에만 덮어쓰기 실시 및 알림 전송
+                    if new_guide and new_guide != old_guide:
+                        conf['strategy']['exit_plan_guideline'] = new_guide
+                        # 런타임 메모리 즉시 반영 (STRAT 변수 오염 방지)
+                        if "Classic" in SYSTEM_STATUS and e_mode == "CLASSIC": STRAT['exit_plan_guideline'] = new_guide
+                        if "Quantum" in SYSTEM_STATUS and e_mode == "QUANTUM": STRAT['exit_plan_guideline'] = new_guide
+                        
+                        await save_config_async(conf, conf_path)
+                        await send_msg(f"✨ <b>[{e_mode} 지침 진화 완료]</b>\n- 기존: {old_guide}\n- <b>신규: {new_guide}</b>\n(사유: {evolve_res.get('reason', 'N/A')})")
 
         try:
             with open(file_path, "rb") as doc:
