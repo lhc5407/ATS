@@ -2331,26 +2331,35 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     chandelier_stop = t['high_p'] * 0.98 if max_p_rate >= 3.0 else 0
     stop_p = max(atr_stop, chandelier_stop)
     
-    adaptive_buffer = exit_plan.get('adaptive_breakeven_buffer', 0.003)
+    adaptive_buffer = exit_plan.get('adaptive_breakeven_buffer', 0.003) # 기본 0.3% 버퍼
     
-    if t.get('breakeven_locked') or (t.get('guard') and max_p_rate > 0.6): 
-        hard_breakeven_floor = avg_p * 1.005 
-        calculated_guard_p = t['high_p'] * (1 - adaptive_buffer)
-        stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
-    else: 
-        stop_p = max(stop_p, avg_p + (avg_p * (hard_s / 100.0)))
+    # 1. 기본 절대 손절선 세팅
+    stop_p = max(stop_p, avg_p + (avg_p * (hard_s / 100.0)))
     if entry_atr == 0: stop_p = max(stop_p, avg_p * 0.98) 
-    
-    if t.get('is_runner', False):
-        stop_p = max(stop_p, avg_p * 1.007)
+    if t.get('is_runner', False): stop_p = max(stop_p, avg_p * 1.007)
 
-    if max_p_rate >= 0.75:
+    # 2. 🟢 다단계 바닥(Floor) 끌어올리기 (수수료 방어 -> 약익절 보장 -> 본격 수익 보장)
+    hard_breakeven_floor = 0
+    if max_p_rate >= 1.0:
         t['breakeven_locked'] = True
-        
-    if t.get('breakeven_locked', False):
-        # 0.75% 도달 시 +0.3% 지점에 방어선을 쳐서 무조건 수익으로 마감시킴
-        stop_p = max(stop_p, avg_p * 1.003)
-    
+        hard_breakeven_floor = avg_p * 1.005  # 1.0% 도달 -> 최소 0.5% 수익 보장
+    elif max_p_rate >= 0.7:
+        t['breakeven_locked'] = True
+        hard_breakeven_floor = avg_p * 1.003  # 0.7% 도달 -> 최소 0.3% 수익 보장
+    elif max_p_rate >= 0.4:
+        t['breakeven_locked'] = True
+        hard_breakeven_floor = avg_p * 1.0015 # 0.4% 도달 -> 수수료 멘징 (손실 원천 차단)
+
+    # 3. 🟢 대표님 아이디어(꺾이면 팔자) + 샹들리에 추적
+    calculated_guard_p = 0
+    if t.get('breakeven_locked') or (t.get('guard') and max_p_rate > 0.6): 
+        # 최대 수익률이 높을수록 꺾임에 더 민감하게 반응 (2% 이상이면 버퍼 절반으로 축소)
+        dynamic_buffer = adaptive_buffer * 0.5 if max_p_rate >= 2.0 else adaptive_buffer
+        calculated_guard_p = t['high_p'] * (1 - dynamic_buffer)
+
+    # 4. 최종 트레일링 스탑라인 설정 (기존 스탑, 다단계 바닥, 꺾임 방어선 중 가장 '높은' 가격)
+    stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
+
     scale_out_step = t.get('scale_out_step', 0)
 
     timeout_candles = exit_plan.get('timeout', get_dynamic_strat_value('timeout_candles', mode=eval_mode, default=8))
