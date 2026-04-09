@@ -23,6 +23,7 @@ import requests
 import ssl
 import certifi
 import websockets
+import math
 from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
@@ -313,7 +314,13 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
     if eval_mode == "QUANTUM":
         if curr_i.get('ST_DIR', 1) == -1 or curr_close < curr_i.get('sma_long', 0): fatal_flaw = True
     else: # CLASSIC
-        if safe_float(curr_i.get('rsi')) > 55 or safe_float(curr_i.get('macd_h_diff')) < -safe_float(curr_i.get('macd_h_diff_sma'), 0) * 0.5: fatal_flaw = True 
+        if safe_float(curr_i.get('rsi')) > 55 or safe_float(curr_i.get('macd_h_diff')) < -safe_float(curr_i.get('macd_h_diff_sma'), 0) * 0.5: 
+            fatal_flaw = True 
+        # 🟢 [추가] 가짜 하락(Low Volume Dip) 필터링
+        vol = safe_float(curr_i.get('volume'), 0)
+        vol_sma = safe_float(curr_i.get('vol_sma'), 1) # 0으로 나누기 방지
+        if vol < (vol_sma * 1.2): 
+            fatal_flaw = True
     
     score = max(0, min(100, score))
     return score, fatal_flaw, eval_mode
@@ -463,6 +470,8 @@ last_update_id = None
 SCAN_IN_PROGRESS = False
 SYSTEM_STATUS = "🟢 정상 감시 중"
 
+background_tasks = set()
+
 INDICATOR_CACHE_LOCK = asyncio.Lock()
 OHLCV_CACHE_LOCK = asyncio.Lock()
 
@@ -568,6 +577,7 @@ DB_FILE = "ats_unified.db"
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("PRAGMA journal_mode=WAL;")
         await db.execute("""CREATE TABLE IF NOT EXISTS trade_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, ticker TEXT, side TEXT, 
             price REAL, amount REAL, profit_krw REAL, reason TEXT, status TEXT, rating INTEGER, improvement TEXT, pass_score INTEGER)""")
@@ -1131,13 +1141,16 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         
         Original Buy Reason: {clean_data.get('original_buy_reason')}
         Original Exit Plan: {clean_data.get('original_exit_plan')}
+        * Note for AI: In the Exit Plan, the 'timeout' value represents the number of CANDLES. Since this is a 15-minute timeframe, a timeout of 8 means 120 minutes. Do NOT confuse candles with minutes.
         
         Buy Indicators: {clean_data.get('buy_ind')}
         Sell Indicators: {clean_data.get('sell_ind')}
         Actual Sell Reason: {clean_data.get('actual_sell_reason')}
         
         Mission: Rate the trade performance (0-100) based on the {strategy_desc} strategy, and suggest improvements in Korean.
-        Did it follow the Original Exit Plan? Should it have taken profit earlier based on Max Reached Profit? Provide JSON.
+        Did it follow the Original Exit Plan? 
+        * CRITICAL: If the trade was closed via "Trailing Stop" or "Rapid Breakeven Lock" with a net positive profit (>0%), consider it a SUCCESSFUL risk management execution in a volatile market. Do NOT overly penalize it for failing to reach the maximum target.
+        Provide JSON.
         """
         
     elif mode == "BUY": 
@@ -1573,7 +1586,7 @@ async def execute_smart_buy(ticker, buy_amt, limit_price_threshold):
         if best_ask > limit_price_threshold: 
             return False, f"순간적인 가격 급등 (1호가 {best_ask}원이 마지노선 {limit_price_threshold}원 초과)"
             
-        buy_qty = remaining_amt / best_ask
+        buy_qty = math.floor((remaining_amt / best_ask) * 1e8) / 1e8
         res = await execute_upbit_api(upbit.buy_limit_order, ticker, best_ask, buy_qty)
         
         if not res or 'uuid' not in res: 
@@ -2682,7 +2695,10 @@ async def main():
                         _c_loc = safe_float(coin.get('locked'))
                         
                         qty = _c_bal + _c_loc
-                        sell_qty = qty * sell_qty_ratio if is_partial_sell else qty
+                        if is_partial_sell:
+                            sell_qty = math.floor((qty * sell_qty_ratio) * 1e8) / 1e8
+                        else:
+                            sell_qty = qty
                         
                         buy_principal = sell_qty * avg_p
                         invested_krw = buy_principal * 1.0005
@@ -2730,7 +2746,9 @@ async def main():
                         
                         # 2. AI 반성문과 텔레그램 발송은 백그라운드 태스크로 던져버림 (Fire and Forget)
                         # ticker=ticker 형태로 바인딩
-                        asyncio.create_task(background_sell_report(ticker=ticker, real_price=real_price, sell_qty=sell_qty, p_krw=p_krw, p_rate=p_rate, sell_reason_str=sell_reason_str, analyze_payload=analyze_payload))                        
+                        task = asyncio.create_task(background_sell_report(ticker=ticker, real_price=real_price, sell_qty=sell_qty, p_krw=p_krw, p_rate=p_rate, sell_reason_str=sell_reason_str, analyze_payload=analyze_payload))
+                        background_tasks.add(task)
+                        task.add_done_callback(background_tasks.discard)
                         continue
 
             # --- [주요 백그라운드 태스크 실행 및 보고 로직] ---
