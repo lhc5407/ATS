@@ -28,6 +28,8 @@ from google import genai
 from google.genai import types
 from datetime import datetime, timedelta
 import logging
+import socket
+import random
 
 # 🟢 로그 파일 설정
 if getattr(sys, 'frozen', False): base_path = os.path.dirname(sys.executable)
@@ -96,7 +98,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - You have full authority to tune "scoring_modifiers" in OPTIMIZE mode to adapt to market regimes.
 
 6. MODE-SPECIFIC OUTPUT SCHEMAS:
-   - [BUY] or [POST_BUY_REPORT]: {"reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
+   - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
    - [SELL_REASON]: {"rating": int, "status": "string", "reason": "string", "improvement": "string"}
    - [OPTIMIZE]: {"reason": "string", "exit_plan_guideline": "string", "strategy": {...}}
 """
@@ -129,7 +131,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - You have full authority to tune "scoring_modifiers" in OPTIMIZE mode.
 
 6. MODE-SPECIFIC OUTPUT SCHEMAS:
-   - [BUY] or [POST_BUY_REPORT]: {"reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
+   - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
    - [SELL_REASON]: {"rating": int, "status": "string", "reason": "string", "improvement": "string"}
    - [OPTIMIZE]: {"reason": "string", "exit_plan_guideline": "string", "strategy": {...}}
 """
@@ -281,8 +283,8 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
         'volume': 1.0 + (1.5 * normalized_regime_val)
     }
 
-# 🟢 [신규 추가] 중복을 제거한 공통 펀더멘탈 채점 엔진
-def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None):
+# 🟢 [추가 3] 파라미터에 mtf_data 추가 및 하드락 로직 강화
+def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
     # force_eval_mode가 주어지면 시장 상황을 무시하고 그 모드로만 채점합니다.
     eval_mode = force_eval_mode if force_eval_mode else determine_eval_mode(current_regime_mode, curr_i)
     logic_list = get_logic_list_for_mode(eval_mode, curr_i)
@@ -310,18 +312,35 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
         if btc_short_trend == "단기 하락": score += current_score_mods.get('bonus_btc_panic_dip', 10)
         if curr_i.get('ST_DIR', 1) == -1 and safe_float(curr_i.get('rsi')) < 35: score += current_score_mods.get('bonus_st_oversold_bounce', 10)
 
+    # 🟢 하드락(Fatal Flaw) 판별부 강화 (CVD 및 MTF 방어막 전개)
     fatal_flaw = False
+    
+    # 안전장치: mtf_data가 없으면 기본값 세팅
+    if mtf_data is None: mtf_data = {"4h_macd": 0, "1h_trend": 0}
+    
     if eval_mode == "QUANTUM":
-        if curr_i.get('ST_DIR', 1) == -1 or curr_close < curr_i.get('sma_long', 0): fatal_flaw = True
+        # 퀀텀 모드: 단기 추세 하락이거나, CVD(누적 순매수)가 음수면 "가짜 돌파"로 간주하여 컷오프!
+        if curr_i.get('ST_DIR', 1) == -1 or curr_close < curr_i.get('sma_long', 0): 
+            fatal_flaw = True
+        elif safe_float(curr_i.get('cvd', 0)) < 0:
+            fatal_flaw = True # 🚨 가격은 뚫었는데 순매도가 더 많음 (세력 털기)
+        elif mtf_data.get("4h_macd", 0) < 0:
+            fatal_flaw = True # 🚨 4시간봉 거시 추세가 하락인데 15분봉 돌파는 휩소 확률 90%
+            
     else: # CLASSIC
+        # 클래식 모드: 지표가 과열되었거나, 투매(거래량 급증)가 없으면 컷오프
         if safe_float(curr_i.get('rsi')) > 55 or safe_float(curr_i.get('macd_h_diff')) < -safe_float(curr_i.get('macd_h_diff_sma'), 0) * 0.5: 
             fatal_flaw = True 
-        # 🟢 [추가] 가짜 하락(Low Volume Dip) 필터링
+            
         vol = safe_float(curr_i.get('volume'), 0)
-        vol_sma = safe_float(curr_i.get('vol_sma'), 1) # 0으로 나누기 방지
+        vol_sma = safe_float(curr_i.get('vol_sma'), 1)
+        
         if vol < (vol_sma * 1.2): 
             fatal_flaw = True
-    
+        elif safe_float(curr_i.get('cvd', 0)) > 0 and vol > (vol_sma * 2.0):
+            # 🚨 팁: 폭락장인데 CVD(순매수)가 맹렬히 양수라면? 세력이 바닥에서 쓸어담고 있다는 진정한 V자 반등 시그널! (하드락 무사 통과)
+            pass
+
     score = max(0, min(100, score))
     return score, fatal_flaw, eval_mode
 
@@ -464,6 +483,8 @@ last_auto_optimize_time = 0
 consecutive_empty_scans = 0 
 REALTIME_PRICES = {}
 REALTIME_PRICES_TS = {}
+REALTIME_CVD = {} # 🟢 실시간 Taker CVD 저장소
+API_FATAL_ERRORS = 0 # 🟢 API 연속 실패 카운터
 
 is_running = True
 last_update_id = None
@@ -479,6 +500,7 @@ OHLCV_CACHE_LOCK = asyncio.Lock()
 MTF_CACHE = {}
 MTF_CACHE_SEC = 300
 
+instance_lock = None  # 🟢 [Pylance 완벽 방어] 미선언 상태로 global 참조 시 발생하는 경고를 해결하기 위해 전역 초기화
 
 TRADE_DATA_DIRTY = False  # 메모리 데이터가 변경되었는지 확인하는 플래그
 
@@ -569,6 +591,8 @@ async def execute_upbit_api(api_call, *args, **kwargs):
                 logging.error(f"❌ API 네트워크/서버 오류: {e}. {RETRY_INTERVAL_SECONDS}초 후 재시도...")
                 await asyncio.sleep(RETRY_INTERVAL_SECONDS)
     
+    global API_FATAL_ERRORS
+    API_FATAL_ERRORS += 1
     logging.error(f"🚫 API 호출 5회 연속 실패. 포기합니다: {getattr(api_call, '__name__', 'Unknown API')}")
     return None
 
@@ -617,6 +641,28 @@ async def load_trade_status_db():
                 try: trade_data_dict[row[0]] = json.loads(row[1])
                 except: pass
     return trade_data_dict
+
+# 🟢 [개선 2-① & 1-②] RAG 컨텍스트 추출 전용 함수 (중복 호출 방지 및 극단적 사례 포함)
+async def get_rag_context():
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            # 1. 가장 크게 수익 난 사례 (최대 2건)
+            c1 = await db.execute("SELECT ticker, profit_krw, reason FROM trade_history WHERE side='SELL' AND profit_krw > 0 ORDER BY profit_krw DESC LIMIT 2")
+            best_wins = [dict(r) for r in await c1.fetchall()]
+            
+            # 2. 가장 크게 손실 난 사례 (최대 2건)
+            c2 = await db.execute("SELECT ticker, profit_krw, reason FROM trade_history WHERE side='SELL' AND profit_krw < 0 ORDER BY profit_krw ASC LIMIT 2")
+            worst_losses = [dict(r) for r in await c2.fetchall()]
+            
+            # 3. 가장 최근 거래 (최대 2건)
+            c3 = await db.execute("SELECT ticker, profit_krw, reason FROM trade_history WHERE side='SELL' ORDER BY id DESC LIMIT 2")
+            recent = [dict(r) for r in await c3.fetchall()]
+            
+            return f"\n[RAG CONTEXT: Learn from Past Trades]\n- Biggest Wins: {best_wins}\n- Biggest Losses: {worst_losses}\n- Recent Trades: {recent}\n* CRITICAL: Avoid setups identical to the 'Biggest Losses'."
+    except Exception as e:
+        logging.error(f"RAG 데이터 추출 실패: {e}")
+        return ""
 
 # 🟢 [Pylance 방어] profit_krw의 기본값을 0.0(float)으로 명시하여 타입 에러를 해결합니다.
 async def record_trade_db(ticker, side, price, amount, profit_krw=0.0, reason="", status="UNKNOWN", rating=0, improvement="", pass_score=0):
@@ -740,7 +786,7 @@ async def get_market_regime():
 
 # 👇 [새로 추가할 코드] 실시간 웹소켓 가격 수신 엔진
 async def websocket_ticker_task():
-    global REALTIME_PRICES, STRAT, trade_data
+    global REALTIME_PRICES, STRAT, trade_data, REALTIME_CVD
     uri = "wss://api.upbit.com/websocket/v1"
 
     # 🟢 [추가] certifi를 이용해 안전한 SSL/TLS 컨텍스트 생성
@@ -750,15 +796,16 @@ async def websocket_ticker_task():
         try:
             # 🟢 [수정] websockets.connect에 ssl=ssl_context 파라미터 추가!
             async with websockets.connect(uri, ping_interval=60, ping_timeout=30, ssl=ssl_context) as websocket:
-                logging.info("🌐 업비트 실시간 웹소켓 연결 성공!")
+                logging.info("🌐 업비트 실시간 웹소켓 연결 성공 (Ticker & Trade)")
 
                 # 현재 감시해야 할 종목 리스트 (보유종목 + 스캔대상 + BTC)
                 current_tickers = list(set(STRAT.get('tickers', []) + ["KRW-BTC"] + list(trade_data.keys())))
 
-                # 업비트 웹소켓 구독 요청 (isOnlyRealtime=True 로 설정해 트래픽 최소화)
+                # 🟢 [개선 2-②] ticker와 함께 'trade'(체결) 데이터도 구독합니다!
                 subscribe_fmt = [
-                    {"ticket": "ats_hybrid_ticker"},
-                    {"type": "ticker", "codes": current_tickers, "isOnlyRealtime": True}
+                    {"ticket": "ats_hybrid_ws"},
+                    {"type": "ticker", "codes": current_tickers, "isOnlyRealtime": True},
+                    {"type": "trade", "codes": current_tickers, "isOnlyRealtime": True}
                 ]
                 await websocket.send(json.dumps(subscribe_fmt))
                 last_subscribed_tickers = set(current_tickers)
@@ -768,8 +815,9 @@ async def websocket_ticker_task():
                     new_tickers = set(STRAT.get('tickers', []) + ["KRW-BTC"] + list(trade_data.keys()))
                     if new_tickers != last_subscribed_tickers:
                         subscribe_fmt = [
-                            {"ticket": "ats_hybrid_ticker"},
-                            {"type": "ticker", "codes": list(new_tickers), "isOnlyRealtime": True}
+                            {"ticket": "ats_hybrid_ws"},
+                            {"type": "ticker", "codes": list(new_tickers), "isOnlyRealtime": True},
+                            {"type": "trade", "codes": list(new_tickers), "isOnlyRealtime": True}
                         ]
                         await websocket.send(json.dumps(subscribe_fmt))
                         last_subscribed_tickers = new_tickers
@@ -786,10 +834,23 @@ async def websocket_ticker_task():
                             data = raw_data
 
                         # dict 타입 확인 후 키 접근 (타입 체커 대응)
-                        if isinstance(data, dict) and 'code' in data and 'trade_price' in data:
-                            code_str = str(data['code'])
-                            REALTIME_PRICES[code_str] = float(data['trade_price'])
-                            REALTIME_PRICES_TS[code_str] = time.time() # 🟢 [개선] 가격이 들어온 '시간'을 정확히 타각
+                        if isinstance(data, dict):
+                            code_str = str(data.get('code'))
+                            
+                            if data.get('type') == 'ticker':
+                                REALTIME_PRICES[code_str] = float(data['trade_price'])
+                                REALTIME_PRICES_TS[code_str] = time.time()
+                                
+                            # 🟢 실시간 Taker Buy/Sell 누적 로직 (강력한 선행 지표)
+                            elif data.get('type') == 'trade':
+                                vol = float(data.get('trade_volume', 0))
+                                ask_bid = data.get('ask_bid') # ASK=매도호가체결(시장가매수), BID=매수호가체결(시장가매도)
+                                
+                                if ask_bid == 'ASK':
+                                    REALTIME_CVD[code_str] = REALTIME_CVD.get(code_str, 0.0) + vol
+                                elif ask_bid == 'BID':
+                                    REALTIME_CVD[code_str] = REALTIME_CVD.get(code_str, 0.0) - vol
+
                     except asyncio.TimeoutError:
                         continue # 1초 동안 시장에 거래가 없으면 다음 루프로 넘어가서 종목 변경 유무만 체크
 
@@ -820,6 +881,19 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
         df['ST_DIR'] = st[st.columns[1]]
         df['vwap'] = df.ta.vwap()
         df['vol_sma'] = df['volume'].rolling(window=20).mean()
+        
+        # 🟢 [추가 1] CVD (Cumulative Volume Delta) 근사치 계산 로직
+        # 고가-저가 범위 내에서 종가의 위치를 기반으로 매수/매도 압력을 분리합니다.
+        high_low_range = df['high'] - df['low']
+        high_low_range = high_low_range.replace(0, 0.00001) # 0으로 나누기 방지
+        
+        buy_pressure = df['volume'] * ((df['close'] - df['low']) / high_low_range)
+        sell_pressure = df['volume'] * ((df['high'] - df['close']) / high_low_range)
+        df['vol_delta'] = buy_pressure - sell_pressure
+        
+        # 최근 20캔들 동안의 순매수/순매도 누적량 (CVD)
+        df['cvd'] = df['vol_delta'].rolling(window=20).sum()
+        
         df['obv'] = df.ta.obv()
         df['rsi'] = df.ta.rsi(length=strat_params.get('rsi_len', 14))
         
@@ -951,14 +1025,15 @@ async def get_mtf_trend(ticker):
     global MTF_CACHE
     now = time.time()
     if ticker in MTF_CACHE and (now - MTF_CACHE[ticker]['time'] < MTF_CACHE_SEC):
-        return MTF_CACHE[ticker]['trend']
+        return MTF_CACHE[ticker]['data']
 
     try:
         await asyncio.sleep(0.05)
         df_1h = await execute_upbit_api(pyupbit.get_ohlcv, ticker, interval="minute60", count=30)
         df_4h = await execute_upbit_api(pyupbit.get_ohlcv, ticker, interval="minute240", count=30)
         
-        if df_1h is None or df_1h.empty or df_4h is None or df_4h.empty: return "알수없음"
+        if df_1h is None or df_1h.empty or df_4h is None or df_4h.empty: 
+            return {"str": "알수없음", "4h_macd": 0, "1h_trend": 0}
 
         ema20_1h = df_1h.ta.ema(length=20).iloc[-1]
         macd_4h = df_4h.ta.macd(fast=12, slow=26, signal=9)
@@ -967,12 +1042,18 @@ async def get_mtf_trend(ticker):
         trend_1h = "상승(EMA20 위)" if df_1h['close'].iloc[-1] > ema20_1h else "하락/횡보"
         trend_4h = "강세(MACD>0)" if macd_hist_4h > 0 else "약세(MACD<0)"
         
-        result = f"4H {trend_4h} / 1H {trend_1h}"
-        MTF_CACHE[ticker] = {'time': now, 'trend': result}
-        return result
+        # 🟢 [추가 2] 파이썬 로직에서 써먹기 위해 수치형 데이터를 함께 반환
+        result_data = {
+            "str": f"4H {trend_4h} / 1H {trend_1h}",
+            "4h_macd": macd_hist_4h,
+            "1h_trend": 1 if df_1h['close'].iloc[-1] > ema20_1h else -1
+        }
+        
+        MTF_CACHE[ticker] = {'time': now, 'data': result_data}
+        return result_data
     except Exception as e:
         logging.error(f"MTF 분석 실패 ({ticker}): {e}")
-        return "알수없음"
+        return {"str": "알수없음", "4h_macd": 0, "1h_trend": 0}
 
 BTC_SHORT_CACHE = {"data": {"trend": "알수없음", "volatility_pct": 0.0, "is_risky": False}, "timestamp": 0}
 
@@ -1030,11 +1111,11 @@ def is_highly_correlated(t1, t2):
 
 def extract_ai_essential_data(curr_data):
     # AI가 차트를 판단하는 데 꼭 필요한 핵심 지표만 필터링
-    essential_keys = ['close', 'volume', 'rsi', 'macd_h', 'ST_DIR', 'adx', 'z_score', 'bb_bw']
+    essential_keys = ['close', 'volume', 'rsi', 'macd_h', 'ST_DIR', 'adx', 'z_score', 'bb_bw', 'cvd']
     return {k: round(v, 4) for k, v in curr_data.items() if k in essential_keys}
 
 # --- [4. AI 분석 엔진] ---
-async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hours=0.0, win_rate=50.0, recent_wins=None, mtf_trend="알수없음", buy_price=0.0, market_regime=None, ignore_cooldown=False):
+async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hours=0.0, win_rate=50.0, recent_wins=None, mtf_trend="알수없음", buy_price=0.0, market_regime=None, ignore_cooldown=False, rag_context="", expected_slippage=0.0):
     global last_ai_call_time, last_coin_ai_call
     if mode == "BUY" and not ignore_cooldown and (time.time() - last_coin_ai_call.get(ticker, 0)) < 300: return None
     clean_data = robust_clean(data)
@@ -1167,23 +1248,26 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             strategy_desc = "Trend Follower & Breakout Trader (추세 추종 및 돌파 매매)"
             mission_detail = "Look for strong breakouts with confirmed volume. Check Orderbook for massive sell walls."
         
-        # 🟢 [추가] AI가 매도 벽과 패닉셀 속도를 감지할 수 있도록 직전 캔들과 호가창 힌트 추가
+        # 🟢 [Step 2 핵심: 에이전트 워크플로우(Agentic Workflow) 프롬프트]
         prompt = f"""
         [X_BUY]
         Ticker: {ticker} | Strategy Mode: {strategy_mode} | MTF: {mtf_trend} | Regime: {market_regime}
         Current Price: {clean_data.get('close')} | Prev Close: {clean_data.get('prev_close', '알수없음')}
         Orderbook Ask/Bid Imbalance: {clean_data.get('ob_imbalance', '알수없음')}
+        Expected Slippage: {expected_slippage}% (If > 0.3%, consider SKIP or reduce score)
         
         Indicators: {clean_data}
         Python Score: {clean_data.get('python_pass_score')}
         Guideline: {guideline}
         {warning_msg}
+        {rag_context}
         
-        Mission: You are the FINAL GATEKEEPER for the {strategy_desc} strategy. Evaluate risk/reward and provide JSON. {mission_detail}
-        - If mode is CLASSIC, look for extreme oversold conditions, Bollinger lower-band bounce, and strong reversal volume.
-        - If mode is QUANTUM, look for breakout confirmation, momentum expansion, and trend continuation evidence.
-        - If market_regime is HYBRID, identify the stronger regime signal before deciding.
-        Output "BUY" if AI Score >= 70. Otherwise "SKIP". Provide JSON.
+        Mission: Execute an AGENTIC WORKFLOW. You are a committee of 3 experts for the {strategy_desc} strategy.
+        Step 1. [Risk Agent]: Analyze downside risks, orderbook imbalance, and check if this matches past failure patterns in the [RAG CONTEXT].
+        Step 2. [Trend Agent]: Analyze upside potential, volume validation, and momentum strength ({mission_detail}).
+        Step 3. [Chief Strategy Officer]: Synthesize the two agents' opinions, finalize the risk/reward, and make the ultimate decision.
+        
+        Output "BUY" if the synthesized AI Score >= 70. Otherwise "SKIP". Provide JSON.
         """
         
     elif mode == "POST_BUY_REPORT": 
@@ -1498,9 +1582,12 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     STRAT[k] = v
                 
         if eval_mode == "CLASSIC":
+            # 🟢 [Step 4 핵심: 최적화 전 스냅샷 백업]
+            await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH.replace(".json", "_backup.json"))
             CLASSIC_CONF['strategy'] = STRAT
             await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH)
         else:
+            await save_config_async(QUANTUM_CONF, CONFIG_PATH.replace(".json", "_backup.json"))
             QUANTUM_CONF['strategy'] = STRAT
             await save_config_async(QUANTUM_CONF, CONFIG_PATH)
         ai_reason = str(res.get('reason', 'N/A')).replace('<', '&lt;').replace('>', '&gt;')
@@ -1619,7 +1706,10 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
     
     curr_data_dict = curr_data if isinstance(curr_data, dict) else curr_data.to_dict()
     curr_data_dict['strategy_mode'] = eval_mode
-    ai_res = await ai_analyze(ticker, curr_data_dict, mode="POST_BUY_REPORT", eval_mode=eval_mode, mtf_trend=mtf, buy_price=buy_price, market_regime=regime, win_rate=wr)
+    
+    mtf_str = mtf.get('str', '알수없음') if isinstance(mtf, dict) else str(mtf)
+    
+    ai_res = await ai_analyze(ticker, curr_data_dict, mode="POST_BUY_REPORT", eval_mode=eval_mode, mtf_trend=mtf_str, buy_price=buy_price, market_regime=regime, win_rate=wr)
     if not isinstance(ai_res, dict): ai_res = ai_res or {}
 
     if ticker in trade_data:
@@ -1646,7 +1736,35 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
     max_trades = strat.get('max_concurrent_trades', STRAT.get('max_concurrent_trades', 5)) 
     if held_count >= max_trades: return False
 
-    risk_pct = strat.get('risk_per_trade', STRAT.get('risk_per_trade', 2.0)) / 100.0
+    # 🟢 [Step 3 핵심: 켈리 공식(Kelly Criterion) 기반 동적 비중 조절]
+    # 최근 봇의 승률(W)과 손익비(R)를 가져옵니다.
+    wr_pct, total_cnt, _, _, wins, losses = await get_performance_stats_db()
+    
+    base_risk = strat.get('risk_per_trade', STRAT.get('risk_per_trade', 2.0)) / 100.0
+    risk_pct = base_risk # 기본값
+    
+    # 🟢 [개선 1-①] 절대 금액(krw)이 아닌 수익률(%) 기반으로 순수 전략 효율성 산출
+    if total_cnt >= 10:
+        W = wr_pct / 100.0
+        
+        # profit_krw를 매수금액(price * amount)으로 나누어 % 수익률을 구함
+        win_pcts = [(w['profit_krw'] / (w['price'] * w['amount'])) for w in wins if w['price'] > 0 and w['amount'] > 0]
+        loss_pcts = [abs(l['profit_krw'] / (l['price'] * l['amount'])) for l in losses if l['price'] > 0 and l['amount'] > 0]
+        
+        avg_win_pct = sum(win_pcts) / len(win_pcts) if win_pcts else 0.01
+        avg_loss_pct = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.01
+        
+        R = avg_win_pct / avg_loss_pct if avg_loss_pct > 0 else 1.5
+        
+        kelly_fraction = W - ((1.0 - W) / R)
+        
+        # 보수적 자산 관리를 위해 Half-Kelly(켈리 값의 절반) 사용
+        # 단, 최소 0.5% 보장, 최대 4.0%로 베팅 캡(Cap)을 씌워 극단적 몰빵 방지
+        if kelly_fraction > 0:
+            risk_pct = max(0.005, min(0.04, kelly_fraction / 2.0))
+        else:
+            risk_pct = 0.005 # 켈리 값이 음수(절대 투자하면 안 되는 장)일 경우 최소 정찰병만 보냄
+
     atr_pct = (curr_data['ATR'] / curr_data['close']) if curr_data['close'] > 0 else 0.01
     atr_pct = max(0.005, atr_pct) 
     
@@ -1658,14 +1776,6 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
     if (cash * 0.99) - buy_amt < 6000: buy_amt = cash * 0.99
         
     if buy_amt >= 6000: 
-        expected_slippage = await calculate_expected_slippage(ticker, buy_amt)
-        if expected_slippage > strat.get('max_slippage_pct', STRAT.get('max_slippage_pct', 0.3)):
-            score -= strat.get('slippage_penalty_score', STRAT.get('slippage_penalty_score', 20))
-            await send_msg(f"⚠️ <b>[슬리피지 경고]</b> {ticker} 예상 체결 오차 {expected_slippage:.2f}%! 점수 차감.")
-            if score < get_dynamic_strat_value('pass_score_threshold', mode=buy_mode, default=STRAT.get('pass_score_threshold', 60)):
-                await send_msg(f"🚫 <b>매수 취소</b>: {ticker} 슬리피지로 인한 펀더멘탈 점수 미달 ({score}점).")
-                return False
-
         max_tolerable_price = curr_data['close'] * 1.005 
         # 🟢 [수정 완료] 성공 여부와 실패 사유를 동시에 받아옵니다.
         buy_success, fail_reason = await execute_smart_buy(ticker, buy_amt, max_tolerable_price)
@@ -1787,10 +1897,20 @@ async def run_full_scan(is_deep_scan=False):
             p = safe_float(REALTIME_PRICES.get(ticker, avg_p))
             total_asset += (safe_float(b.get('balance')) + safe_float(b.get('locked'))) * p
 
-    if cash < 6000 or len(held_dict) >= STRAT.get('max_concurrent_trades', 5):
+    # 🟢 [Step 3 핵심: 거시 변동성 기반 동적 포트폴리오 노출(Exposure) 제한]
+    base_max_trades = STRAT.get('max_concurrent_trades', 5)
+    dynamic_max_trades = base_max_trades
+
+    # 비트코인이 단기 급락(is_risky) 중이거나, 시장이 극단적 공포(FGI <= 25)면 매수 슬롯을 강제로 줄임
+    if btc_short.get('is_risky', False):
+        dynamic_max_trades = max(1, base_max_trades // 2) # 위험장: 슬롯을 절반으로 쳐내어 현금 50% 강제 확보
+    elif fgi_val <= 25: 
+        dynamic_max_trades = max(2, base_max_trades - 1)  # 공포장: 슬롯 1개 축소
+
+    if cash < 6000 or len(held_dict) >= dynamic_max_trades:
         if is_deep_scan:
-            reason = "현금 부족 (6,000원 미만)" if cash < 6000 else "매수 슬롯 가득 참"
-            await send_msg(f"⏳ <b>매수 탐색 중단</b>: {reason}. 관망 모드를 유지합니다.")
+            reason = "현금 부족 (6,000원 미만)" if cash < 6000 else f"매수 슬롯 한도 도달 (현재 안전 한도: {dynamic_max_trades}개)"
+            await send_msg(f"⏳ <b>매수 탐색 중단</b>: {reason}. 현금 비중을 유지하며 관망합니다.")
         last_global_buy_time = time.time(); return
 
     indicator_results = []
@@ -1816,7 +1936,8 @@ async def run_full_scan(is_deep_scan=False):
         if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
         # 🟢 [적용 1] 복잡했던 수십 줄의 코드를 단 한 줄로 압축! (변수명 prev, curr 매칭)
-        score, fatal, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'])
+        mtf_dict = await get_mtf_trend(t)
+        score, fatal, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=mtf_dict)
 
         if fatal:
             score = -999
@@ -1830,7 +1951,7 @@ async def run_full_scan(is_deep_scan=False):
         if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
         
         # 🟢 mode 변수를 그대로 넘겨줍니다.
-        python_passed.append({"t": t, "score": score, "data": curr, "prev_data": prev, "mtf": await get_mtf_trend(t), "mode": eval_mode})
+        python_passed.append({"t": t, "score": score, "data": curr, "prev_data": prev, "mtf": mtf_dict["str"], "mode": mode})
 
     # 🟢 [수정 5] for 루프 종료 후, LATEST_TOP_PASS_SCORE 덮어쓰기!
     LATEST_TOP_PASS_SCORE = current_loop_max_score
@@ -1853,8 +1974,12 @@ async def run_full_scan(is_deep_scan=False):
         report_msg += f"• {p['t']} : {p['score']}점 ({mode_icon} {p['mode']})\n"
     await send_msg(report_msg)
 
+    # 🟢 [수정 후] RAG를 루프 밖에서 한 번만 호출하고, 슬리피지를 사전 계산하여 AI에게 넘김
     ai_approved = []
     ai_rejected = []
+    
+    global_rag_context = await get_rag_context() # 1회만 호출하여 성능 최적화
+    est_buy_amt = total_asset * 0.02 # 임시 예상 매수 금액 (2%)
 
     for p in python_passed:
         ai_data = extract_ai_essential_data(p['data'].to_dict()) if hasattr(p['data'], 'to_dict') else p['data']
@@ -1863,6 +1988,7 @@ async def run_full_scan(is_deep_scan=False):
         
         # 🟢 추가 로직: AI의 눈을 뜨게 해줄 필수 데이터 공급
         ai_data['prev_close'] = p['prev_data'].get('close', '알수없음') if isinstance(p.get('prev_data'), dict) else '알수없음'
+        ai_data['realtime_cvd'] = REALTIME_CVD.get(p['t'], 0.0) # 🟢 실시간 Taker CVD 추가
         
         ob = await execute_upbit_api(pyupbit.get_orderbook, p['t'])
         if ob and 'total_bid_size' in ob and 'total_ask_size' in ob:
@@ -1870,8 +1996,15 @@ async def run_full_scan(is_deep_scan=False):
             ai_data['ob_imbalance'] = round(ta / tb, 2) if tb > 0 else "알수없음"
         else:
             ai_data['ob_imbalance'] = "알수없음"
-        
-        ana = await ai_analyze(p['t'], ai_data, mode="BUY", eval_mode=p['mode'], ignore_cooldown=True, mtf_trend=p['mtf'], market_regime=regime)
+            
+        # 🟢 [개선 1-③] AI 결재 전 슬리피지 미리 계산
+        exp_slip = await calculate_expected_slippage(p['t'], est_buy_amt)
+        # 🟢 mtf가 딕셔너리인 경우 'str' 키의 문자열만 추출하여 일반 BUY 프롬프트에도 주입!
+        mtf_val = p.get('mtf', '알수없음')
+        mtf_str_for_buy = mtf_val.get('str', '알수없음') if isinstance(mtf_val, dict) else str(mtf_val)
+
+        # 🟢 AI 호출 시 rag_context와 expected_slippage 인자 전달 (mtf_trend 문자열 정리)
+        ana = await ai_analyze(p['t'], ai_data, mode="BUY", eval_mode=p['mode'], ignore_cooldown=True, mtf_trend=mtf_str_for_buy, market_regime=regime, rag_context=global_rag_context, expected_slippage=round(exp_slip, 2))
         if ana and ana['decision'] == "BUY":
             ai_approved.append({
                 "t": p['t'], "final_score": ana['score'], "decision": "BUY", 
@@ -2127,6 +2260,7 @@ COMMAND_HELP_MSG = """⌨️ <b>[사용 가능한 텔레그램 명령어]</b>
 • <b>매도</b> : 보유 중인 모든 종목 시장가 긴급 전량 청산
 • <b>최적화</b> : AI 기반 마스터 전략 및 파라미터 수동 최적화
 • <b>제안</b> : 누적된 AI 사후 분석 리포트(TXT 파일) 추출
+• <b>롤백</b> : AI 최적화 이전 상태로 마스터 전략 긴급 복구
 • <b>점수</b> : 🔍 [디버그] 감시 대상 종목 실시간 점수 랭킹 확인
 """
 
@@ -2238,6 +2372,36 @@ async def handle_telegram_updates():
                 elif cmd == "제안":
                     await send_msg("📁 <b>AI 제언 리포트 생성 중...</b>")
                     asyncio.create_task(generate_daily_proposal())
+                # 🟢 [Step 4 핵심: 롤백 명령어 추가]
+                elif cmd == "롤백":
+                    try:
+                        backup_q_path = CONFIG_PATH.replace(".json", "_backup.json")
+                        backup_c_path = CLASSIC_CONFIG_PATH.replace(".json", "_backup.json")
+                        
+                        if os.path.exists(backup_q_path) and os.path.exists(backup_c_path):
+                            with open(backup_q_path, 'r', encoding='utf-8') as f: q_back = json.load(f)
+                            with open(backup_c_path, 'r', encoding='utf-8') as f: c_back = json.load(f)
+                            
+                            # 원본 파일 덮어쓰기
+                            await save_config_async(q_back, CONFIG_PATH)
+                            await save_config_async(c_back, CLASSIC_CONFIG_PATH)
+                            
+                            # 메모리 상태 즉시 반영
+                            global QUANTUM_CONF, CLASSIC_CONF, STRAT
+                            QUANTUM_CONF, CLASSIC_CONF = q_back, c_back
+                            STRAT = QUANTUM_CONF['strategy'] if "Quantum" in SYSTEM_STATUS else CLASSIC_CONF['strategy']
+                            
+                            # 🟢 [개선 3-①] 롤백 시 잔여 찌꺼기(캐시) 완전 초기화
+                            global INDICATOR_CACHE, OHLCV_CACHE
+                            INDICATOR_CACHE.clear()
+                            OHLCV_CACHE.clear()
+                            clean_unused_caches()
+                            
+                            await send_msg("⏪ <b>[긴급 롤백 완료]</b>\n전략 복구 및 인디케이터 캐시 초기화가 완료되었습니다.")
+                        else:
+                            await send_msg("⚠️ 백업 파일이 아직 존재하지 않습니다.")
+                    except Exception as e:
+                        await send_msg(f"❌ 롤백 실패: {e}")
                 elif cmd == "점수":
                     asyncio.create_task(send_score_debug_report())
 
@@ -2440,16 +2604,49 @@ async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, se
         await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}] AI 통신 지연", status="ERROR_FALLBACK", rating=50)
         await send_msg(f"🔕 <b>최종 청산 완료 (비상 모드)</b> ({ticker})\n- 사유: {sell_reason_str}\n- 수익률: {p_rate:+.2f}%\n- 수익금: {p_krw:,.0f}원\n- AI: 구글 서버 지연으로 사후 분석 생략")
 
+# 🟢 [Step 4 핵심: 시스템 헬스 체크 (Watchdog)]
+# 메인 루프나 웹소켓이 모종의 이유로 멈추면 텔레그램으로 즉시 비상 알림을 보냅니다.
+last_main_loop_time = time.time()
+
+async def system_watchdog():
+    global last_main_loop_time, REALTIME_PRICES_TS, API_FATAL_ERRORS
+    await asyncio.sleep(60) # 봇 초기화 대기
+    
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            
+            # 🟢 [개선 3-②] 워치독 알림 3단계 세분화
+            # Level 3 (치명)
+            if API_FATAL_ERRORS >= 3:
+                await send_msg("🚨 <b>[FATAL] 업비트 API 장애 의심!</b>\n연속 응답 실패가 발생했습니다. 모든 신규 매수를 중지하고 포지션 수동 청산을 고려하세요.")
+                API_FATAL_ERRORS = 0 # 알림 후 초기화
+                
+            # Level 2 (심각)
+            if now - last_main_loop_time > 180: 
+                await send_msg("🔥 <b>[CRITICAL] 메인 엔진 정지 감지!</b>\n파이썬 감시 루프가 3분 이상 멈춰있습니다. 즉시 서버 확인 요망.")
+                last_main_loop_time = now 
+                
+            # Level 1 (경고)
+            dead_tickers = [t for t, ts in REALTIME_PRICES_TS.items() if now - ts > 60] # 1분으로 축소
+            if len(dead_tickers) > 15:
+                await send_msg(f"⚠️ <b>[WARNING] 네트워크 지연 감지</b>\n{len(dead_tickers)}개 종목 실시간 호가 1분 이상 지연.")
+                for dt in dead_tickers: REALTIME_PRICES_TS[dt] = now 
+                
+        except Exception as e:
+            logging.error(f"Watchdog 에러: {e}")
+
 async def main():
     # 🟢 [수정 완료] 안 쓰는 last_buy_time, last_update_id 삭제
     global trade_data, last_global_buy_time, BALANCE_CACHE, last_sell_time, is_running
 
     global instance_lock
-    import socket, random
+    
     try:
         instance_lock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         instance_lock.bind(('127.0.0.1', 65433)) # 통합 봇은 65433 포트를 사용하여 중복 실행을 방지합니다.
-    except socket.error:
+    except OSError:  # 🟢 [Pylance 방어] socket.error는 deprecated될 수 있으므로 표준 OSError로 교체
         logging.error("❌ 이미 ATS_Hybrid 봇이 실행 중입니다. 중복 실행을 방지하기 위해 즉시 종료합니다.")
         return # 이미 포트가 잠겨있다면 조용히 프로그램을 종료!
     
@@ -2478,6 +2675,11 @@ async def main():
 
     logging.info(f"ATS 통합 엔진 시작 ({SYSTEM_STATUS} 모드)")
     await send_msg(f"⚔️ <b>ATS_Hybrid 가동 시작</b> ({SYSTEM_STATUS} 모드)\n\n{COMMAND_HELP_MSG}")
+
+    await init_db()
+    trade_data = await load_trade_status_db()
+    asyncio.create_task(websocket_ticker_task())
+    asyncio.create_task(system_watchdog()) # 🟢 워치독 실행!
 
     last_report_time = time.time()
     last_loss_check_time = time.time()
@@ -2570,6 +2772,8 @@ async def main():
                 continue
             
             now_ts, now_dt = time.time(), datetime.now()
+            global last_main_loop_time
+            last_main_loop_time = now_ts # 🟢 메인 루프가 정상적으로 돌고 있음을 워치독에 보고 (심장 박동)
             
             
             if now_ts - BALANCE_CACHE['timestamp'] > BALANCE_CACHE_SEC: 
@@ -2774,6 +2978,10 @@ async def main():
             if now_dt.hour == 9 and now_dt.minute == 0 and now_dt.day != last_daily_report_day: 
                 await send_msg(await daily_settlement_report())
                 last_daily_report_day = now_dt.day
+                
+                # 🟢 [누락 보완] 무한 누적 방지: 당일 세력 매집 흐름 파악을 위한 실시간 CVD 초기화
+                global REALTIME_CVD
+                REALTIME_CVD.clear()
             
             # 3. 일일 AI 제안 파일 생성 (매일 오전 9시)
             if now_dt.hour == 9 and now_dt.minute == 0 and now_dt.day != last_proposal_day:
