@@ -1,4 +1,4 @@
-import pyupbit
+﻿import pyupbit
 import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -793,7 +793,7 @@ async def update_top_volume_tickers():
         
         sorted_data = sorted(json_response, key=lambda x: x.get('acc_trade_price_24h', 0), reverse=True)
         exclude = ['KRW-USDT', 'KRW-USDC', 'KRW-TUSD', 'KRW-DAI']
-        top_tickers = [x['market'] for x in sorted_data if isinstance(x, dict) and x.get('market') not in exclude][:30]
+        top_tickers = [x['market'] for x in sorted_data if isinstance(x, dict) and x.get('market') not in exclude][:50]
         
         balances = await execute_upbit_api(upbit.get_balances)
         if isinstance(balances, list):
@@ -2084,6 +2084,10 @@ async def run_full_scan(is_deep_scan=False):
 
             score_1st, fatal_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=None)
 
+            # 🟢 [수정] 하드락이 아니면 대기 최고 점수 갱신에 우선 반영 (보고서 동기화용)
+            if not fatal_1st:
+                current_loop_max_score = max(current_loop_max_score, score_1st)
+
             pass_cut = get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80)
             if fatal_1st or score_1st < (pass_cut - 20):
                 continue
@@ -2093,8 +2097,6 @@ async def run_full_scan(is_deep_scan=False):
 
             if final_fatal:
                 final_score = -999
-
-            current_loop_max_score = max(current_loop_max_score, final_score)
 
             if final_score < pass_cut: 
                 continue
@@ -2467,6 +2469,14 @@ async def send_score_debug_report():
             score_results.append(res)
             
     score_results.sort(key=lambda x: x['score'], reverse=True)
+    
+    # 🟢 [추가] 실시간 스코어 현황 발신 시, 보고서용 최고 점수 전역 변수 동기화
+    global LATEST_TOP_PASS_SCORE
+    non_fatal_scores = [r['score'] for r in score_results if not r.get('fatal', False)]
+    if non_fatal_scores:
+        LATEST_TOP_PASS_SCORE = max(non_fatal_scores)
+    else:
+        LATEST_TOP_PASS_SCORE = 0
     
     msg = f"📊 <b>[디버그] 실시간 종목 점수 (기준: {current_regime_mode})</b>\n\n"
     for i, res in enumerate(score_results[:20]): 
