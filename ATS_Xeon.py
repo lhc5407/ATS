@@ -1,4 +1,4 @@
-﻿import pyupbit
+import pyupbit
 import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -741,7 +741,6 @@ def clean_unused_caches():
     for t in list(REALTIME_CVD.keys()):
         if t not in active_tickers:
             if t in REALTIME_CVD: del REALTIME_CVD[t]
-            if t in REALTIME_VOL: del REALTIME_VOL[t]
             if t in REALTIME_PRICES_TS: del REALTIME_PRICES_TS[t]
             if t in REALTIME_PRICES: del REALTIME_PRICES[t]
 
