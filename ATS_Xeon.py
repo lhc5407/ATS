@@ -2912,6 +2912,7 @@ async def main():
 
     await send_msg(await build_report("초기 보고", True))
     asyncio.create_task(background_scan_task(True)) # 🟢 [수정] 프로그램 시작 시 바로 딥 스캔 시작
+    last_global_buy_time = time.time() # 🟢 [버그 픽스] 중복 스캔 방지를 위해 시작 시점을 현재로 리셋
     asyncio.create_task(db_flush_task())
     asyncio.create_task(cache_cleanup_task())
     await asyncio.sleep(3)
