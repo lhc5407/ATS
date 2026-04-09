@@ -1,4 +1,4 @@
-﻿import pyupbit
+import pyupbit
 import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -37,6 +37,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import socket
 import random
+import glob
 
 # 🟢 [최적화] TA 스레드 풀 고정 (OS 레벨 스레드 경합 방지 + 예측 가능한 성능)
 _TA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="TA_Worker")
@@ -58,6 +59,21 @@ logging.basicConfig(level=logging.INFO,
                         logging.StreamHandler(sys.__stderr__)
                     ])
 logging.getLogger().handlers[1].setLevel(logging.ERROR)
+
+def cleanup_old_logs(days=3):
+    try:
+        now = time.time()
+        # ats_hybrid_log_*.log 패턴의 파일들 검색
+        for f in glob.glob(os.path.join(log_dir, "ats_hybrid_log_*.log")):
+            if os.path.isfile(f):
+                if os.stat(f).st_mtime < now - (days * 86400):
+                    os.remove(f)
+                    print(f"🧹 오래된 로그 삭제됨: {os.path.basename(f)}")
+    except Exception as e:
+        print(f"⚠️ 로그 정리 중 오류: {e}")
+
+# 시작 시 로그 정리 실행
+cleanup_old_logs(days=3)
 
 original_stdout = sys.stdout
 original_stderr = sys.stderr
