@@ -697,7 +697,7 @@ async def record_trade_db(ticker, side, price, amount, profit_krw=0.0, reason=""
 async def get_performance_stats_db():
     async with aiosqlite.connect(DB_FILE) as db:
         db.row_factory = aiosqlite.Row 
-        async with db.execute("SELECT ticker, side, price, profit_krw, reason, status, rating, improvement FROM trade_history WHERE side='SELL' ORDER BY id DESC") as cursor:
+        async with db.execute("SELECT ticker, side, price, amount, profit_krw, reason, status, rating, improvement FROM trade_history WHERE side='SELL' ORDER BY id DESC") as cursor:
             rows = await cursor.fetchall()
             rows = list(rows) # Explicitly convert to list to ensure len() is supported
             
@@ -740,7 +740,7 @@ async def update_top_volume_tickers():
         
         sorted_data = sorted(json_response, key=lambda x: x.get('acc_trade_price_24h', 0), reverse=True)
         exclude = ['KRW-USDT', 'KRW-USDC', 'KRW-TUSD', 'KRW-DAI']
-        top_tickers = [x['market'] for x in sorted_data if isinstance(x, dict) and x.get('market') not in exclude][:30]
+        top_tickers = [x['market'] for x in sorted_data if isinstance(x, dict) and x.get('market') not in exclude][:50]
         
         balances = await execute_upbit_api(upbit.get_balances)
         if isinstance(balances, list):
@@ -1798,8 +1798,8 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
         W = wr_pct / 100.0
         
         # profit_krw를 매수금액(price * amount)으로 나누어 % 수익률을 구함
-        win_pcts = [(w['profit_krw'] / (w['price'] * w['amount'])) for w in wins if w['price'] > 0 and w['amount'] > 0]
-        loss_pcts = [abs(l['profit_krw'] / (l['price'] * l['amount'])) for l in losses if l['price'] > 0 and l['amount'] > 0]
+        win_pcts = [(w['profit_krw'] / (safe_float(w.get('price')) * safe_float(w.get('amount')))) for w in wins if safe_float(w.get('price')) > 0 and safe_float(w.get('amount')) > 0]
+        loss_pcts = [abs(l['profit_krw'] / (safe_float(l.get('price')) * safe_float(l.get('amount')))) for l in losses if safe_float(l.get('price')) > 0 and safe_float(l.get('amount')) > 0]
         
         avg_win_pct = sum(win_pcts) / len(win_pcts) if win_pcts else 0.01
         avg_loss_pct = sum(loss_pcts) / len(loss_pcts) if loss_pcts else 0.01
