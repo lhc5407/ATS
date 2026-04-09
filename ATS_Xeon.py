@@ -83,7 +83,7 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
    - Buy the Dip: Actively look for RSI oversold (<35), Bollinger Band lower bounds, and Extreme Fear capitulations.
    - Volume Validation (NEW): Pure oversold signals without a volume spike are considered fake. Demand high volume on dips to confirm panic selling is over.
    - Ignore Macro Downtrend: DO NOT reject trades purely because the macro trend (BTC or MTF) is bearish. Downward trends are your hunting ground.
-   - Risk/Reward: Target profit must be at least 1.5x the stop loss.
+   - Risk/Reward: In CLASSIC mode (Bear Market Bounces), securing a fast +0.4% to +1.0% scalp profit is highly successful. DO NOT demand a 1.5x RRR. Praise the system if it secures small profits or protects capital via trailing stops in bad markets.
    - Fake Breakout Defense: If orderbook shows a massive sell wall, reject the BUY (decision: "SKIP").
 
 4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
@@ -1148,8 +1148,10 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         Actual Sell Reason: {clean_data.get('actual_sell_reason')}
         
         Mission: Rate the trade performance (0-100) based on the {strategy_desc} strategy, and suggest improvements in Korean.
-        Did it follow the Original Exit Plan? 
-        * CRITICAL: If the trade was closed via "Trailing Stop" or "Rapid Breakeven Lock" with a net positive profit (>0%), consider it a SUCCESSFUL risk management execution in a volatile market. Do NOT overly penalize it for failing to reach the maximum target.
+        Did it follow the Original Exit Plan? Should it have taken profit earlier based on Max Reached Profit? 
+        * CRITICAL NOTES: 
+        1. If closed via 'Trailing Stop' or 'Breakeven Lock' with positive profit, rate it highly (>75) as successful risk management.
+        2. 'Buy Indicators' are from an INCOMPLETE candle (live data). The 'volume' might appear lower than 'vol_sma' simply because the candle just started. Do not overly penalize low volume if other oversold signals were extremely strong.
         Provide JSON.
         """
         
@@ -2342,11 +2344,12 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     if t.get('is_runner', False):
         stop_p = max(stop_p, avg_p * 1.007)
 
-    if max_p_rate >= 1.0:
+    if max_p_rate >= 0.75:
         t['breakeven_locked'] = True
         
     if t.get('breakeven_locked', False):
-        stop_p = max(stop_p, avg_p * 1.005)
+        # 0.75% 도달 시 +0.3% 지점에 방어선을 쳐서 무조건 수익으로 마감시킴
+        stop_p = max(stop_p, avg_p * 1.003)
     
     scale_out_step = t.get('scale_out_step', 0)
 
