@@ -1,4 +1,4 @@
-import pyupbit
+﻿import pyupbit
 import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
@@ -618,9 +618,13 @@ RETRY_INTERVAL_SECONDS = 2
 
 # 🟢 [Pylance 완벽 방어] API 호출 횟수를 최대 5회로 제한하고, 업비트의 null(None) 데이터를 원천 차단합니다.
 async def execute_upbit_api(api_call, *args, **kwargs):
+    global API_FATAL_ERRORS
     for attempt in range(5):
         try:
             res = await asyncio.to_thread(api_call, *args, **kwargs)
+            
+            # 🟢 [안정성] 호출 성공 시 치명적 에러 카운트 초기화 (장기 가동 시 오알람 방지)
+            API_FATAL_ERRORS = 0
             
             if getattr(api_call, '__name__', '') == 'get_balances' and isinstance(res, list):
                 for b in res:
@@ -642,7 +646,6 @@ async def execute_upbit_api(api_call, *args, **kwargs):
                 logging.error(f"❌ API 네트워크/서버 오류: {e}. {RETRY_INTERVAL_SECONDS}초 후 재시도...")
                 await asyncio.sleep(RETRY_INTERVAL_SECONDS)
     
-    global API_FATAL_ERRORS
     API_FATAL_ERRORS += 1
     logging.error(f"🚫 API 호출 5회 연속 실패. 포기합니다: {getattr(api_call, '__name__', 'Unknown API')}")
     return None
@@ -765,7 +768,8 @@ async def clean_unused_caches():
 async def update_top_volume_tickers():
     global STRAT
     try:
-        tickers = pyupbit.get_tickers(fiat="KRW")
+        tickers = await execute_upbit_api(pyupbit.get_tickers, fiat="KRW")
+        if not tickers: return STRAT.get('tickers', [])
         if isinstance(tickers, tuple): tickers = tickers[0]
         url = f"https://api.upbit.com/v1/ticker?markets={','.join(tickers)}"
         res = await execute_upbit_api(requests.get, url, timeout=5)
@@ -818,7 +822,10 @@ async def get_market_regime():
         if not isinstance(fgi_res, requests.Response) or fgi_res.status_code != 200:
             return FGI_CACHE['data']
         
-        fgi_data = fgi_res.json()
+        try:
+            fgi_data = fgi_res.json()
+        except Exception:
+            return FGI_CACHE['data']
         if not isinstance(fgi_data, dict):
             return FGI_CACHE['data']
         
@@ -886,11 +893,11 @@ async def websocket_ticker_task():
                         last_subscribed_tickers = new_tickers
                         logging.info(f"🔄 웹소켓 감시 종목 동적 갱신 (완료 {len(new_tickers)}개)")
 
-                    # 🟢 [Half-Open 감지] 30초마다 수신량 체크 후 '0건'이면 심폐소생
+                    # 🟢 [Half-Open 감지] 120초간 데이터 수신이 전혀 없으면 '죽은 연결'로 간주하고 재접속 시도
                     now_ws = time.time()
-                    if now_ws - ws_last_check_ts >= 30:
+                    if now_ws - ws_last_check_ts >= 120:
                         if ws_recv_count == 0:
-                            logging.warning("⚠️ 웹소켓 업슈 없음 (좏비 연결 감지). 강제 재연결...")
+                            logging.warning("⚠️ 웹소켓 수신 지연(120초) 감지. 강제 재연결을 시도합니다.")
                             break  # Inner loop 탈출 -> outer while: reconnect
                         ws_recv_count = 0
                         ws_last_check_ts = now_ws
@@ -1427,6 +1434,9 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
 
     for attempt in range(3):
         try:
+            if attempt > 0:
+                await asyncio.sleep(2.0) # 🟢 [안정성] AI 재시도 시 2초 대기 (Rate Limit 대응)
+
             if attempt == 0 and mode != "POST_BUY_REPORT":
                 elapsed = time.time() - last_ai_call_time
                 if elapsed < GLOBAL_COOLDOWN: await asyncio.sleep(GLOBAL_COOLDOWN - elapsed)
@@ -2020,12 +2030,9 @@ async def run_full_scan(is_deep_scan=False):
     import random
     await asyncio.sleep(random.uniform(0.1, 1.0))
     
-    # 🟢 [보고체계 복구 2] 스캔 시작 알림 및 연속 관망 안내 복원
+    # 🟢 [알림 최적화] 스캔 시작 하트비트 메시지 제거 (소음 방지)
     if is_deep_scan:
-        if consecutive_empty_scans >= 3:
-            await send_msg(f"⏳ <b>[{consecutive_empty_scans + 1}회 연속 관망]</b> 타점이 포착되지 않아 안전하게 대기합니다.")
-        else: 
-            await send_msg(f"⏰ <b>{consecutive_empty_scans + 1}번째</b> 하이브리드 정규 스캔 중...")
+        logging.info(f"⏰ {consecutive_empty_scans + 1}번째 하이브리드 정규 스캔 시작...")
             
     btc_short = await get_btc_short_term_data() 
     regime = await get_market_regime()
@@ -2052,8 +2059,11 @@ async def run_full_scan(is_deep_scan=False):
     SYSTEM_STATUS = new_status 
 
     if is_deep_scan: 
-        # 🟢 [추가] 딥 스캔 시 거래대금 상위 종목 리스트를 갱신하여 최신 유동성 반영
-        await update_top_volume_tickers()
+        # 🟢 [안정성] 거래대금 상위 종목 갱신 시 API 지연으로 루프가 멈추는 것을 방지하기 위한 타임아웃(60초) 적용
+        try:
+            await asyncio.wait_for(update_top_volume_tickers(), timeout=60.0)
+        except asyncio.TimeoutError:
+            logging.error("⚠️ 상위 종목 리스트 갱신 시간 초과. 다음 턴을 노립니다.")
 
     balances = await execute_upbit_api(upbit.get_balances)
     if not isinstance(balances, list): return
@@ -2107,23 +2117,30 @@ async def run_full_scan(is_deep_scan=False):
         if isinstance(curr, pd.Series): curr = curr.to_dict()
         if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-        # 🟢 MTF는 케시를 통해 선제적으로 프리페치 (2차 API 파도 방지)
-        mtf_dict = await get_mtf_trend(t)  # 표었으면 케시, 없으면 API 호출 후 자동 케시됨
-        score, fatal, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=mtf_dict)
+        # 🟢 [해결책: Fail-Fast 1차 가채점] MTF(거시 데이터) 없이 순수 개별 차트 지표만으로 먼저 채점합니다.
+        # 여기서 기본 하드락(거래량 부족 등)에 걸리면 API를 낭비하지 않고 즉시 버립니다.
+        score_1st, fatal_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=None)
 
-        if fatal:
-            score = -999
+        # 1차 하드락 탈락이거나, 점수가 커트라인에서 너무 멀리 떨어진 경우 (MTF 보너스 최대치 15점을 감안해도 가망 없는 코인 필터링)
+        pass_cut = get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80)
+        if fatal_1st or score_1st < (pass_cut - 20):
+            continue
 
-        # 🟢 pass_score라는 변수 대신 score를 사용합니다
-        current_loop_max_score = max(current_loop_max_score, score)
+        # 🟢 [해결책: 2차 정밀 채점] 1차 서류를 통과한 '잠재적 유망 종목(소수)'에게만 MTF API를 호출합니다! (API 파도 90% 억제)
+        mtf_dict = await get_mtf_trend(t)
+        final_score, final_fatal, _ = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_dict)
 
-        if score < get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80): 
+        if final_fatal:
+            final_score = -999
+
+        current_loop_max_score = max(current_loop_max_score, final_score)
+
+        if final_score < pass_cut: 
             continue
 
         if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
         
-        # 🟢 mode 변수를 그대로 넘겨줍니다.
-        python_passed.append({"t": t, "score": score, "data": curr, "prev_data": prev, "mtf": mtf_dict["str"], "mode": mode})
+        python_passed.append({"t": t, "score": final_score, "data": curr, "prev_data": prev, "mtf": mtf_dict["str"], "mode": mode})
 
     # 🟢 [수정 5] for 루프 종료 후, LATEST_TOP_PASS_SCORE 덮어쓰기!
     LATEST_TOP_PASS_SCORE = current_loop_max_score
@@ -2821,18 +2838,19 @@ async def system_watchdog():
             # 🟢 [개선 3-②] 워치독 알림 3단계 세분화
             # Level 3 (치명)
             if API_FATAL_ERRORS >= 3:
-                await send_msg("🚨 <b>[FATAL] 업비트 API 장애 의심!</b>\n연속 응답 실패가 발생했습니다. 모든 신규 매수를 중지하고 포지션 수동 청산을 고려하세요.")
-                API_FATAL_ERRORS = 0 # 알림 후 초기화
+                await send_msg(f"🚨 <b>[FATAL] API 호출 연속 실패!</b>\n누적 치명적 오류가 {API_FATAL_ERRORS}회 발생했습니다. 계정 권한이나 네트워크를 확인하세요.")
+                API_FATAL_ERRORS = 0 # 알람 후 초기화
                 
             # Level 2 (심각)
-            if now - last_main_loop_time > 180: 
-                await send_msg("🔥 <b>[CRITICAL] 메인 엔진 정지 감지!</b>\n파이썬 감시 루프가 3분 이상 멈춰있습니다. 즉시 서버 확인 요망.")
+            elapsed_loop = now - last_main_loop_time
+            if elapsed_loop > 180: 
+                await send_msg(f"🔥 <b>[CRITICAL] 메인 엔진 정지 감지!</b>\n마지막 심장 박동 후 {int(elapsed_loop)}초가 경과했습니다. 즉시 서버 확인 요망.")
                 last_main_loop_time = now 
                 
             # Level 1 (경고)
-            dead_tickers = [t for t, ts in REALTIME_PRICES_TS.items() if now - ts > 60] # 1분으로 축소
+            dead_tickers = [t for t, ts in REALTIME_PRICES_TS.items() if now - ts > 60]
             if len(dead_tickers) > 15:
-                await send_msg(f"⚠️ <b>[WARNING] 네트워크 지연 감지</b>\n{len(dead_tickers)}개 종목 실시간 호가 1분 이상 지연.")
+                await send_msg(f"⚠️ <b>[WARNING] 네트워크 지연 감지</b>\n{len(dead_tickers)}개 종목의 실시간 데이터 수신이 1분 이상 끊겼습니다. (WebSocket 재구독 시도 중)")
                 for dt in dead_tickers: REALTIME_PRICES_TS[dt] = now 
                 
         except Exception as e:
