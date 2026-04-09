@@ -5,9 +5,14 @@ pd.set_option('future.no_silent_downcasting', True)
 
 # 🟢 [Pylance 및 로그 방어] Pandas의 미래 버전 호환성 경고(Warning)가 ERROR 로그로 둔갑하는 것을 원천 차단합니다.
 import warnings
-warnings.filterwarnings("ignore", category=FutureWarning)
+# 모든 종류의 파이썬/판다스 미래 호환성 경고 및 UserWarning 억제 (로그 오염 방지)
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=DeprecationWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
 warnings.filterwarnings("ignore", message=".*'d' is deprecated.*")
+warnings.filterwarnings("ignore", message=".*Pandas4Warning.*")
 warnings.filterwarnings("ignore", module="pandas")
+warnings.filterwarnings("ignore", module="pandas_ta")
 
 import numpy as np
 import telegram
@@ -262,11 +267,11 @@ def get_logic_list_for_mode(eval_mode: str, curr_data: dict) -> list:
 
 
 def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
-    v_min = safe_float(STRAT.get('fgi_v_curve_min', 0.5))
-    v_max = safe_float(STRAT.get('fgi_v_curve_max', 3.0))
+    v_min = safe_float(get_dynamic_strat_value('fgi_v_curve_min', mode=eval_mode, default=0.5))
+    v_max = safe_float(get_dynamic_strat_value('fgi_v_curve_max', mode=eval_mode, default=3.0))
 
     if eval_mode == "CLASSIC":
-        v_bottom = safe_float(STRAT.get('fgi_v_curve_bottom'), 70.0)
+        v_bottom = safe_float(get_dynamic_strat_value('fgi_v_curve_bottom', mode=eval_mode, default=70.0))
         dynamic_fgi_mult = v_max - ((fgi_val / v_bottom) * (v_max - v_min)) if fgi_val <= v_bottom else v_min
         normalized_regime_val = max(0.0, min(1.0, (dynamic_fgi_mult - v_min) / max(v_max - v_min, 0.0001)))
         return {
@@ -307,10 +312,18 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
     if eval_mode == "QUANTUM":
         if curr_close >= safe_float(curr_i.get('bb_u')): score += current_score_mods.get('bonus_volume_explosion', 30)
         if btc_short_trend == "단기 하락": score += current_score_mods.get('penalty_btc_weakness', -15)
+        
+        if curr_close >= safe_float(curr_i.get('kc_u', 99999999)): score += current_score_mods.get('bonus_all_time_high', 15)
+        if safe_float(curr_i.get('rsi', 50)) < 55: score += current_score_mods.get('penalty_weak_momentum', -15)
+        if safe_float(curr_i.get('rsi', 50)) >= 80: score += current_score_mods.get('penalty_overbought_rsi', -10)
     else: # CLASSIC
         if fgi_val <= 35 and safe_float(curr_i.get('rsi')) < 35: score += current_score_mods.get('bonus_golden_combo', 35)
         if btc_short_trend == "단기 하락": score += current_score_mods.get('bonus_btc_panic_dip', 10)
         if curr_i.get('ST_DIR', 1) == -1 and safe_float(curr_i.get('rsi')) < 35: score += current_score_mods.get('bonus_st_oversold_bounce', 10)
+        
+        if curr_i.get('ST_DIR', 1) == -1: score += current_score_mods.get('penalty_st_downtrend', 0)
+        if safe_float(curr_i.get('rs', 0)) < 0: score += current_score_mods.get('penalty_rs_weakness', -10)
+        if mtf_data and mtf_data.get('4h_macd', 0) < 0 and safe_float(curr_i.get('rsi')) <= 35: score += current_score_mods.get('bonus_mtf_panic_dip', 15)
 
     # 🟢 하드락(Fatal Flaw) 판별부 강화 (CVD 및 MTF 방어막 전개)
     fatal_flaw = False
@@ -328,18 +341,22 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
             fatal_flaw = True # 🚨 4시간봉 거시 추세가 하락인데 15분봉 돌파는 휩소 확률 90%
             
     else: # CLASSIC
-        # 클래식 모드: 지표가 과열되었거나, 투매(거래량 급증)가 없으면 컷오프
-        if safe_float(curr_i.get('rsi')) > 55 or safe_float(curr_i.get('macd_h_diff')) < -safe_float(curr_i.get('macd_h_diff_sma'), 0) * 0.5: 
+        # 1. 과매수 구간(RSI > 55) 진입 원천 차단
+        if safe_float(curr_i.get('rsi')) > 55: 
             fatal_flaw = True 
             
-        vol = safe_float(curr_i.get('volume'), 0)
-        vol_sma = safe_float(curr_i.get('vol_sma'), 1)
+        curr_vol = safe_float(curr_i.get('volume'), 0)
+        curr_vol_sma = safe_float(curr_i.get('vol_sma'), 1)
+        prev_vol = safe_float(prev_i.get('volume'), 0)
+        prev_vol_sma = safe_float(prev_i.get('vol_sma'), 1)
         
-        if vol < (vol_sma * 1.2): 
+        # 2. 거래량 투매 검증: 현재와 직전 캔들 모두 거래량이 안 터지면 가짜 하락(계단식 하락)으로 간주
+        if curr_vol < (curr_vol_sma * 1.2) and prev_vol < (prev_vol_sma * 1.2): 
             fatal_flaw = True
-        elif safe_float(curr_i.get('cvd', 0)) > 0 and vol > (vol_sma * 2.0):
-            # 🚨 팁: 폭락장인데 CVD(순매수)가 맹렬히 양수라면? 세력이 바닥에서 쓸어담고 있다는 진정한 V자 반등 시그널! (하드락 무사 통과)
-            pass
+            
+        # 3. V자 반등 특례: 거래량이 폭발했고 실시간 순매수(cvd)가 양수라면 세력의 바닥 줍기로 간주하여 락 강제 해제!
+        if safe_float(curr_i.get('cvd', 0)) > 0 and (curr_vol > curr_vol_sma * 1.5 or prev_vol > prev_vol_sma * 1.5):
+            fatal_flaw = False
 
     score = max(0, min(100, score))
     return score, fatal_flaw, eval_mode
@@ -402,26 +419,29 @@ async def calculate_expected_slippage(ticker, buy_amt_krw):
         logging.error(f"슬리피지 계산 오류 ({ticker}): {e}")
         return 0.0
 
-def get_coin_tier_params(ticker: str, curr_data: dict) -> dict:
+def get_coin_tier_params(ticker: str, curr_data: dict, eval_mode: str = "QUANTUM") -> dict:
     try:
-        # Type validation for curr_data parameter
+        major_params = get_dynamic_strat_value('major_params', mode=eval_mode, default={})
+        high_vol_params = get_dynamic_strat_value('high_vol_params', mode=eval_mode, default={})
+        mid_vol_params = get_dynamic_strat_value('mid_vol_params', mode=eval_mode, default={})
+
         if not isinstance(curr_data, dict):
-            return STRAT.get('major_params', {})
+            return major_params
         
         close_val = curr_data.get('close')
         atr_val = curr_data.get('ATR')
         
         if close_val is None or atr_val is None or close_val <= 0: 
-            return STRAT.get('major_params', {})
+            return major_params
         
         volatility_idx = (atr_val / close_val) * 100
         
-        if volatility_idx > 3.5: return STRAT.get('high_vol_params', {})
-        elif volatility_idx > 1.5: return STRAT.get('mid_vol_params', {})
-        else: return STRAT.get('major_params', {})
+        if volatility_idx > 3.5: return high_vol_params
+        elif volatility_idx > 1.5: return mid_vol_params
+        else: return major_params
     except Exception as e:
         logging.error(f"티어 분류 오류 ({ticker}): {e}")
-        return STRAT.get('major_params', {}) 
+        return get_dynamic_strat_value('major_params', mode=eval_mode, default={}) 
 
 def load_config():
     if getattr(sys, 'frozen', False): base_path = os.path.dirname(sys.executable)
@@ -926,27 +946,39 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
         if kc is not None and isinstance(kc, pd.DataFrame):
             df['kc_u'] = kc.iloc[:, 2]
         
-        # 4. 일목균형표(Ichimoku) 방어 및 정수(int) 강제 변환
-        # 🟢 [Pylance 및 런타임 방어] JSON에서 float(9.0)이나 str("9")로 넘어와도 무조건 int(9)로 깎아서 넣습니다.
+        # 4. 일목균형표(Ichimoku) 수동 계산 방어코드
+        # 🟢 [코드 레벨 픽스] pandas-ta의 ichimoku 함수 내의 datetime offset('d') 등 미래에 폐기(Deprecated)될 
+        # 판다스 문법을 원천 차단하기 위해 순수 수치 연산만으로 일목균형표를 수동 구현했습니다.
         t_len = int(float(strat_params.get('ichimoku_conversion_len', 9)))
         k_len = int(float(strat_params.get('ichimoku_base_len', 26)))
         s_len = int(float(strat_params.get('ichimoku_lead_span_b_len', 52)))
         
-        ichi_result = df.ta.ichimoku(tenkan=t_len, kijun=k_len, senkou=s_len)
+        tenkan_max = df['high'].rolling(window=t_len).max()
+        tenkan_min = df['low'].rolling(window=t_len).min()
+        tenkan_sen = (tenkan_max + tenkan_min) / 2
         
-        if ichi_result is not None:
-            ichi = ichi_result[0] if isinstance(ichi_result, tuple) else ichi_result
-            if isinstance(ichi, pd.DataFrame):
-                df['span_a'], df['span_b'] = ichi.iloc[:, 2], ichi.iloc[:, 3]
-            else:
-                df['span_a'], df['span_b'] = df['close'], df['close']
-        else:
-            df['span_a'], df['span_b'] = df['close'], df['close']
+        kijun_max = df['high'].rolling(window=k_len).max()
+        kijun_min = df['low'].rolling(window=k_len).min()
+        kijun_sen = (kijun_max + kijun_min) / 2
+        
+        senkou_span_a_raw = (tenkan_sen + kijun_sen) / 2
+        
+        senkou_b_max = df['high'].rolling(window=s_len).max()
+        senkou_b_min = df['low'].rolling(window=s_len).min()
+        senkou_span_b_raw = (senkou_b_max + senkou_b_min) / 2
+        
+        # 선행 스팬: 앞으로 이동(과거의 가격이 현재의 구름대를 형성)
+        df['span_a'] = senkou_span_a_raw.shift(k_len - 1).fillna(df['close'])
+        df['span_b'] = senkou_span_b_raw.shift(k_len - 1).fillna(df['close'])
         
         ssl_len = strat_params.get('ssl_len', 70)
         sma_h, sma_l = df.ta.sma(close=df['high'], length=ssl_len), df.ta.sma(close=df['low'], length=ssl_len)
         df['c'] = np.where(df['close'] > sma_h, 1, np.where(df['close'] < sma_l, -1, 0))
-        df['d'] = df['c'].replace(0, np.nan).ffill().fillna(1)
+        
+        # 🟢 [코드 레벨 픽스] .replace 의 암묵적 다운캐스팅 경고를 회피하기 위한 명시적 마스킹 처리
+        df['c'] = df['c'].astype(float)
+        df.loc[df['c'] == 0.0, 'c'] = np.nan
+        df['d'] = df['c'].ffill().fillna(1)
         df['ssl_up'], df['ssl_down'] = np.where(df['d'] == 1, sma_h, sma_l), np.where(df['d'] == 1, sma_l, sma_h)
         
         df['sma_short'] = df.ta.sma(length=strat_params.get('sma_short_len', 5))
@@ -1396,7 +1428,9 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
     }
 
 async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
-    global STRAT, last_auto_optimize_time
+    global last_auto_optimize_time
+    
+    target_strat = get_strat_for_mode(eval_mode)
     
     if trigger in ("auto", "daily"):
         remaining_cooldown = 3600 - (time.time() - last_auto_optimize_time)
@@ -1439,7 +1473,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
             else:
                 default_trend = ['supertrend', 'macd', 'volume', 'bollinger_breakout', 'sma_crossover', 'z_score']
             valid_trend = enforce_indicator_count(new_data['trend_active_logic'], default_trend)
-            old_trend = STRAT.get('trend_active_logic', [])
+            old_trend = target_strat.get('trend_active_logic', [])
             
             if set(old_trend) != set(valid_trend):
                 added = [x for x in valid_trend if x not in old_trend]
@@ -1448,7 +1482,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                 if added: msg_parts.append(f"추가[{', '.join(added)}]")
                 if removed: msg_parts.append(f"제외[{', '.join(removed)}]")
                 if msg_parts: changes.append(f"• 🚀 <b>강추세 지표</b>: {' / '.join(msg_parts)}")
-                STRAT['trend_active_logic'] = valid_trend
+                target_strat['trend_active_logic'] = valid_trend
                 
         if 'range_active_logic' in new_data: 
             if eval_mode == "CLASSIC":
@@ -1456,7 +1490,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
             else:
                 default_range = ['rsi', 'stochastics', 'bollinger_bandwidth', 'vwap', 'ssl_channel', 'z_score']
             valid_range = enforce_indicator_count(new_data['range_active_logic'], default_range)
-            old_range = STRAT.get('range_active_logic', [])
+            old_range = target_strat.get('range_active_logic', [])
             if set(old_range) != set(valid_range):
                 added = [x for x in valid_range if x not in old_range]
                 removed = [x for x in old_range if x not in valid_range]
@@ -1464,12 +1498,12 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                 if added: msg_parts.append(f"추가[{', '.join(added)}]")
                 if removed: msg_parts.append(f"제외[{', '.join(removed)}]")
                 if msg_parts: changes.append(f"• 🌊 <b>횡보장 지표</b>: {' / '.join(msg_parts)}")
-                STRAT['range_active_logic'] = valid_range
+                target_strat['range_active_logic'] = valid_range
 
         if 'indicator_weights' in new_data:
-            current_weights = STRAT.get('indicator_weights', {})
+            current_weights = target_strat.get('indicator_weights', {})
             raw_new_weights = new_data['indicator_weights']
-            active_indicators = set(STRAT.get('trend_active_logic', []) + STRAT.get('range_active_logic', []))
+            active_indicators = set(target_strat.get('trend_active_logic', []) + target_strat.get('range_active_logic', []))
             clamped_weights = {}
             for ind in active_indicators:
                 val = raw_new_weights.get(ind, current_weights.get(ind, 1.0))
@@ -1480,18 +1514,24 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     old_v = current_weights.get(k, 1.0) 
                     if old_v != v: weight_changes.append(f"{k}({old_v}→{v})")
                 if weight_changes: changes.append(f"• ⚖️ <b>가중치 조정</b>: {', '.join(weight_changes)}")
-                STRAT['indicator_weights'] = clamped_weights
+                target_strat['indicator_weights'] = clamped_weights
                 
         if 'scoring_modifiers' in new_data:
-            current_mods = STRAT.get('scoring_modifiers', {})
+            current_mods = target_strat.get('scoring_modifiers', {})
             raw_mods = new_data['scoring_modifiers']
             clamped_mods = {}
             mod_changes = []
             
-            valid_strategy_mods = [
-                'bonus_all_time_high', 'bonus_volume_explosion', 'penalty_btc_weakness',
-                'penalty_weak_momentum', 'penalty_overbought_rsi'
-            ]
+            if eval_mode == "CLASSIC":
+                valid_strategy_mods = [
+                    'bonus_mtf_panic_dip', 'bonus_btc_panic_dip', 'bonus_golden_combo', 
+                    'bonus_st_oversold_bounce', 'penalty_st_downtrend', 'penalty_rs_weakness'
+                ]
+            else:
+                valid_strategy_mods = [
+                    'bonus_all_time_high', 'bonus_volume_explosion', 'penalty_btc_weakness',
+                    'penalty_weak_momentum', 'penalty_overbought_rsi'
+                ]
             
             for mk in valid_strategy_mods:
                 val = raw_mods.get(mk, current_mods.get(mk))
@@ -1500,11 +1540,20 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                 try: mv = int(val)
                 except: mv = current_mods.get(mk, 0)
                 
-                if mk == 'bonus_all_time_high': clamped_mods[mk] = max(10, min(40, mv)) # 신고가 돌파 보너스
-                elif mk == 'bonus_volume_explosion': clamped_mods[mk] = max(20, min(50, mv)) # 거래량 폭발 보너스
-                elif mk == 'penalty_btc_weakness': clamped_mods[mk] = max(-30, min(-5, mv)) # 비트코인 약세 페널티
-                elif mk == 'penalty_weak_momentum': clamped_mods[mk] = max(-25, min(-5, mv)) # 약한 모멘텀 페널티
-                elif mk == 'penalty_overbought_rsi': clamped_mods[mk] = max(-20, min(-5, mv)) # 과매수 RSI 페널티
+                # QUANTUM Modifiers
+                if mk == 'bonus_all_time_high': clamped_mods[mk] = max(10, min(40, mv)) 
+                elif mk == 'bonus_volume_explosion': clamped_mods[mk] = max(20, min(50, mv)) 
+                elif mk == 'penalty_btc_weakness': clamped_mods[mk] = max(-30, min(-5, mv)) 
+                elif mk == 'penalty_weak_momentum': clamped_mods[mk] = max(-25, min(-5, mv)) 
+                elif mk == 'penalty_overbought_rsi': clamped_mods[mk] = max(-20, min(-5, mv)) 
+                
+                # CLASSIC Modifiers
+                elif mk == 'bonus_mtf_panic_dip': clamped_mods[mk] = max(15, min(35, mv))
+                elif mk == 'bonus_btc_panic_dip': clamped_mods[mk] = max(10, min(25, mv))
+                elif mk == 'bonus_golden_combo': clamped_mods[mk] = max(25, min(45, mv))
+                elif mk == 'bonus_st_oversold_bounce': clamped_mods[mk] = max(10, min(25, mv))
+                elif mk == 'penalty_st_downtrend': clamped_mods[mk] = max(-15, min(0, mv))
+                elif mk == 'penalty_rs_weakness': clamped_mods[mk] = max(-30, min(-10, mv))
                 
                 old_mv = current_mods.get(mk, "N/A")
                 if old_mv != clamped_mods[mk]:
@@ -1512,19 +1561,19 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     
             if mod_changes:
                 changes.append(f"• 🧮 <b>점수 가감 스위치 조정</b>: {', '.join(mod_changes)}")
-                STRAT['scoring_modifiers'] = clamped_mods
+                target_strat['scoring_modifiers'] = clamped_mods
 
         new_guideline = res.get('exit_plan_guideline')
-        if new_guideline and STRAT.get('exit_plan_guideline') != new_guideline:
+        if new_guideline and target_strat.get('exit_plan_guideline') != new_guideline:
             changes.append(f"• 📜 작전 지침: <b>{str(new_guideline).replace('<', '&lt;').replace('>', '&gt;')}</b>")
-            STRAT['exit_plan_guideline'] = new_guideline
+            target_strat['exit_plan_guideline'] = new_guideline
 
         tier_keys = ['high_vol_params', 'mid_vol_params', 'major_params']
         tier_updated = False
         
         for tk in tier_keys:
             if tk in new_data:
-                old_p = STRAT.get(tk, {})
+                old_p = target_strat.get(tk, {})
                 new_p = new_data[tk]
                 
                 if isinstance(new_p, dict):
@@ -1537,7 +1586,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                         "adx_strong_trend_threshold": float(new_p.get("adx_strong_trend_threshold", old_p.get("adx_strong_trend_threshold", 25.0)))
                     }
                     if old_p != updated_p:
-                        STRAT[tk] = updated_p
+                        target_strat[tk] = updated_p
                         tier_updated = True
 
         if tier_updated:
@@ -1545,7 +1594,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
             table_str += "<pre>Tier |  SL  | TAM |  ABB  | ASTH | ADX\n"
             table_str += "----------------------------------------\n"
             for tk, name in zip(tier_keys, ['High ', 'Mid  ', 'Major']):
-                p = STRAT.get(tk, {})
+                p = target_strat.get(tk, {})
                 sl = p.get('stop_loss', 0)
                 tam = p.get('target_atr_multiplier', 0)
                 abb = p.get('adaptive_breakeven_buffer', 0)
@@ -1558,7 +1607,7 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
         ignore_list = ['trend_active_logic', 'range_active_logic', 'active_logic', 'exit_plan_guideline', 'indicator_weights', 'scoring_modifiers', 'high_vol_params', 'mid_vol_params', 'major_params', 'tickers', 'max_concurrent_trades', 'interval', 'report_interval_seconds', 'deep_scan_interval']
         
         for k, v in new_data.items():
-            if k in STRAT and k not in ignore_list:
+            if k in target_strat and k not in ignore_list:
                 try:
                     if 'mult' in k or 'dev' in k: v = max(0.5, min(5.0, float(v)))
                     elif 'len' in k: v = max(3, min(200, int(v)))
@@ -1577,18 +1626,18 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     elif k == 'success_reference_count': v = max(5, min(15, int(v)))
                     elif k == 'failure_reference_count': v = max(5, min(15, int(v)))
                 except: continue 
-                if STRAT[k] != v: 
-                    changes.append(f"• {k}: {STRAT[k]} → <b>{v}</b>")
-                    STRAT[k] = v
+                if target_strat.get(k) != v: 
+                    changes.append(f"• {k}: {target_strat.get(k)} → <b>{v}</b>")
+                    target_strat[k] = v
                 
         if eval_mode == "CLASSIC":
             # 🟢 [Step 4 핵심: 최적화 전 스냅샷 백업]
             await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH.replace(".json", "_backup.json"))
-            CLASSIC_CONF['strategy'] = STRAT
+            CLASSIC_CONF['strategy'] = target_strat
             await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH)
         else:
             await save_config_async(QUANTUM_CONF, CONFIG_PATH.replace(".json", "_backup.json"))
-            QUANTUM_CONF['strategy'] = STRAT
+            QUANTUM_CONF['strategy'] = target_strat
             await save_config_async(QUANTUM_CONF, CONFIG_PATH)
         ai_reason = str(res.get('reason', 'N/A')).replace('<', '&lt;').replace('>', '&gt;')
         if changes: await send_msg(f"✨ <b>통합 전략 진화 완료 </b>\n\n" + "\n".join(changes) + f"\n\n💡 <b>AI:</b>\n{ai_reason}")
@@ -1707,6 +1756,7 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
     curr_data_dict = curr_data if isinstance(curr_data, dict) else curr_data.to_dict()
     curr_data_dict['strategy_mode'] = eval_mode
     
+    # 🟢 딕셔너리에서 인간과 AI가 읽을 수 있는 텍스트만 추출
     mtf_str = mtf.get('str', '알수없음') if isinstance(mtf, dict) else str(mtf)
     
     ai_res = await ai_analyze(ticker, curr_data_dict, mode="POST_BUY_REPORT", eval_mode=eval_mode, mtf_trend=mtf_str, buy_price=buy_price, market_regime=regime, win_rate=wr)
@@ -1803,7 +1853,7 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
             
             temp_exit_plan = exit_plan if exit_plan else {"target_atr_multiplier": 5.5, "stop_loss": -3.5, "atr_mult": 2.0, "timeout": 24}
             
-            tier_params = get_coin_tier_params(ticker, curr_data)
+            tier_params = get_coin_tier_params(ticker, curr_data, eval_mode=eval_mode)
             
             if exit_plan:
                 temp_exit_plan = exit_plan  
@@ -2476,7 +2526,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
     hard_s = exit_plan.get('stop_loss', -3.0) 
 
-    current_atr_mult = exit_plan.get('atr_mult', STRAT.get('atr_multiplier_for_stoploss', 1.8))
+    current_atr_mult = exit_plan.get('atr_mult', get_dynamic_strat_value('atr_multiplier_for_stoploss', mode=eval_mode, default=1.8))
     
     entry_rsi = t.get('buy_ind', {}).get('rsi', 50)
     if entry_rsi >= 70.0:
@@ -2979,7 +3029,7 @@ async def main():
                 await send_msg(await daily_settlement_report())
                 last_daily_report_day = now_dt.day
                 
-                # 🟢 [누락 보완] 무한 누적 방지: 당일 세력 매집 흐름 파악을 위한 실시간 CVD 초기화
+                # 🟢 무한 누적 방지: 당일 세력 매집 흐름 파악을 위한 실시간 CVD 초기화
                 global REALTIME_CVD
                 REALTIME_CVD.clear()
             
