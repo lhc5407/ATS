@@ -1,5 +1,4 @@
 import pyupbit
-import pandas_ta as ta
 import pandas as pd
 pd.set_option('future.no_silent_downcasting', True)
 
@@ -12,6 +11,7 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 warnings.filterwarnings("ignore", message=".*'d' is deprecated.*")
 warnings.filterwarnings("ignore", message=".*Pandas4Warning.*")
 warnings.filterwarnings("ignore", module="pandas")
+import pandas_ta # noqa: F401
 warnings.filterwarnings("ignore", module="pandas_ta")
 
 import numpy as np
@@ -110,16 +110,17 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
 
 3. TRADING PHILOSOPHY (CLASSIC):
    - Buy the Dip: Actively look for RSI oversold (<35), Bollinger Band lower bounds, and Extreme Fear capitulations.
-   - Volume Validation (NEW): Pure oversold signals without a volume spike are considered fake. Demand high volume on dips to confirm panic selling is over.
+   - Volume Validation: Pure oversold signals without a volume spike are fake. Python engine already handles strict volume filtering, so focus on Orderbook Imbalance and overall context.
    - Ignore Macro Downtrend: DO NOT reject trades purely because the macro trend (BTC or MTF) is bearish. Downward trends are your hunting ground.
-   - Risk/Reward: In CLASSIC mode (Bear Market Bounces), securing a fast +0.4% to +1.2% scalp profit is the ONLY goal. DO NOT demand long-term swings. Praise the system if it secures small profits within 3-8 candles (45-120 mins).
+   - Risk/Reward: Securing a fast +0.4% to +1.2% scalp profit is the ONLY goal. Praise the system if it secures small profits within 3-8 candles.
    - Fake Breakout Defense: If orderbook shows a massive sell wall, reject the BUY (decision: "SKIP").
 
-4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
-   - Fatal Flaw Locks: Python Engine automatically blocks trades if: 1) RSI > 55, or 2) Both Current & Previous Volumes < 1.2x SMA. Do NOT re-evaluate basic volume or overbought RSI rules that Python already handles.
-   - Rapid Breakeven Lock: If a trade reaches +1.0% net profit at any point, the Python engine mathematically locks the stop-loss to secure a guaranteed net profit. Do not penalize trades that exit here; it is an intended risk management feature.
-   - NET PROFIT RULE (NEW): All performance metrics provided to you (p_rate, profit_krw) ALREADY deduct the 0.1% round-trip exchange fee. A `p_rate` of 0.0% means true absolute breakeven. Do not double-calculate fees in your logic.
-   - Time-Decay Stop: If a trade fails to bounce within half of its timeout period and loses momentum, the Python engine will auto-eject early. Recognize this as a "Time-Decay" exit in your SELL_REASON.
+4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT - DO NOT SUGGEST THESE AS IMPROVEMENTS):
+   - Fatal Flaw Locks: Python automatically blocks trades if: 1) RSI > 55, 2) Both Current & Prev Volumes < 1.3x SMA, 3) The candle is NOT a Bullish Recovery (Yangbong), or 4) CVD (Net Buying) is NOT improving. 
+   - V-Shape Exception: Python bypasses volume blocks if Volume > 1.5x AND CVD is improving.
+   - Multi-Level Breakeven Lock: Python mathematics automatically lock stop-losses at +0.25% when hitting +0.4% profit, +0.45% at +0.7% profit, and +0.65% at +1.0% profit to completely absorb slippage. Do not penalize trades that exit here.
+   - Nano & Micro Timeout: Python auto-ejects trades if they fail to bounce within 3 minutes (dropping to -1.2%) or 15 minutes (dropping to -1.0%). Recognize this as an excellent "Immediate Risk Cut" in your SELL_REASON.
+   - NET PROFIT RULE: All performance metrics (p_rate, profit_krw) ALREADY deduct the 0.1% round-trip exchange fee.
 
 5. DYNAMIC PARAMETER RULES:
    - Use ATR-based multipliers (target_atr_multiplier, atr_mult).
@@ -140,26 +141,24 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
 1. OUTPUT FORMAT (CRITICAL): You MUST output ONLY valid JSON. 
    - DO NOT wrap the JSON in markdown code blocks.
    - DO NOT output any text outside the JSON object.
-   - STRICT SCHEMA RULE: Do NOT hallucinate wrapper objects like 'chief_strategy_officer_opinion'. You MUST strictly use the exact top-level keys provided in the MODE-SPECIFIC OUTPUT SCHEMAS.
+   - STRICT SCHEMA RULE: Do NOT hallucinate wrapper objects.
 
 2. LANGUAGE RULE: All string values MUST be written in Korean.
 
 3. TRADING PHILOSOPHY (QUANTUM):
-   - Buy Strength: Actively look for strong volume breakouts, RSI momentum (>60), and price action above major moving averages. Never "Buy the Dip" into a falling knife.
-   - Volume Confirmation: Breakouts without a significant volume spike are considered fake. Demand high volume to confirm institutional participation.
+   - Buy Strength: Actively look for strong volume breakouts, RSI momentum (>60), and price action above major moving averages. Never "Buy the Dip".
+   - Volume Confirmation: Breakouts without a significant volume spike are considered fake.
    - Follow the Trend: DO NOT buy if the macro trend (BTC or MTF) is bearish. Cash is a position in a downtrend.
-   - Risk/Reward: Focus on "Let Winners Run" (Profit > 2x Stop Loss). Use trailing stops to maximize gains.
-   - Fake Breakout Defense: If orderbook shows a massive sell wall and no buying pressure, reject the BUY (decision: "SKIP").
+   - Risk/Reward: Focus on "Let Winners Run". Use trailing stops to maximize gains.
 
-4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
-   - Fatal Flaw Locks: Python Engine automatically blocks trades if: 1) Short-term Trend is DOWN, 2) CVD (Net Buying Volume) is NEGATIVE, or 3) 4H MACD < 0. Do NOT create duplicate rules about macro trend blocks.
-   - Trailing Stop Lock: If a trade reaches +1.0% net profit, the system activates a tight trailing stop. Do not penalize early exits; it's a risk management feature.
-   - NET PROFIT RULE: All performance metrics (p_rate, profit_krw) ALREADY deduct the 0.1% round-trip exchange fee.
-   - Trend-Decay Exit: If momentum stalls for more than 2-3 candles after a breakout, the Python engine will auto-eject to preserve capital.
+4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT - DO NOT SUGGEST THESE AS IMPROVEMENTS):
+   - Fatal Flaw Locks: Python automatically blocks trades if: 1) Short-term Trend is DOWN, 2) CVD (Net Buying Volume) is NEGATIVE, or 3) 4H MACD < 0.
+   - Dynamic Trailing Stop Lock: Python actively tightens the trailing stop buffer based on profit brackets (+0.6%, +1.0%, +2.0%) to lock in maximum gains.
+   - NET PROFIT RULE: All performance metrics (p_rate) ALREADY deduct the 0.1% exchange fee.
+   - Trend-Decay Exit: If momentum stalls or reverses, Python auto-ejects based on strict dynamic scoring rules.
 
 5. DYNAMIC PARAMETER RULES:
    - Use ATR-based multipliers for tight stop-losses and dynamic trailing targets.
-   - You have full authority to tune "scoring_modifiers" in OPTIMIZE mode.
 
 6. MODE-SPECIFIC OUTPUT SCHEMAS:
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
@@ -425,8 +424,16 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
             fatal_flaw = True # 🚨 거래량이 안 터졌거나, 여전히 가격이 밀리는 중이면 차단
             
         # 5. V자 반등 특례: 거래량이 확실히 폭발했고(1.5x) CVD가 순증가 중이면 락 강제 해제!
+        v_shape_special = False
         if cvd_improving and (curr_vol > curr_vol_sma * 1.5 or prev_vol > prev_vol_sma * 1.5):
             fatal_flaw = False
+            v_shape_special = True
+
+        # 🟢 [AI 피드백 강화] 계산된 물리적 지표들을 Indicators 딕셔너리에 주입하여 AI가 인지하게 함
+        curr_i['is_volume_spike'] = is_volume_spike
+        curr_i['is_bullish_recovery'] = is_bullish_recovery
+        curr_i['cvd_improving'] = cvd_improving
+        curr_i['v_shape_special'] = v_shape_special
 
     score = round(max(0.0, min(100.0, score)), 1)
     return score, fatal_flaw, eval_mode
@@ -1412,7 +1419,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         
         Original Buy Reason: {clean_data.get('original_buy_reason')}
         Original Exit Plan: {clean_data.get('original_exit_plan')}
-        * Note for AI: In the Exit Plan, the 'timeout' value represents the number of CANDLES. Since this is a 15-minute timeframe, a timeout of 4 means 60 minutes. Standard goal for CLASSIC is 3-8 candles. Do NOT confuse candles with minutes.
+        * Note for AI: 1) 'timeout' in Exit Plan is in CANDLES (15m each). 2) The Python engine now also uses 'Nano Timeout' (3 min) and 'Micro Timeout' (15 min) for immediate exit if a trade fails to bounce or breaks momentum early. Recognize these as excellent "Immediate Risk Cuts", NOT failure of the strategy.
         
         Buy Indicators: {clean_data.get('buy_ind')}
         Sell Indicators: {clean_data.get('sell_ind')}
@@ -1433,10 +1440,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         
         if eval_mode == "CLASSIC":
             strategy_desc = "Deep Dip / Oversold Mean Reversion (낙폭 과대 역추세 매매)"
-            mission_detail = "Look for oversold conditions with a strong probability of a technical bounce. Check Orderbook imblance and Drop Velocity."
         else:
             strategy_desc = "Trend Follower & Breakout Trader (추세 추종 및 돌파 매매)"
-            mission_detail = "Look for strong breakouts with confirmed volume. Check Orderbook for massive sell walls."
         
         # 🟢 [Step 2 핵심: 에이전트 워크플로우(Agentic Workflow) 프롬프트]
         prompt = f"""
@@ -1452,10 +1457,11 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         {warning_msg}
         {rag_context}
         
-        Mission: Execute an AGENTIC WORKFLOW. You are a committee of 3 experts for the {strategy_desc} strategy.
-        Step 1. [Risk Agent]: Analyze downside risks, orderbook imbalance, and check if this matches past failure patterns in the [RAG CONTEXT].
-        Step 2. [Trend Agent]: Analyze upside potential, volume validation, and momentum strength ({mission_detail}).
-        Step 3. [Chief Strategy Officer]: Synthesize the two agents' opinions, finalize the risk/reward, and make the ultimate decision.
+        Mission: Execute an AGENTIC WORKFLOW. You are a committee of 3 experts.
+        Check technical flags in 'Indicators': 'is_volume_spike', 'is_bullish_recovery', 'cvd_improving'. 
+        Step 1. [Risk Agent]: Analyze downside risks, orderbook imbalance, and confirm if 'is_bullish_recovery' is TRUE.
+        Step 2. [Trend Agent]: Analyze upside potential, volume validation ('is_volume_spike'), and CVD strength ('cvd_improving').
+        Step 3. [Chief Strategy Officer]: Synthesize opinions and make the ultimate decision.
         
         Output "BUY" if the synthesized AI Score >= 70. Otherwise "SKIP". Provide JSON.
         """
@@ -1466,10 +1472,8 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         
         if eval_mode == "CLASSIC":
             strategy_desc = "'Deep Dip / Oversold Mean Reversion' (낙폭 과대 역추세 매매)"
-            mission_detail = "Focus on oversold extremes, Bollinger Band deviations, and bounce probability."
         else:
             strategy_desc = "'Trend Follower & Breakout Trader' (추세 추종 및 돌파 매매)"
-            mission_detail = "Focus on confirmed breakouts, strong volume, and continuing momentum."
         
         prompt = f"""
         [X_POST_BUY_REPORT]
@@ -1477,7 +1481,9 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         Indicators: {clean_data}
         {warning_msg}
         Situation: Python preemptive purchase based on {strategy_desc}.
-        Mission: Re-verify entry quality. {mission_detail} decision is BUY or SKIP. Provide JSON.
+        Mission: Re-verify entry quality. Check technical flags: 'is_volume_spike', 'is_bullish_recovery', 'cvd_improving'. 
+        If 'v_shape_special' is TRUE, it was a high-conviction V-reversal attempt.
+        Your final decision is BUY or SKIP. Provide JSON.
         """
         
     elif mode == "EVOLVE_PROMPT":
@@ -1950,6 +1956,7 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
     regime = await get_market_regime()
     wr, _, _, _, _, _ = await get_performance_stats_db()
     
+    global TRADE_DATA_DIRTY
     curr_data_dict = curr_data if isinstance(curr_data, dict) else curr_data.to_dict()
     curr_data_dict['strategy_mode'] = eval_mode
     
@@ -1976,7 +1983,7 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
 
 # --- [5. 공통 스캔 모듈] ---
 async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash, held_count, exit_plan, buy_mode="COUNCIL", pass_score=0, eval_mode="QUANTUM"):
-    global last_global_buy_time
+    global last_global_buy_time, TRADE_DATA_DIRTY
     
     strat = get_strat_for_mode(buy_mode)
     max_trades = strat.get('max_concurrent_trades', STRAT.get('max_concurrent_trades', 5)) 
@@ -2104,7 +2111,6 @@ async def run_full_scan(is_deep_scan=False):
             current_regime_mode = "HYBRID" 
             new_status = "⚖️ Hybrid (Adaptive Monitoring)"
 
-        eval_mode = "CLASSIC" if current_regime_mode == "HYBRID" else current_regime_mode
         SYSTEM_STATUS = new_status 
         if is_deep_scan: 
             try:
@@ -2528,7 +2534,6 @@ async def send_score_debug_report():
         return
 
     score_results = []
-    scan_semaphore = asyncio.Semaphore(6)  # 🟢 [최적화] 4→6
 
     async def fetch_and_score(t):
         async with GLOBAL_API_SEMAPHORE:
@@ -2568,7 +2573,7 @@ async def send_score_debug_report():
         
     await send_msg(msg)
 async def handle_telegram_updates():
-    global last_update_id, is_running
+    global last_update_id, is_running, TRADE_DATA_DIRTY
     logging.info("텔레그램 명령 처리 태스크 시작")
     
     if last_update_id is None:
@@ -2578,7 +2583,7 @@ async def handle_telegram_updates():
                 last_update_id = updates[-1].update_id + 1
             else:
                 last_update_id = None
-        except Exception as e:
+        except Exception:
             pass
 
     while True:
@@ -2710,7 +2715,11 @@ async def handle_telegram_updates():
 
 # 🟢 [신규 추가] 매도 조건 검사 전용 모듈 (스파게티 코드 분리)
 def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score):
-    global STRAT, INDICATOR_CACHE
+    global STRAT, INDICATOR_CACHE, TRADE_DATA_DIRTY
+    
+    # 🟢 [Pylance/Flake8 방어] 변수 초기화 및 타입 안전성 확보
+    curr_p_rate = safe_float(p_rate, 0.0)
+    curr_ma_score = float(ma_live_score) if ma_live_score is not None else 80.0
     
     eval_mode = t.get('strategy_mode', 'QUANTUM')
     
@@ -2851,9 +2860,6 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     macd_diff_val = curr_i_safe.get('macd_h_diff', 0)
     if macd_diff_val is None: macd_diff_val = 0
     
-    curr_p_rate = float(p_rate) if p_rate is not None else 0.0
-    curr_ma_score = float(ma_live_score) if ma_live_score is not None else 0.0
-    
     entry_score = t.get('pass_score', 0)
     
     sell_conditions = [
@@ -2945,8 +2951,10 @@ async def system_watchdog():
             logging.error(f"Watchdog 에러: {e}")
 
 async def main():
-    # 🟢 [수정 완료] 안 쓰는 last_buy_time, last_update_id 삭제
+    # 🟢 [수정 완료] 전역 변수 참조 안정성 확보 (Pylance/Flake8 방어)
     global trade_data, BALANCE_CACHE, last_sell_time, is_running, last_global_buy_time
+    global TRADE_DATA_DIRTY, SYSTEM_STATUS, REALTIME_PRICES, REALTIME_PRICES_TS, INDICATOR_CACHE
+    global API_FATAL_ERRORS, last_main_loop_time
 
     global instance_lock
     
@@ -2962,7 +2970,7 @@ async def main():
     logging.info(f"🚀 API 병목 방지를 위해 {startup_jitter:.2f}초 후 엔진 가동을 시작합니다...")
     await asyncio.sleep(startup_jitter)
 
-    tg_task = asyncio.create_task(handle_telegram_updates())
+    asyncio.create_task(handle_telegram_updates())
     await asyncio.sleep(0.1) 
     
     # 🟢 [추가] 초기 시장 레짐 감지 및 시스템 상태 업데이트
@@ -3092,7 +3100,6 @@ async def main():
                 continue
 
             # 🟢 [Pylance 방어] cash 안전 추출
-            cash = safe_float(next((b.get('balance') for b in balances if isinstance(b, dict) and b.get('currency') == "KRW"), 0.0))
             
             # 🟢 [FIX: 변수명 복구 및 방어] main 루프에서는 held_dict가 아니라 held를 사용해야 하며, 값도 float이 아닌 b(딕셔너리) 자체여야 합니다!
             held = {
@@ -3344,8 +3351,8 @@ async def main():
                 
             await asyncio.sleep(0.5) 
             
-        except Exception as e:
-            logging.error(f"❗ 통합 메인 루프 예외 발생: {e}\n{traceback.format_exc()}")
+        except Exception:
+            logging.error(f"❗ 통합 메인 루프 예외 발생: {traceback.format_exc()}")
             await asyncio.sleep(5)
 
 if __name__ == "__main__":
@@ -3353,7 +3360,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         logging.info("\n🛑 봇이 종료되었습니다.")
-    except Exception as e:
+    except Exception:
         logging.error(f"\n❌ 실행 중 치명적 오류:\n{traceback.format_exc()}")
     finally:
         sys.stdout = original_stdout
