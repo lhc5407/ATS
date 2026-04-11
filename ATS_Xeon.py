@@ -498,12 +498,12 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
             if not (mtf_bullish and is_pullback_zone):
                 fatal_reason = "단기상승세이탈"
         if not fatal_reason and safe_float(curr_i.get('cvd', 0)) < 0:
-            fatal_reason = "매도세우위 (CVD)"
-        elif not fatal_reason and safe_float(mtf_data.get("4h_macd", 0)) < 0:
-            fatal_reason = "장기추세악화 (4H)"
+            score -= 25 # 🟢 [유연화] 하드락에서 감점으로 변경
+        if not fatal_reason and safe_float(mtf_data.get("4h_macd", 0)) < 0:
+            score -= 20 # 🟢 [유연화] 하드락에서 감점으로 변경
             
     else: # CLASSIC
-        if safe_float(curr_i.get('rsi')) > 55: fatal_reason = "RSI과열"
+        if safe_float(curr_i.get('rsi')) > 60: fatal_reason = "RSI과열" # 🟢 55 -> 60 상향
         curr_vol = safe_float(curr_i.get('volume'), 0)
         curr_vol_sma = safe_float(curr_i.get('vol_sma'), 1)
         prev_vol = safe_float(prev_i.get('volume'), 0)
@@ -652,19 +652,56 @@ def get_dynamic_strat_value(key, mode=None, default=None):
 
 async def save_config_async(config_data, path):
     def _save():
-        with open(path + ".tmp", 'w', encoding='utf-8') as f: 
-            json.dump(config_data, f, indent=4, ensure_ascii=False)
-        os.replace(path + ".tmp", path) 
+        import time
+        import shutil
+        
+        # 1. 백업 파일 생성 (안전장치)
+        bak_path = path + ".bak"
+        try:
+            if os.path.exists(path):
+                shutil.copy2(path, bak_path)
+        except:
+            pass # 백업 실패는 무시하고 진행
+            
+        # 2. 메인 파일 파일 쓰기 시도 (최대 5회 재시도)
+        success = False
+        last_err = None
+        
+        for i in range(5):
+            try:
+                # 윈도우 잠금 해제를 위해 잠시 대기
+                if i > 0: time.sleep(0.3)
+                
+                with open(path, 'w', encoding='utf-8') as f: 
+                    json.dump(config_data, f, indent=4, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                success = True
+                break
+            except Exception as e:
+                last_err = e
+                # 잠금 오류일 확률이 높으므로 다시 루프 실행
+                continue
+        
+        if not success:
+            # 최종 실패 시 백업에서 복구 시도
+            try:
+                if os.path.exists(bak_path):
+                    shutil.copy2(bak_path, path)
+            except:
+                pass
+            raise last_err
+
     try:
         await asyncio.to_thread(_save)
     except Exception as e:
-        logging.error(f"설정 파일 저장 중 에러: {e}")
+        logging.error(f"설정 파일 저장 중 최종 에러: {e}")
 
 QUANTUM_CONF, CLASSIC_CONF, CONFIG_PATH, CLASSIC_CONFIG_PATH = load_config()
 API_CONF, TG_CONF = QUANTUM_CONF['api_keys'], QUANTUM_CONF['telegram']
 # 🟢 [전역 제어 객체] 시스템 부하 및 스캔 충돌 방지
 SCAN_LOCK = asyncio.Lock()
-GLOBAL_API_SEMAPHORE = asyncio.Semaphore(10) # 🟢 동시 API 호출 제한 (8-10 권장)
+GLOBAL_API_SEMAPHORE = asyncio.Semaphore(15) # 🟢 동시 API 호출 제한 상향 (15 권장)
 
 INDICATOR_CACHE = {} 
 INDICATOR_CACHE_LOCK = asyncio.Lock()
@@ -2566,13 +2603,15 @@ async def run_full_scan(is_deep_scan=False):
 
         async def fetch_data(ticker):
             async with GLOBAL_API_SEMAPHORE:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(0.05) # 🟢 딜레이 단축 (0.1 -> 0.05)
                 p, c = await get_indicators(ticker)
-                return ticker, p, c
+                mtf = await get_mtf_trend(ticker) # 🟢 MTF 추세를 병렬 단계로 전진 배치
+                return ticker, p, c, mtf
 
         fetch_tasks = [fetch_data(t) for t in STRAT['tickers']]
         indicator_results = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        indicator_results = [res for res in indicator_results if isinstance(res, tuple) and len(res) == 3]
+        # 🟢 결과 구조 변경 반영 (p, c, mtf)
+        indicator_results = [res for res in indicator_results if isinstance(res, tuple) and len(res) == 4]
 
         python_passed = []
         current_loop_max_score = 0
@@ -2580,14 +2619,14 @@ async def run_full_scan(is_deep_scan=False):
         # 🟢 [대시보드 스캐너] 이번 루프의 스캔 결과를 취합합니다.
         new_scan_data = {}
 
-        for t, prev, curr in indicator_results:
+        for t, prev, curr, mtf_res in indicator_results:
             if curr is None or prev is None: continue
             
             if isinstance(prev, pd.Series): prev = prev.to_dict()
             if isinstance(curr, pd.Series): curr = curr.to_dict()
             if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-            mtf_res = await get_mtf_trend(t)
+            # get_mtf_trend 호출 제거 (이미 fetch_data에서 가져옴)
             score_1st, fatal_reason_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], mtf_data=mtf_res)
 
             # 🟢 [수정] 하드락이 아니면 대기 최고 점수 갱신에 우선 반영 (보고서 동기화용)
@@ -2604,15 +2643,12 @@ async def run_full_scan(is_deep_scan=False):
             }
 
             pass_cut = get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80)
-            if fatal_reason_1st or score_1st < (pass_cut - 20):
-                continue
+            
+            # 🟢 [최적화] 중복 채점(evaluate_coin_fundamental 2회 호출) 제거
+            final_score = score_1st
+            final_fatal_reason = fatal_reason_1st
 
-            final_score, final_fatal_reason, _ = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
-
-            if final_fatal_reason:
-                final_score = -999
-
-            if final_score < pass_cut: 
+            if final_fatal_reason or final_score < pass_cut: 
                 continue
 
             if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
@@ -2760,7 +2796,7 @@ async def build_report(header="실시간 리포트", is_running=True):
             coins.append({'t': ticker, 'r': net_rate, 'pft': net_profit, 'val': val})
 
     wr, tc, wc, tp, _,_ = await get_performance_stats_db()
-    scan_interval_min = STRAT.get('deep_scan_interval', 1800) // 60
+    scan_interval_min = STRAT.get('deep_scan_interval', 900) // 60
 
     # 🟢 [보고체계 복구 3] 현재 가동 중인 모드(Regime)에 맞는 전략 설정집 가져오기
     report_eval_mode = "CLASSIC" if "Classic" in SYSTEM_STATUS else "QUANTUM"
