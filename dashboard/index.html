@@ -148,10 +148,20 @@
                             <input type="number" step="1000" id="set-base-amount">
                         </div>
                         <div class="form-group">
-                            <label>허용 슬리피지 한도 (Max Slippage %)</label>
+                            <label>최대 허용 슬리피지 (Max Slippage %)</label>
                             <input type="number" step="0.1" id="set-max-slippage">
                         </div>
-                        <button id="btn-save-settings" class="neon-button">Save Configuration</button>
+                        
+                        <div class="form-group">
+                            <label>딥스캔(전수검사) 주기 설정 (Deep Scan Frequency)</label>
+                            <select id="set-deep-scan" class="neon-select">
+                                <option value="900">15분 (추천 - 고수익형)</option>
+                                <option value="1800">30분 (안정 - 리소스 절약)</option>
+                            </select>
+                        </div>
+                        
+                        <button id="btn-save-settings" class="neon-button" onclick="saveSettings()" style="width: 100%;">
+Save Configuration</button>
                     </div>
                 </div>
             </div>

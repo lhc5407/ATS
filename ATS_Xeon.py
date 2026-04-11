@@ -695,6 +695,7 @@ BTC_SURGE_COOLDOWN_TS = 0        # 마지막 트리거 시각 (연속 트리거 
 BTC_SURGE_THRESHOLD = 1.5        # 트리거 기준 상승률 (%) - AI OPTIMIZE로 조정 가능
 LATEST_TOP_PASS_SCORE = 0
 BOT_START_TIME = time.time()  
+last_deep_scan_ts = 0  # 🟢 딥스캔 전용 타이머 분리
 last_auto_optimize_time = 0  
 consecutive_empty_scans = 0 
 REALTIME_PRICES = {}
@@ -796,7 +797,7 @@ async def api_get_dashboard(timeframe: str = 'all'):
             "pnl_pct": pnl,
             "score": t_data.get('pass_score', 0),
             "mode": t_data.get('strategy_mode', 'UNKNOWN'),
-            "reason": t_data.get('reason_buy', '데이터 없음')
+            "reason": t_data.get('buy_reason', '데이터 없음')
         })
 
     btc_trend_str = "알 수 없음"
@@ -970,7 +971,8 @@ async def api_get_settings():
     return {
         "max_concurrent_trades": st.get("max_concurrent_trades", 5),
         "base_trade_amount": st.get("base_trade_amount", 5000),
-        "max_slippage_pct": st.get("max_slippage_pct", 0.5)
+        "max_slippage_pct": st.get("max_slippage_pct", 0.5),
+        "deep_scan_interval": st.get("deep_scan_interval", 900)
     }
 
 @app.post("/api/settings")
@@ -1744,7 +1746,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             - bonus_all_time_high: MUST be between 20 and 40
             - penalty_btc_weakness: MUST be between -30 and -15
             - penalty_weak_momentum: MUST be between -25 and -10
-            - deep_scan_interval: MUST be between 900 and 1800
+        # deep_scan_interval 지침 제거
             - btc_surge_threshold: MUST be between 1.0 and 3.0 (BTC 1분 급등 트리거 기준%. 시장 변동성 높으면 낙게, 낙으면 높게 교정)
             """
             critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Remove panic dip bonuses."
@@ -2215,7 +2217,6 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                     elif k == 'fgi_v_curve_max': v = max(1.5, min(3.0, float(v)))
                     elif k == 'fgi_v_curve_min': v = max(0.5, min(1.0, float(v)))
                     elif k == 'fgi_v_curve_greed_max': v = max(1.0, min(2.5, float(v)))
-                    elif k == 'deep_scan_interval': v = max(900, min(1800, int(v)))
                     elif k == 'pass_score_threshold': v = max(75, min(90, int(v)))
                     elif k == 'guard_score_threshold': v = max(45, min(75, int(v)))
                     elif k == 'sell_score_threshold': 
@@ -3395,7 +3396,7 @@ async def system_watchdog():
 
 async def main():
     # 🟢 [수정 완료] 전역 변수 참조 안정성 확보 (Pylance/Flake8 방어)
-    global trade_data, BALANCE_CACHE, last_sell_time, is_running, last_global_buy_time
+    global trade_data, BALANCE_CACHE, last_sell_time, is_running, last_global_buy_time, last_deep_scan_ts
     global TRADE_DATA_DIRTY, SYSTEM_STATUS, REALTIME_PRICES, REALTIME_PRICES_TS, INDICATOR_CACHE
     global API_FATAL_ERRORS, last_main_loop_time
 
@@ -3789,10 +3790,10 @@ async def main():
                 # 스캔 중이더라도 플래그는 리셋하여 중복 트리거 방지 (SCAN_LOCK이 순차 처리 보장)
 
             # 5. 딥 스캔 실행 조건
-            if is_running and (now_ts - last_global_buy_time >= STRAT.get("deep_scan_interval", 900)):
+            if is_running and (now_ts - last_deep_scan_ts >= STRAT.get("deep_scan_interval", 900)):
                 # SCAN_LOCK이 종료 후 자동 실행(Wait)하므로 별도 상태 체크 없이 태스크 던짐
                 asyncio.create_task(run_full_scan(is_deep_scan=True))
-                last_global_buy_time = now_ts
+                last_deep_scan_ts = now_ts
                 
             await asyncio.sleep(0.5) 
             

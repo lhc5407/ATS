@@ -106,15 +106,18 @@ function updateUI(data) {
     
     document.getElementById('regime-status').textContent = data.system_status || "Initializing...";
     
+    const btcTrend = data.btc_trend || "알 수 없음";
     const btcEl = document.getElementById('btc-trend');
-    btcEl.textContent = data.btc_trend || "Unknown";
-    btcEl.className = (data.btc_trend === "단기 상승" || data.btc_trend === "Bullish") ? "neon-text" : "neon-purple";
+    btcEl.textContent = btcTrend;
+    btcEl.className = (btcTrend === "단기 상승" || btcTrend === "Bullish") ? "neon-text" : "neon-purple";
 
     // 2. Stats Row
-    document.getElementById('win-rate').textContent = `${data.win_rate.toFixed(1)}%`;
+    const winRateVal = typeof data.win_rate === 'number' ? data.win_rate : 0;
+    document.getElementById('win-rate').textContent = `${winRateVal.toFixed(1)}%`;
     
     // Format KRW with commas
-    const formattedProfit = new Intl.NumberFormat('ko-KR').format(Math.floor(data.total_profit));
+    const profitVal = typeof data.total_profit === 'number' ? data.total_profit : 0;
+    const formattedProfit = new Intl.NumberFormat('ko-KR').format(Math.floor(profitVal));
     const profitEl = document.getElementById('total-profit');
     profitEl.textContent = `${formattedProfit} KRW`;
     
@@ -330,6 +333,7 @@ async function fetchSettings() {
         document.getElementById('set-max-trades').value = data.max_concurrent_trades || 5;
         document.getElementById('set-base-amount').value = data.base_trade_amount || 5000;
         document.getElementById('set-max-slippage').value = data.max_slippage_pct || 0.5;
+        document.getElementById('set-deep-scan').value = data.deep_scan_interval || 900;
         currentSettings.max_concurrent_trades = data.max_concurrent_trades || 5;
         
     } catch (e) {
@@ -354,8 +358,18 @@ async function saveSettings() {
             body: JSON.stringify(payload)
         });
         
-        if (!response.ok) throw new Error('Save failed');
+        if (!response.ok) throw new Error('Basic settings save failed');
         
+        // 2. 딥스캔 주기 전용 API 호출
+        const scanPayload = { interval: parseInt(document.getElementById('set-deep-scan').value) };
+        const scanRes = await fetch(`${API_BASE}/settings/deep-scan`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(scanPayload)
+        });
+        
+        if (!scanRes.ok) throw new Error('Deep scan interval save failed');
+
         btn.textContent = "Saved Successfully!";
         btn.style.color = "var(--neon-green)";
         btn.style.borderColor = "var(--neon-green)";
