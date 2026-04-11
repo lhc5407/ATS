@@ -408,7 +408,7 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
         'volume': 1.0 + (1.5 * normalized_regime_val)
     }
 
-# 🟢 [추가 3] 파라미터에 mtf_data 추가 및 하드락 로직 강화
+
 def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
     # force_eval_mode가 주어지면 시장 상황을 무시하고 그 모드로만 채점합니다.
     eval_mode = force_eval_mode if force_eval_mode else determine_eval_mode(current_regime_mode, curr_i)
@@ -420,12 +420,11 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
     curr_close = safe_float(curr_i.get('close'))
     curr_vol = safe_float(curr_i.get('volume'))
     
-    # 🚨 [데이터 무결성 검증] 기본 시세 데이터 누락 시 즉각 하드락(Fatal=True)하여 거짓 매수 차단
+    # 🚨 [데이터 무결성 검증] 기본 시세 데이터 누락 시 즉각 하드락 사유 반환
     if curr_close <= 0 or curr_vol <= 0:
-        return 0, True, eval_mode
+        return 0, "데이터오류", eval_mode
         
-    
-    # 🟢 [Pyrefly 방어] 모든 지표 플래그 초기화 ( UnboundLocalError 방지)
+    # 모든 지표 플래그 초기화
     is_volume_spike, is_bullish_recovery, cvd_improving, v_shape_special = False, False, False, False
     is_pullback_zone = False
     
@@ -439,151 +438,102 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
     score = int(earned_score / total_w) if total_w > 0 else 0
 
     def calc_gradient_val(val, target, window, mode='DECREASE'):
-        """이진법(0/1)을 그라데이션(0.0~1.0)으로 변환하여 점수 깜빡임 방지"""
         diff = abs(val - target)
-        if mode == 'DECREASE': # 타겟보다 커질수록 점수 감소 (예: RSI > 35)
+        if mode == 'DECREASE': 
             if val <= target: return 1.0
             if val >= target + window: return 0.0
             return 1.0 - (diff / window)
-        else: # 타겟보다 작아질수록 점수 감소 (예: Close < BB_U)
+        else:
             if val >= target: return 1.0
             if val <= target - window: return 0.0
             return 1.0 - (diff / window)
 
     current_score_mods = get_dynamic_strat_value('scoring_modifiers', mode=eval_mode, default={})
     if eval_mode == "QUANTUM":
-        # 볼린저 밴드 돌파 보너스 (그라데이션: 상단 돌파 시 최대, 하단으로 내려올수록 감소)
         bb_u = safe_float(curr_i.get('bb_u'))
         if curr_close >= bb_u:
             score += current_score_mods.get('bonus_volume_explosion', 30)
-        
         if btc_short_trend == "단기 하락": score += current_score_mods.get('penalty_btc_weakness', -15)
-        
-        # 전고점 돌파 보너스 (Keltner Channel 상단 기준)
         kc_u = safe_float(curr_i.get('kc_u', 99999999))
         if curr_close >= kc_u: score += current_score_mods.get('bonus_all_time_high', 15)
-        
-        # 패널티 부드럽게 적용 (RSI가 55 미만으로 갈수록 페널티 강화)
         rsi_val = safe_float(curr_i.get('rsi', 50))
         if rsi_val < 55:
             penalty = current_score_mods.get('penalty_weak_momentum', -15)
             score += (penalty * calc_gradient_val(rsi_val, 55, 10, 'DECREASE'))
-            
-        # 🟢 [추가] 퀀텀 눌림목 지지 보너스
-        # 가격이 SMA20(중간선)의 -1% ~ +4% 범위 내에 있을 때 지지받는 것으로 간주
         sma_long_val = safe_float(curr_i.get('sma_long', 0))
         is_pullback_zone = (curr_close >= sma_long_val * 0.99) and (curr_close <= sma_long_val * 1.04)
         if is_pullback_zone:
             score += current_score_mods.get('bonus_pullback_support', 30)
             
     else: # CLASSIC
-        # 🟢 [핵심] 골든 콤보 그라데이션 적용 (RSI 35~45 구간 완충)
         rsi_val = safe_float(curr_i.get('rsi', 50))
         if fgi_val <= 35:
             golden_bonus = current_score_mods.get('bonus_golden_combo', 35)
             score += (golden_bonus * calc_gradient_val(rsi_val, 35, 10, 'DECREASE'))
-            
         if btc_short_trend == "단기 하락": score += current_score_mods.get('bonus_btc_panic_dip', 10)
-        
-        # 슈퍼트렌드 과매매 반등 보너스 완충
         if curr_i.get('ST_DIR', 1) == -1:
             st_bonus = current_score_mods.get('bonus_st_oversold_bounce', 10)
             score += (st_bonus * calc_gradient_val(rsi_val, 35, 10, 'DECREASE'))
-            
-        # 🟢 [추가] 과도한 이격도(낙폭)에 대한 '투매 포착' 보너스
         sma20 = safe_float(curr_i.get('sma_long', curr_close))
         gap_pct = ((curr_close - sma20) / sma20) * 100 if sma20 > 0 else 0
-        if gap_pct < -5.0: # 5% 이상 하위 이격 발생 시
+        if gap_pct < -5.0:
             score += min(25, abs(gap_pct) * 3)
-            
         if safe_float(curr_i.get('rs', 0)) < 0: score += current_score_mods.get('penalty_rs_weakness', -10)
-        
-        # MTF 패닉 딥 완충 및 이격 가점
         if mtf_data and safe_float(mtf_data.get('4h_macd', 0)) < 0:
             mtf_bonus = current_score_mods.get('bonus_mtf_panic_dip', 15)
             score += (mtf_bonus * calc_gradient_val(rsi_val, 35, 10, 'DECREASE'))
-            
-        # 이격도(Gap from SMA20)가 클수록 강력한 반등 기대 (신설)
         dist_sma = safe_float(curr_i.get('dist_sma20', 0))
         if dist_sma < -5.0:
-            score += min(30, abs(dist_sma) * 3) # 최대 30점 추가 보너스
+            score += min(30, abs(dist_sma) * 3)
 
-    # 🟢 하드락(Fatal Flaw) 판별부 강화 (CVD 및 MTF 방어막 전개)
-    fatal_flaw = False
-    
-    # 안전장치: mtf_data가 없으면 기본값 세팅
+    # 🟢 하드락(Fatal Flaw) 판별부
+    fatal_reason = ""
     if mtf_data is None: mtf_data = {"4h_macd": 0, "1h_trend": 0}
     
     if eval_mode == "QUANTUM":
-        # 퀀텀 모드: 기본적으로 추세 하락이나 CVD 음수 시 차단하지만, '눌림목 특례' 적용
         sma_long_val = safe_float(curr_i.get('sma_long', 0))
         is_pullback_zone = (curr_close >= sma_long_val * 0.985) and (curr_close <= sma_long_val * 1.03)
         mtf_bullish = mtf_data.get('1h_trend', 0) == 1
-        
         if curr_i.get('ST_DIR', 1) == -1 or curr_close < sma_long_val: 
-            if mtf_bullish and is_pullback_zone:
-                pass # 🟢 눌림목 특례: 거시 상승세 중 주요 지지선 부근이면 하드락 해제
-            else:
-                fatal_flaw = True
-        
-        if not fatal_flaw and safe_float(curr_i.get('cvd', 0)) < 0:
-            fatal_flaw = True # 🚨 가격은 유지되는데 순매도가 압도적이면 차단
-        elif not fatal_flaw and safe_float(mtf_data.get("4h_macd", 0)) < 0:
-            fatal_flaw = True # 🚨 4시간 거시 추세가 하락이면 돌파/눌림목 모두 휩소로 간주
+            if not (mtf_bullish and is_pullback_zone):
+                fatal_reason = "단기상승세이탈"
+        if not fatal_reason and safe_float(curr_i.get('cvd', 0)) < 0:
+            fatal_reason = "매도세우위 (CVD)"
+        elif not fatal_reason and safe_float(mtf_data.get("4h_macd", 0)) < 0:
+            fatal_reason = "장기추세악화 (4H)"
             
     else: # CLASSIC
-        # 1. 과매수 구간(RSI > 55) 진입 원천 차단
-        if safe_float(curr_i.get('rsi')) > 55: 
-            fatal_flaw = True 
-            
+        if safe_float(curr_i.get('rsi')) > 55: fatal_reason = "RSI과열"
         curr_vol = safe_float(curr_i.get('volume'), 0)
         curr_vol_sma = safe_float(curr_i.get('vol_sma'), 1)
         prev_vol = safe_float(prev_i.get('volume'), 0)
-        prev_vol_sma = safe_float(prev_i.get('vol_sma'), 1)
-        
-        # 2. 거래량 투매 검증: SMA의 1.3배 이상 터져야 '찐 반등' 후보로 인정 (기존 1.2배에서 상향)
-        is_volume_spike = (curr_vol > curr_vol_sma * 1.3) or (prev_vol > prev_vol_sma * 1.3)
-        
-        # 3. 양봉 전환 확인: 가격이 하락 중인 음봉에서는 절대 진입 금지 (칼날 잡기 방지)
+        is_volume_spike = (curr_vol > curr_vol_sma * 1.3) or (prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.3)
         is_bullish_recovery = curr_close > curr_i.get('open', curr_close)
-        
-        # 4. CVD 개선 확인 (CLASSIC에서도 필수 조건으로 격상하여 가짜 반등 필터링)
         cvd_improving = safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0))
-
-        # 🟢 [개선] 주문장 불균형 필터: 매도 압력이 압도적(-75% 이하)인 경우 매수 우위가 없으므로 차단
         ob_imbalance = safe_float(curr_i.get('ob_imbalance', 0))
         is_ob_bad = ob_imbalance < -75.0
 
-        if not (is_volume_spike and is_bullish_recovery) or not cvd_improving or is_ob_bad:
-            fatal_flaw = True # 🚨 거래량/양봉/CVD/주문장 중 하나라도 부적합하면 차단
+        if not fatal_reason:
+            if not (is_volume_spike and is_bullish_recovery): fatal_reason = "반등신호대기 (거래량/양봉)"
+            elif not cvd_improving: fatal_reason = "실매수세부족 (CVD)"
+            elif is_ob_bad: fatal_reason = "매도벽압박 (OB)"
             
-        # 5. V자 반등 특례: 거래량이 압도적으로 폭발했고(1.7x) CVD가 개선 중이면 락 해제
-        # 🚨 [버그 픽스] RSI가 60을 초과하는 과열 상태에서는 V자 반등 특례를 적용하지 않음 (KRW-MMT 사례 방지)
-        v_shape_special = False
-        if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > prev_vol_sma * 1.7):
+        if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.7):
             if safe_float(curr_i.get('rsi')) <= 60:
-                fatal_flaw = False
+                fatal_reason = "" # V자 반등 특례
                 v_shape_special = True
-            else:
-                logging.warning(f"⚠️ {ticker} V자 반등 포착되었으나 RSI 과열({curr_i.get('rsi')})로 인해 특례 제외")
 
-        # 🟢 [AI 리포트 효과 극대화용 데이터 주입] 
-        curr_i['is_volume_spike'] = is_volume_spike
-        curr_i['is_bullish_recovery'] = is_bullish_recovery
-        curr_i['cvd_improving'] = cvd_improving
-        curr_i['v_shape_special'] = v_shape_special
-        if eval_mode == "QUANTUM":
-            curr_i['is_pullback_zone'] = is_pullback_zone
-            curr_i['is_rsi_cooling'] = (50 <= safe_float(curr_i.get('rsi')) <= 65)
-        
-        # 추가 분석 데이터: 이격도 및 변동성
-        sma20 = safe_float(curr_i.get('sma_long', curr_close))
-        curr_i['dist_sma20'] = round(((curr_close - sma20) / sma20) * 100, 2) if sma20 > 0 else 0
-        atr_val = safe_float(curr_i.get('ATR', 0))
-        curr_i['atr_pct'] = round((atr_val / curr_close) * 100, 2) if curr_close > 0 else 0
-
+    # 데이터 주입 (보고서용)
+    curr_i['is_volume_spike'] = is_volume_spike
+    curr_i['is_bullish_recovery'] = is_bullish_recovery
+    curr_i['cvd_improving'] = cvd_improving
+    curr_i['v_shape_special'] = v_shape_special
+    if eval_mode == "QUANTUM":
+        curr_i['is_pullback_zone'] = is_pullback_zone
+        curr_i['is_rsi_cooling'] = (50 <= safe_float(curr_i.get('rsi')) <= 65)
+    
     score = round(max(0.0, min(100.0, score)), 1)
-    return score, fatal_flaw, eval_mode
+    return score, fatal_reason, eval_mode
 
 # 🟢 [FIX: 슬리피지 수학 공식 교정] 원화(KRW)를 기준으로 몇 개의 코인을 샀는지 부피(Volume)를 역산하여 정확한 VWAP 산출
 async def calculate_expected_slippage(ticker, buy_amt_krw):
@@ -726,6 +676,7 @@ QUANTUM_STRAT = QUANTUM_CONF['strategy']
 CLASSIC_STRAT = CLASSIC_CONF['strategy']
 STRAT = dict(QUANTUM_STRAT)
 STRAT['tickers'] = sorted(list(set(QUANTUM_STRAT.get('tickers', []) + CLASSIC_STRAT.get('tickers', []))))
+STRAT['external_dashboard_url'] = "http://localhost:8080"  # 외부 접속용 대시보드 주소 (실제 포트 8080에 맞춤)
 
 upbit = pyupbit.Upbit(API_CONF['access_key'], API_CONF['secret_key'])
 bot = telegram.Bot(token=TG_CONF['token'])
@@ -749,6 +700,8 @@ consecutive_empty_scans = 0
 REALTIME_PRICES = {}
 REALTIME_PRICES_TS = {}
 REALTIME_CVD = {} # 🟢 실시간 Taker CVD 저장소
+LATEST_SCAN_RESULTS = {} # 🟢 모든 종목의 최신 스캐너 정보 (대시보드 노출용)
+LATEST_SCAN_TS = 0
 API_FATAL_ERRORS = 0 # 🟢 API 연속 실패 카운터
 
 is_running = True
@@ -884,6 +837,91 @@ async def api_get_history():
         logging.error(f"히스토리 DB 쿼리 오류: {e}")
         
     return {"history": history_data}
+
+@app.get("/api/scanner")
+async def api_get_scanner():
+    results = []
+    # 딕셔너리를 리스트 형태로 변환하여 전송
+    for t, info in LATEST_SCAN_RESULTS.items():
+        results.append({
+            "ticker": t,
+            "score": info["score"],
+            "reason": info["reason"],
+            "price": info["price"],
+            "mode": info["mode"],
+            "mtf": info["mtf"]
+        })
+    # 점수 높은 순으로 정렬
+    results.sort(key=lambda x: x['score'], reverse=True)
+    return {"scanner": results, "timestamp": LATEST_SCAN_TS}
+
+@app.post("/api/trade")
+async def api_trade_manual(request: Request):
+    data = await request.json()
+    ticker = data.get("ticker")
+    action = data.get("action") # "buy" or "sell"
+    
+    if not ticker or not action:
+        return {"status": "error", "message": "Missing ticker or action"}
+        
+    try:
+        if action == "sell":
+            # 1. 잔고 조회 후 즉시 시장가 매도
+            balances = await execute_upbit_api(upbit.get_balances)
+            coin = next((b for b in balances if f"KRW-{b['currency']}" == ticker), None)
+            if not coin:
+                return {"status": "error", "message": "해당 종목의 잔고가 없습니다."}
+            
+            qty = safe_float(coin['balance']) + safe_float(coin['locked'])
+            if qty <= 0:
+                return {"status": "error", "message": "매도 가능한 수량이 없습니다."}
+                
+            # 매수 시점의 점수 인계 시도
+            t_data = trade_data.get(ticker, {})
+            p_score = t_data.get('pass_score', 0)
+            
+            # 매도 실행
+            await execute_upbit_api(upbit.sell_market_order, ticker, qty)
+            
+            # 수익률 계산 (보고서용)
+            avg_p = safe_float(coin['avg_buy_price'])
+            real_p = safe_float(REALTIME_PRICES.get(ticker, avg_p))
+            invested = qty * avg_p * 1.0005
+            earned = qty * real_p * 0.9995
+            p_krw = earned - invested
+            
+            await record_trade_db(ticker, 'SELL', real_p, qty, profit_krw=p_krw, reason="[대시보드 수동매도]", pass_score=p_score)
+            
+            if ticker in trade_data:
+                del trade_data[ticker]
+                global TRADE_DATA_DIRTY
+                TRADE_DATA_DIRTY = True
+            
+            await send_msg(f"🛑 <b>대시보드 수동 매도 완료</b>: {ticker}\n- 예상 수익금: {p_krw:,.0f}원")
+            return {"status": "success", "message": f"{ticker} 매도 주문이 완료되었습니다."}
+            
+        elif action == "buy":
+            # 1. 한도 체크
+            max_concurrent = STRAT.get('max_concurrent_trades', 5)
+            if len(trade_data) >= max_concurrent:
+                return {"status": "error", "message": f"매수 슬롯 한도({max_concurrent}개)에 도달했습니다."}
+                
+            # 2. 매수 실행 (기본 설정 금액 사용)
+            buy_amt = STRAT.get('base_trade_amount', 5000)
+            await execute_upbit_api(upbit.buy_market_order, ticker, buy_amt)
+            
+            # DB 기록 및 알림 (스캐너에 점수가 있으면 가져다 쓰고, 없으면 기본 80점 부여)
+            manual_score = LATEST_SCAN_RESULTS.get(ticker, {}).get('score', 80.0)
+            await record_trade_db(ticker, 'BUY', 0, 0, profit_krw=0, reason="[대시보드 수동매수]", status="ENTERED", pass_score=manual_score) 
+            await send_msg(f"✅ <b>대시보드 수동 매수 완료</b>: {ticker}\n- 매수 금액: {buy_amt:,.0f}원")
+            
+            return {"status": "success", "message": f"{ticker} 매수 주문이 완료되었습니다."}
+            
+    except Exception as e:
+        logging.error(f"대시보드 매매 오류 ({ticker}): {e}")
+        return {"status": "error", "message": f"매매 처리 중 오류 발생: {str(e)}"}
+        
+    return {"status": "error", "message": "Invalid action"}
     
 @app.get("/api/logs")
 async def api_get_logs():
@@ -2537,6 +2575,9 @@ async def run_full_scan(is_deep_scan=False):
 
         python_passed = []
         current_loop_max_score = 0
+        
+        # 🟢 [대시보드 스캐너] 이번 루프의 스캔 결과를 취합합니다.
+        new_scan_data = {}
 
         for t, prev, curr in indicator_results:
             if curr is None or prev is None: continue
@@ -2545,20 +2586,29 @@ async def run_full_scan(is_deep_scan=False):
             if isinstance(curr, pd.Series): curr = curr.to_dict()
             if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-            score_1st, fatal_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=None, mtf_data=None)
+            mtf_res = await get_mtf_trend(t)
+            score_1st, fatal_reason_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], mtf_data=mtf_res)
 
             # 🟢 [수정] 하드락이 아니면 대기 최고 점수 갱신에 우선 반영 (보고서 동기화용)
-            if not fatal_1st:
+            if not fatal_reason_1st:
                 current_loop_max_score = max(current_loop_max_score, score_1st)
 
+            # 스캐너 데이터 저장 (필터링 전 모든 종목 기록)
+            new_scan_data[t] = {
+                "score": score_1st,
+                "reason": fatal_reason_1st if fatal_reason_1st else "PASS",
+                "price": safe_float(curr.get('close')),
+                "mode": mode,
+                "mtf": mtf_res.get('str', '알수없음')
+            }
+
             pass_cut = get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80)
-            if fatal_1st or score_1st < (pass_cut - 20):
+            if fatal_reason_1st or score_1st < (pass_cut - 20):
                 continue
 
-            mtf_dict = await get_mtf_trend(t)
-            final_score, final_fatal, _ = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_dict)
+            final_score, final_fatal_reason, _ = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
 
-            if final_fatal:
+            if final_fatal_reason:
                 final_score = -999
 
             if final_score < pass_cut: 
@@ -2566,8 +2616,13 @@ async def run_full_scan(is_deep_scan=False):
 
             if t in held_dict or (time.time() - last_sell_time.get(t, 0)) < 1800: continue
             
-            python_passed.append({"t": t, "score": final_score, "data": curr, "prev_data": prev, "mtf": mtf_dict["str"], "mode": mode})
+            python_passed.append({"t": t, "score": final_score, "data": curr, "prev_data": prev, "mtf": mtf_res["str"], "mode": mode})
 
+        # 전역 스캐너 데이터 업데이트
+        global LATEST_SCAN_RESULTS, LATEST_SCAN_TS
+        LATEST_SCAN_RESULTS = new_scan_data
+        LATEST_SCAN_TS = time.time()
+        
         LATEST_TOP_PASS_SCORE = current_loop_max_score
 
         python_passed.sort(key=lambda x: x['score'], reverse=True)
@@ -2928,8 +2983,8 @@ async def send_score_debug_report():
             if not isinstance(p, dict) or not isinstance(c, dict): return None
             
             # 🟢 [적용 2] 디버그 모드 역시 단 한 줄로 압축 완료!
-            score, fatal, mode = evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
-            return {"t": t, "score": score, "fatal": fatal, "mode": mode}
+            score, fatal_reason, mode = evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
+            return {"t": t, "score": score, "fatal_reason": fatal_reason, "mode": mode}
             
     tasks = [fetch_and_score(t) for t in tickers]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2942,7 +2997,7 @@ async def send_score_debug_report():
     
     # 🟢 [추가] 실시간 스코어 현황 발신 시, 보고서용 최고 점수 전역 변수 동기화
     global LATEST_TOP_PASS_SCORE
-    non_fatal_scores = [r['score'] for r in score_results if not r.get('fatal', False)]
+    non_fatal_scores = [r['score'] for r in score_results if not r.get('fatal_reason')]
     if non_fatal_scores:
         LATEST_TOP_PASS_SCORE = max(non_fatal_scores)
     else:
@@ -2951,7 +3006,7 @@ async def send_score_debug_report():
     msg = f"📊 <b>[디버그] 실시간 종목 점수 (기준: {current_regime_mode})</b>\n\n"
     for i, res in enumerate(score_results[:20]): 
         icon = "🚀" if res['mode'] == "QUANTUM" else "📉"
-        fatal_tag = " 💀(하드락 탈락)" if res['fatal'] else ""
+        fatal_tag = f" 💀({res['fatal_reason']})" if res['fatal_reason'] else ""
         msg += f"{i+1}. {res['t']} : <b>{res['score']:.1f}점</b> ({icon}){fatal_tag}\n"
         
     await send_msg(msg)
@@ -3078,8 +3133,9 @@ async def handle_telegram_updates():
                         p_krw = earned_krw - invested_krw
                         
                         await execute_upbit_api(upbit.sell_market_order, t_ticker, qty)
-                        # db 기록 시 amount 자리에 0 대신 실제 qty를 기록하도록 수정
-                        await record_trade_db(t_ticker, 'SELL', real_p, qty, profit_krw=p_krw, reason="[수동청산]")
+                        # DB 기록 시 매수 시점의 점수(pass_score)를 찾아 함께 기록합니다.
+                        t_data = trade_data.get(t_ticker, {})
+                        await record_trade_db(t_ticker, 'SELL', real_p, qty, profit_krw=p_krw, reason="[수동청산]", pass_score=t_data.get('pass_score', 0))
                         
                         last_sell_time[t_ticker] = time.time()
                         sold_count += 1
@@ -3087,6 +3143,10 @@ async def handle_telegram_updates():
                     trade_data.clear()
                     TRADE_DATA_DIRTY = True
                     await send_msg(f"🚨 <b>통합 수동 전량 매도 완료 ({sold_count}개 종목 청산)</b>")
+                
+                elif cmd == "주소" or cmd == "링크":
+                    dashboard_url = STRAT.get('external_dashboard_url', 'http://localhost:8080')
+                    await send_msg(f"🌐 <b>ATS 대시보드 접속 주소</b>\n\n대시보드: {dashboard_url}\n로그 확인: {dashboard_url}/log\n\n* 외부 접속 시 Tunnel(Cloudflare, Tailscale 등)이 설정되어 있어야 합니다.")
                 
         except asyncio.TimeoutError: pass
         except telegram.error.NetworkError: await asyncio.sleep(1.0)
@@ -3629,7 +3689,8 @@ async def main():
                             t['is_runner'] = True 
 
                             TRADE_DATA_DIRTY = True
-                            await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}]", status="PARTIAL_SUCCESS", rating=80)
+                            # 분할 매도 시에도 매수 당시의 점수를 정확히 인계합니다.
+                            await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}]", status="PARTIAL_SUCCESS", rating=80, pass_score=t.get('pass_score', 0))
                             await send_msg(f"💸 <b>{next_step}차 분할 익절</b> ({ticker})\n- 수익률: {p_rate:+.2f}%\n- 수익금: {p_krw:,.0f}원")
                             continue
 
@@ -3651,7 +3712,8 @@ async def main():
                             'btc_buy_price': btc_buy_p, 'btc_sell_price': btc_sell_p, 'btc_change': round(btc_change, 2),
                             'strategy_mode': t.get('strategy_mode', 'QUANTUM'),
                             'max_p_rate': round(max_p_rate_local, 2), # 🟢 즉석에서 구한 값을 매칭!
-                            'elapsed_min': int(elapsed_sec / 60)
+                            'elapsed_min': int(elapsed_sec / 60),
+                            'pass_score': t.get('pass_score', 0) # 🟢 매수 시점 점수 인계
                         }
                         
                         last_sell_time[ticker] = now_ts

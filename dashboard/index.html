@@ -26,6 +26,7 @@
             <nav class="nav-menu">
                 <a href="#" class="nav-item active" data-target="dashboard-view">Dashboard</a>
                 <a href="#" class="nav-item" data-target="history-view">Trade History</a>
+                <a href="#" class="nav-item" data-target="scanner-view">Scanner</a>
                 <a href="#" class="nav-item" data-target="settings-view">Settings</a>
                 <a href="#" class="nav-item" data-target="system-view">System</a>
             </nav>
@@ -106,6 +107,32 @@
                 </div>
             </div>
 
+            <!-- Scanner View -->
+            <div id="scanner-view" class="view-section" style="display: none;">
+                <div class="glass-panel history-panel">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                        <h2 style="margin-bottom: 0;">Real-time Market Scanner</h2>
+                        <span id="scanner-update-time" class="text-muted" style="font-size: 13px;">Waiting for scan...</span>
+                    </div>
+                    <div class="history-table-container">
+                        <table class="history-table">
+                            <thead>
+                                <tr>
+                                    <th>Ticker</th>
+                                    <th>Price</th>
+                                    <th>Score</th>
+                                    <th>MTF</th>
+                                    <th>Action</th>
+                                </tr>
+                            </thead>
+                            <tbody id="scanner-tbody">
+                                <!-- JS Injected -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
             <!-- Settings View -->
             <div id="settings-view" class="view-section" style="display: none;">
                 <div class="glass-panel" style="padding: 24px; flex-grow: 1;">
@@ -163,6 +190,14 @@
                 </div>
             </div>
         </main>
+    </div>
+    <div id="offline-overlay" class="offline-overlay" style="display: none;">
+        <div class="offline-content">
+            <div class="offline-icon">📡</div>
+            <h2>System Offline</h2>
+            <p>서버와 연결이 끊어졌습니다. 봇이 실행 중인지 확인해 주세요.</p>
+            <button onclick="location.reload()" class="neon-button" style="margin-top: 20px; padding: 10px 30px;">재시도</button>
+        </div>
     </div>
     <script src="script.js" charset="utf-8"></script>
 </body>

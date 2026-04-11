@@ -23,10 +23,9 @@ function Start-Engine {
 }
 
 function Stop-Engine {
-    if ($Global:Process -and -not $Global:Process.HasExited) {
-        Write-Host "Stopping ATS Xeon Engine..."
-        Stop-Process -Id $Global:Process.Id -Force
-    }
+    Write-Host "Forcing all ATS Xeon processes to stop..."
+    # Kill by name to ensure no background orphans remain
+    Get-Process "ATS_Xeon" -ErrorAction SilentlyContinue | Stop-Process -Force
 }
 
 # --- Tray Icon Setup ---

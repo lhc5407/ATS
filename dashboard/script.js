@@ -3,6 +3,8 @@ const API_BASE = '/api';
 let profitChart = null;
 let currentTimeframe = 'all'; // Default timeframe
 let logInterval = null;
+let scannerInterval = null;
+let currentSettings = { max_concurrent_trades: 5 }; // For blocking buy button
 
 // Initialize Chart.js
 function initChart() {
@@ -82,10 +84,18 @@ async function fetchDashboardData() {
         const data = await response.json();
         
         updateUI(data);
+        // Hide offline overlay on success
+        const overlay = document.getElementById('offline-overlay');
+        if (overlay) overlay.style.display = 'none';
+        
     } catch (error) {
         console.error("Failed to fetch dashboard data:", error);
         document.getElementById('system-status-text').textContent = "Disconnected";
         document.getElementById('system-status-dot').className = "dot pnl-negative";
+        
+        // Show offline overlay on failure
+        const overlay = document.getElementById('offline-overlay');
+        if (overlay) overlay.style.display = 'flex';
     }
 }
 
@@ -150,6 +160,7 @@ function updateUI(data) {
                         <div class="trade-pnl ${pnlClass}">
                             ${pnlSign}${trade.pnl_pct.toFixed(2)}%
                         </div>
+                        <button class="trade-btn sell-btn" style="margin-top: 8px;" onclick="executeTrade('${trade.ticker}', 'sell', event)">Sell</button>
                     </div>
                 </div>
                 <div class="trade-detail-reason" style="display: none;">
@@ -219,16 +230,23 @@ function switchView(targetId) {
     } else if (targetId === 'settings-view') {
         fetchSettings();
     } else if (targetId === 'system-view') {
-        // Start log polling
         fetchLogs();
         if (logInterval) clearInterval(logInterval);
         logInterval = setInterval(fetchLogs, 3000);
+    } else if (targetId === 'scanner-view') {
+        fetchScannerData();
+        if (scannerInterval) clearInterval(scannerInterval);
+        scannerInterval = setInterval(fetchScannerData, 10000); // 10s refresh for scanner
     }
     
     // Stop log polling if NOT in system view
     if (targetId !== 'system-view' && logInterval) {
         clearInterval(logInterval);
         logInterval = null;
+    }
+    if (targetId !== 'scanner-view' && scannerInterval) {
+        clearInterval(scannerInterval);
+        scannerInterval = null;
     }
 }
 
@@ -312,6 +330,7 @@ async function fetchSettings() {
         document.getElementById('set-max-trades').value = data.max_concurrent_trades || 5;
         document.getElementById('set-base-amount').value = data.base_trade_amount || 5000;
         document.getElementById('set-max-slippage').value = data.max_slippage_pct || 0.5;
+        currentSettings.max_concurrent_trades = data.max_concurrent_trades || 5;
         
     } catch (e) {
         console.error(e);
@@ -368,10 +387,10 @@ async function fetchLogs() {
         const response = await fetch(`${API_BASE}/logs`);
         const data = await response.json();
         const terminal = document.getElementById('log-terminal');
-        if (terminal && data.logs) {
-            // Only update if content is different to prevent flickering
-            if (terminal.innerText !== data.logs) {
-                terminal.innerText = data.logs;
+        if (terminal && typeof data.logs === 'string') {
+            // Updated comparison and assignment for robustness
+            if (terminal.textContent !== data.logs) {
+                terminal.textContent = data.logs;
                 // Auto scroll to bottom
                 terminal.scrollTop = terminal.scrollHeight;
             }
@@ -459,6 +478,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const shutdownBtn = document.getElementById('btn-shutdown');
     if (restartBtn) restartBtn.addEventListener('click', () => controlSystem('restart'));
     if (shutdownBtn) shutdownBtn.addEventListener('click', () => controlSystem('shutdown'));
+    
 
     // Initial fetch
     fetchDashboardData();
@@ -470,4 +490,114 @@ document.addEventListener('DOMContentLoaded', () => {
             fetchDashboardData();
         }
     }, 60000); // Updated to 1 minute per user request
+    
+    // Initial settings fetch to get trade limits
+    fetchSettings();
 });
+
+// ==========================================
+// Scanner View Logic
+// ==========================================
+async function fetchScannerData() {
+    try {
+        const response = await fetch(`${API_BASE}/scanner`);
+        if (!response.ok) throw new Error('Scanner API fail');
+        const data = await response.json();
+        
+        const tbody = document.getElementById('scanner-tbody');
+        tbody.innerHTML = '';
+        
+        if (data.timestamp > 0) {
+            const lastScan = new Date(data.timestamp * 1000);
+            document.getElementById('scanner-update-time').textContent = `Last scan: ${lastScan.toLocaleTimeString()}`;
+        }
+
+        if (!data.scanner || data.scanner.length === 0) {
+            tbody.innerHTML = `<tr><td colspan="5" class="empty-state">No scan results yet. Start scan first.</td></tr>`;
+            return;
+        }
+
+        // Check current active count
+        const activeCount = parseInt(document.getElementById('active-trades-count').textContent) || 0;
+        const canBuy = activeCount < currentSettings.max_concurrent_trades;
+
+        data.scanner.forEach(item => {
+            const scoreClass = item.score >= 80 ? 'score-high' : (item.score >= 60 ? 'score-mid' : 'score-low');
+            const tr = document.createElement('tr');
+            tr.className = 'scanner-row';
+            
+            // Format price
+            const f = new Intl.NumberFormat('ko-KR');
+            const priceStr = f.format(item.price);
+            
+            tr.innerHTML = `
+                <td>
+                    <div style="font-weight: 600;">${item.ticker}</div>
+                    <div class="scanner-info">${item.mode}</div>
+                </td>
+                <td>${priceStr}</td>
+                <td>
+                    <span class="score-badge ${scoreClass}">${item.score.toFixed(1)}</span>
+                </td>
+                <td><span class="mtf-badge">${item.mtf}</span></td>
+                <td>
+                    <button class="trade-btn buy-btn" 
+                        ${canBuy ? '' : 'disabled title="Max trades reached"'} 
+                        onclick="executeTrade('${item.ticker}', 'buy', event)">Buy</button>
+                </td>
+            `;
+            
+            // Tooltip row or reason
+            const reasonTr = document.createElement('tr');
+            reasonTr.style.display = 'none';
+            reasonTr.innerHTML = `<td colspan="5" class="history-details"><strong>Scan Detail:</strong> ${item.reason}</td>`;
+            
+            tr.addEventListener('click', (e) => {
+                if(e.target.tagName !== 'BUTTON') {
+                    reasonTr.style.display = reasonTr.style.display === 'none' ? 'table-row' : 'none';
+                }
+            });
+            
+            tbody.appendChild(tr);
+            tbody.appendChild(reasonTr);
+        });
+    } catch (e) {
+        console.error("Scanner fetch error:", e);
+    }
+}
+
+// ==========================================
+// Manual Trading Execution
+// ==========================================
+async function executeTrade(ticker, action, event) {
+    if (event) event.stopPropagation(); // Prevent row expand
+    
+    const confirmMsg = action === 'buy' 
+        ? `${ticker} 종목을 즉시 매수하시겠습니까?` 
+        : `${ticker} 종목을 전량 시장가 매도하시겠습니까?`;
+        
+    if (!confirm(confirmMsg)) return;
+    
+    try {
+        const response = await fetch(`${API_BASE}/trade`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ ticker, action })
+        });
+        
+        const result = await response.json();
+        if (result.status === 'success') {
+            alert(result.message);
+            // Refresh data
+            fetchDashboardData();
+            if (document.getElementById('scanner-view').style.display !== 'none') {
+                fetchScannerData();
+            }
+        } else {
+            alert(`Error: ${result.message}`);
+        }
+    } catch (e) {
+        console.error("Trade execution error:", e);
+        alert("통신 오류가 발생했습니다.");
+    }
+}
