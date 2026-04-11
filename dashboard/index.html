@@ -23,8 +23,8 @@
             
             <nav class="nav-menu">
                 <a href="#" class="nav-item active">Dashboard</a>
-                <a href="#" class="nav-item">Trade History</a>
-                <a href="#" class="nav-item">Settings</a>
+                <a href="#" class="nav-item" onclick="alert('Trade History 기능은 다음 업데이트에 제공됩니다!');">Trade History</a>
+                <a href="#" class="nav-item" onclick="alert('Settings 페이지는 준비 중입니다.');">Settings</a>
             </nav>
 
             <div class="info-widget">
@@ -57,7 +57,9 @@
                 <!-- Main Chart -->
                 <div class="chart-container glass-panel">
                     <h2>Profit/Loss Timeline</h2>
-                    <canvas id="profitChart"></canvas>
+                    <div style="position: relative; flex-grow: 1; min-height: 0;">
+                        <canvas id="profitChart"></canvas>
+                    </div>
                 </div>
 
                 <!-- Active Trades Feed -->
@@ -71,6 +73,6 @@
             </div>
         </main>
     </div>
-    <script src="script.js"></script>
+    <script src="script.js" charset="utf-8"></script>
 </body>
 </html>
