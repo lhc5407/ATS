@@ -38,12 +38,14 @@ from logging.handlers import RotatingFileHandler
 import socket
 import random
 import glob
+import webbrowser
 from typing import Any, Optional, Tuple, Dict, List
 
 # 🟢 [대시보드 통합] FastAPI 엔진 추가설정
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import uvicorn
 
 def get_coin_tier(ticker: str, curr_data: dict = None) -> str:
@@ -133,13 +135,39 @@ os.makedirs(log_dir, exist_ok=True)
 log_filename = datetime.now().strftime("ats_hybrid_log_%Y%m%d_%H%M%S.log")
 log_filepath = os.path.join(log_dir, log_filename)
 
+# 🟢 PyInstaller 외 환경에서는 stderr를 안전하게 가져오기
+_safe_stderr = getattr(sys, '__stderr__', None) or getattr(sys, 'stderr', None)
+
+_log_handlers: list = [
+    RotatingFileHandler(log_filepath, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
+]
+if _safe_stderr is not None:
+    _log_handlers.append(logging.StreamHandler(_safe_stderr))
+
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s',
-                    handlers=[
-                        RotatingFileHandler(log_filepath, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
-                        logging.StreamHandler(sys.__stderr__)
-                    ])
-logging.getLogger().handlers[1].setLevel(logging.ERROR)
+                    handlers=_log_handlers)
+
+# 🟢 콘솔이 있는 경우 WARNING 이상만 표시 (파일에는 INFO 전체 기록)
+if len(logging.getLogger().handlers) > 1:
+    logging.getLogger().handlers[1].setLevel(logging.WARNING)
+
+# 🔇 외부 라이브러리의 과도한 HTTP/API 로그 파일로만 기록
+for _noisy in [
+    "httpx",         # Telegram Bot HTTP 요청
+    "httpcore",
+    "hpack",
+    "h11",
+    "google",        # Gemini API
+    "google.ai",
+    "google.generativeai",
+    "uvicorn",       # 대시보드 접속 로그
+    "uvicorn.access",
+    "uvicorn.error",
+    "fastapi",
+]:
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+    logging.getLogger(_noisy).propagate = True
 
 def cleanup_old_logs(days=3):
     try:
@@ -751,17 +779,46 @@ else:
     dashboard_dir = os.path.join(base_path, "dashboard")
 
 @app.get("/api/dashboard")
-async def api_get_dashboard():
+async def api_get_dashboard(timeframe: str = 'all'):
     wins, losses, total_profit = 0, 0, 0.0
+    chart_data = []
+    
     try:
         async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
-            async with db.execute("SELECT profit_krw FROM trade_history WHERE side='SELL'") as cursor:
+            query = "SELECT timestamp, profit_krw FROM trade_history WHERE side='SELL' ORDER BY timestamp ASC"
+            async with db.execute(query) as cursor:
+                cumulative_profit = 0.0
                 async for row in cursor:
-                    profit = safe_float(row[0])
+                    ts_str = str(row[0])
+                    profit = safe_float(row[1])
+                    
                     total_profit += profit
+                    cumulative_profit += profit
+                    
                     if profit > 0: wins += 1
-                    else: losses += 1
-    except: pass
+                    elif profit < 0: losses += 1
+                    
+                    chart_data.append({"time": ts_str, "profit": cumulative_profit})
+                    
+        # Apply timeframe filtering
+        if timeframe in ['day', 'week'] and chart_data:
+            now = datetime.now()
+            cutoff = now - timedelta(days=1 if timeframe == 'day' else 7)
+            
+            # 필터링 라인: 기준 시간 이후의 데이터만 남깁니다.
+            filtered_data = []
+            for d in chart_data:
+                try:
+                    t_obj = datetime.strptime(d['time'], '%Y-%m-%d %H:%M:%S')
+                    if t_obj >= cutoff:
+                        filtered_data.append(d)
+                except:
+                    filtered_data.append(d) # 형식이 이상하면 그냥 유지
+            
+            chart_data = filtered_data
+            
+    except Exception as e:
+        logging.error(f"대시보드 DB 쿼리 오류: {e}")
     
     total = wins + losses
     win_rate = (wins / total * 100) if total > 0 else 0
@@ -769,15 +826,24 @@ async def api_get_dashboard():
     active_trades = []
     for t_name, t_data in trade_data.items():
         entry = safe_float(t_data.get('high_p', 0))
+        amount = safe_float(t_data.get('amount', 0))
         cur_p = safe_float(REALTIME_PRICES.get(t_name, entry))
         pnl = ((cur_p - entry) / entry) * 100 if entry > 0 else 0
+        
+        buy_amount_krw = entry * amount
+        current_amount_krw = cur_p * amount
+        
         active_trades.append({
             "ticker": t_name,
             "entry_price": entry,
             "current_price": cur_p,
+            "amount": amount,
+            "buy_amount": buy_amount_krw,
+            "current_amount": current_amount_krw,
             "pnl_pct": pnl,
             "score": t_data.get('pass_score', 0),
-            "mode": t_data.get('strategy_mode', 'UNKNOWN')
+            "mode": t_data.get('strategy_mode', 'UNKNOWN'),
+            "reason": t_data.get('reason_buy', '데이터 없음')
         })
 
     btc_trend_str = "알 수 없음"
@@ -790,8 +856,121 @@ async def api_get_dashboard():
         "btc_trend": btc_trend_str,
         "win_rate": win_rate,
         "total_profit": total_profit,
-        "active_trades": active_trades
+        "active_trades": active_trades,
+        "chart_data": chart_data
     }
+
+@app.get("/api/history")
+async def api_get_history():
+    history_data = []
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
+            # 최근 100건의 매매 역사 (역순)
+            query = "SELECT timestamp, ticker, side, price, profit_krw, reason, pass_score FROM trade_history ORDER BY id DESC LIMIT 100"
+            async with db.execute(query) as cursor:
+                async for row in cursor:
+                    # reason 문자열 처리에 따라 None일 수 있으므로 보호
+                    ai_reason = row[5] if row[5] else "System default closed."
+                    history_data.append({
+                        "time": str(row[0]),
+                        "ticker": str(row[1]),
+                        "side": str(row[2]),
+                        "price": safe_float(row[3]),
+                        "profit_krw": safe_float(row[4]),
+                        "reason": ai_reason,
+                        "score": safe_float(row[6])
+                    })
+    except Exception as e:
+        logging.error(f"히스토리 DB 쿼리 오류: {e}")
+        
+    return {"history": history_data}
+    
+@app.get("/api/logs")
+async def api_get_logs():
+    try:
+        # log_filepath is defined globally at line 136
+        if not os.path.exists(log_filepath):
+            return {"logs": "Log file not found."}
+        
+        with open(log_filepath, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            # Tail last 200 lines
+            last_lines = lines[-200:] if len(lines) > 200 else lines
+            return {"logs": "".join(last_lines)}
+    except Exception as e:
+        return {"logs": f"Error reading logs: {e}"}
+
+@app.post("/api/control")
+async def api_control_system(request: Request):
+    data = await request.json()
+    action = data.get("action")
+    
+    if action == "restart":
+        logging.warning("🔄 Dashboard requested RESTART...")
+        asyncio.create_task(shutdown_after_delay(0))
+        return {"status": "success", "message": "Restarting engine..."}
+    elif action == "shutdown":
+        logging.warning("🛑 Dashboard requested FULL SHUTDOWN...")
+        asyncio.create_task(shutdown_after_delay(99))
+        return {"status": "success", "message": "Shutting down system..."}
+    
+    return {"status": "error", "message": "Invalid action"}
+
+async def shutdown_after_delay(code):
+    await asyncio.sleep(1.5)
+    os._exit(code)
+
+class SettingsUpdate(BaseModel):
+    max_concurrent_trades: int
+    base_trade_amount: int
+    max_slippage_pct: float
+
+@app.get("/api/settings")
+async def api_get_settings():
+    # Return core strategy settings from QUANTUM_CONF (assumed shared with CLASSIC_CONF for core ones)
+    st = QUANTUM_CONF.get("strategy", {})
+    return {
+        "max_concurrent_trades": st.get("max_concurrent_trades", 5),
+        "base_trade_amount": st.get("base_trade_amount", 5000),
+        "max_slippage_pct": st.get("max_slippage_pct", 0.5)
+    }
+
+@app.post("/api/settings")
+async def api_post_settings(data: SettingsUpdate):
+    try:
+        global QUANTUM_CONF, CLASSIC_CONF, STRAT, CLASSIC_STRAT
+        
+        QUANTUM_CONF.setdefault("strategy", {})
+        QUANTUM_CONF["strategy"]["max_concurrent_trades"] = data.max_concurrent_trades
+        QUANTUM_CONF["strategy"]["base_trade_amount"] = data.base_trade_amount
+        QUANTUM_CONF["strategy"]["max_slippage_pct"] = data.max_slippage_pct
+        
+        CLASSIC_CONF.setdefault("strategy", {})
+        CLASSIC_CONF["strategy"]["max_concurrent_trades"] = data.max_concurrent_trades
+        CLASSIC_CONF["strategy"]["base_trade_amount"] = data.base_trade_amount
+        CLASSIC_CONF["strategy"]["max_slippage_pct"] = data.max_slippage_pct
+        
+        # 파일 수동 기록 (비동기로 안전하게)
+        await save_config_async(QUANTUM_CONF, CONFIG_PATH)
+        await save_config_async(CLASSIC_CONF, CLASSIC_CONFIG_PATH)
+        
+        # 봇의 메모리 전역 변수에 바로 복사하여 실시간 반영!
+        if 'STRAT' in globals() and isinstance(STRAT, dict):
+            STRAT["max_concurrent_trades"] = data.max_concurrent_trades
+            STRAT["base_trade_amount"] = data.base_trade_amount
+            STRAT["max_slippage_pct"] = data.max_slippage_pct
+            
+        if 'CLASSIC_STRAT' in globals() and isinstance(CLASSIC_STRAT, dict):
+            CLASSIC_STRAT["max_concurrent_trades"] = data.max_concurrent_trades
+            CLASSIC_STRAT["base_trade_amount"] = data.base_trade_amount
+            CLASSIC_STRAT["max_slippage_pct"] = data.max_slippage_pct
+            
+        logging.info("🌐 웹 대시보드(Settings)에서 봇의 핵심 파라미터가 실시간 오버라이드 되었습니다.")
+        return {"status": "success", "message": "Settings perfectly updated and hot-reloaded!"}
+        
+    except Exception as e:
+        logging.error(f"설정 저장 오류: {e}")
+        return {"status": "error", "message": str(e)}
 
 if os.path.exists(dashboard_dir):
     app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="static")
@@ -800,10 +979,15 @@ else:
 
 async def run_fastapi_server():
     try:
-        print("\n=======================================================")
-        print("🌐 로컬 대시보드 서버 준비 중... (접속: http://localhost:8080)")
-        print("=======================================================\n")
-        logging.info("🌐 로컬 대시보드 서버 가동 시작")
+        logging.warning("🌐 대시보드 서버 가동 중 (접속: http://localhost:8080)")
+        
+        # 🟢 서버가 준비되었을 것으로 예상되는 시점에 브라우저를 자동으로 엽니다.
+        def open_browser():
+            time.sleep(2) # 서버가 기동될 시간을 줍니다.
+            webbrowser.open("http://localhost:8080")
+        
+        asyncio.create_task(asyncio.to_thread(open_browser))
+
         # 🟢 uvicorn 고유의 로거가 PyInstaller 환경의 stdout과 충돌하여 크래시를 유발하므로 log_config=None 으로 비활성화
         config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_config=None)
         server = uvicorn.Server(config)
@@ -3100,8 +3284,8 @@ async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, se
         
         ai_improvement = str(ai_r.get('improvement', '없음')).replace('<', '&lt;').replace('>', '&gt;') if isinstance(ai_r, dict) else '없음'
         
-        # DB 저장
-        await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}] {ai_msg}", status=ai_status, rating=ai_rating, improvement=ai_improvement)
+        # DB 저장 (매수 당시의 점수 pass_score를 유지)
+        await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}] {ai_msg}", status=ai_status, rating=ai_rating, improvement=ai_improvement, pass_score=analyze_payload.get('pass_score', 0))
         
         # 텔레그램 발송
         telegram_message = f"🔕 <b>최종 청산 완료</b> ({ticker})\n- 상태: {ai_status} ({ai_rating}점)\n- 사유: {sell_reason_str}\n- 수익률: {p_rate:+.2f}%\n- 수익금: {p_krw:,.0f}원\n- AI: {ai_msg}"
@@ -3112,7 +3296,7 @@ async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, se
     except Exception as e:
         logging.error(f"백그라운드 매도 리포트 에러 ({ticker}): {e}")
         # 🟢 [보고체계 복구 1] AI 통신 실패 시에도 매도 사실을 반드시 DB와 텔레그램에 남깁니다!
-        await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}] AI 통신 지연", status="ERROR_FALLBACK", rating=50)
+        await record_trade_db(ticker, 'SELL', real_price, sell_qty, profit_krw=p_krw, reason=f"[{sell_reason_str}] AI 통신 지연", status="ERROR_FALLBACK", rating=50, pass_score=analyze_payload.get('pass_score', 0))
         await send_msg(f"🔕 <b>최종 청산 완료 (비상 모드)</b> ({ticker})\n- 사유: {sell_reason_str}\n- 수익률: {p_rate:+.2f}%\n- 수익금: {p_krw:,.0f}원\n- AI: 구글 서버 지연으로 사후 분석 생략")
 
 # 🟢 [Step 4 핵심: 시스템 헬스 체크 (Watchdog)]

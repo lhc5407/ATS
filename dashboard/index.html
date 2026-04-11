@@ -5,8 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ATS Xeon Command Center</title>
     <link rel="stylesheet" href="style.css">
-    <!-- Chart.js for graphs -->
+    <!-- Chart.js for graphs and plugins for zoom/pan -->
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/hammerjs@2.0.8"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.0.1"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
 </head>
 <body>
@@ -22,9 +24,10 @@
             </div>
             
             <nav class="nav-menu">
-                <a href="#" class="nav-item active">Dashboard</a>
-                <a href="#" class="nav-item" onclick="alert('Trade History 기능은 다음 업데이트에 제공됩니다!');">Trade History</a>
-                <a href="#" class="nav-item" onclick="alert('Settings 페이지는 준비 중입니다.');">Settings</a>
+                <a href="#" class="nav-item active" data-target="dashboard-view">Dashboard</a>
+                <a href="#" class="nav-item" data-target="history-view">Trade History</a>
+                <a href="#" class="nav-item" data-target="settings-view">Settings</a>
+                <a href="#" class="nav-item" data-target="system-view">System</a>
             </nav>
 
             <div class="info-widget">
@@ -53,21 +56,109 @@
                 </div>
             </header>
 
-            <div class="content-grid">
-                <!-- Main Chart -->
-                <div class="chart-container glass-panel">
-                    <h2>Profit/Loss Timeline</h2>
-                    <div style="position: relative; flex-grow: 1; min-height: 0;">
-                        <canvas id="profitChart"></canvas>
+            <div id="dashboard-view" class="view-section active">
+                <div class="content-grid">
+                    <!-- Main Chart -->
+                    <div class="chart-container glass-panel">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+                            <h2 style="margin-bottom: 0;">Profit/Loss Timeline</h2>
+                            <div class="timeframe-filters">
+                                <button class="filter-btn" data-timeframe="day">1D</button>
+                                <button class="filter-btn" data-timeframe="week">1W</button>
+                                <button class="filter-btn active" data-timeframe="all">ALL</button>
+                            </div>
+                        </div>
+                        <div style="position: relative; flex-grow: 1; min-height: 0;">
+                            <canvas id="profitChart"></canvas>
+                        </div>
+                    </div>
+
+                    <!-- Active Trades Feed -->
+                    <div class="trades-container glass-panel">
+                        <h2>Active Positions</h2>
+                        <div class="trade-list" id="trade-list">
+                            <div class="empty-state">No active trades currently.</div>
+                        </div>
                     </div>
                 </div>
+            </div>
 
-                <!-- Active Trades Feed -->
-                <div class="trades-container glass-panel">
-                    <h2>Active Positions</h2>
-                    <div class="trade-list" id="trade-list">
-                        <!-- Trade items will be injected here via JS -->
-                        <div class="empty-state">No active trades currently.</div>
+            <!-- History View -->
+            <div id="history-view" class="view-section" style="display: none;">
+                <div class="glass-panel history-panel">
+                    <h2>Trade History (Recent 100)</h2>
+                    <div class="history-table-container">
+                        <table class="history-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Ticker</th>
+                                    <th>Side</th>
+                                    <th>Price</th>
+                                    <th>PnL (KRW)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="history-tbody">
+                                <!-- JS Injected -->
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Settings View -->
+            <div id="settings-view" class="view-section" style="display: none;">
+                <div class="glass-panel" style="padding: 24px; flex-grow: 1;">
+                    <h2>System Settings Override</h2>
+                    
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>최대 동시 진입 종목 수 (Max Concurrent Trades)</label>
+                            <input type="number" id="set-max-trades" min="1" max="15">
+                        </div>
+                        <div class="form-group">
+                            <label>기본 매수 금액 (Base Trade Amount KRW)</label>
+                            <input type="number" step="1000" id="set-base-amount">
+                        </div>
+                        <div class="form-group">
+                            <label>허용 슬리피지 한도 (Max Slippage %)</label>
+                            <input type="number" step="0.1" id="set-max-slippage">
+                        </div>
+                        <button id="btn-save-settings" class="neon-button">Save Configuration</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- System View -->
+            <div id="system-view" class="view-section" style="display: none; flex-direction: column;">
+                <div class="content-grid" style="grid-template-columns: 1fr; gap: 24px;">
+                    <!-- Terminal Log Viewer -->
+                    <div class="glass-panel" style="padding: 24px; flex-grow: 1; display: flex; flex-direction: column; min-height: 400px;">
+                        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                            <h2 style="margin-bottom: 0;">Live System Logs</h2>
+                            <span class="text-muted" style="font-size: 12px;">Auto-scrolling last 200 lines</span>
+                        </div>
+                        <div id="log-terminal" class="terminal-box">
+                            <!-- Logs will be injected here -->
+                            Initializing log stream...
+                        </div>
+                    </div>
+
+                    <!-- System Control -->
+                    <div class="glass-panel" style="padding: 24px;">
+                        <h2>System Control</h2>
+                        <div class="control-grid">
+                            <div class="control-card">
+                                <h3>Restart Engine</h3>
+                                <p class="text-muted">엔진 프로세스만 재시작합니다. 설정 변경 시 활성화를 위해 필요할 수 있습니다.</p>
+                                <button id="btn-restart" class="control-btn warning">Restart Engine</button>
+                            </div>
+                            <div class="control-card">
+                                <h3>Full Shutdown</h3>
+                                <p class="text-muted">엔진과 트레이 런처를 모두 종료합니다. 다시 켜려면 서버에서 직접 실행해야 합니다.</p>
+                                <button id="btn-shutdown" class="control-btn danger">Shutdown System</button>
+                            </div>
+                        </div>
                     </div>
                 </div>
             </div>
