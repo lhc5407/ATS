@@ -40,6 +40,11 @@ import random
 import glob
 from typing import Any, Optional, Tuple, Dict, List
 
+# 🟢 [대시보드 통합] FastAPI 엔진 추가설정
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 
 def get_coin_tier(ticker: str, curr_data: dict = None) -> str:
     """코인의 변동성 지수를 기반으로 티어(Major/Mid/Small) 명칭을 반환합니다."""
@@ -734,6 +739,69 @@ MTF_CACHE_SEC = 300
 instance_lock = None  # 🟢 [Pylance 완벽 방어] 미선언 상태로 global 참조 시 발생하는 경고를 해결하기 위해 전역 초기화
 
 TRADE_DATA_DIRTY = False  # 메모리 데이터가 변경되었는지 확인하는 플래그
+
+# 🟢 [대시보드 전용 서버 세팅]
+app = FastAPI(title="ATS Command Center", docs_url=None, redoc_url=None)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+dashboard_dir = os.path.join(base_path, "dashboard")
+
+@app.get("/api/dashboard")
+async def api_get_dashboard():
+    wins, losses, total_profit = 0, 0, 0.0
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
+            async with db.execute("SELECT profit_krw FROM trade_history WHERE side='SELL'") as cursor:
+                async for row in cursor:
+                    profit = safe_float(row[0])
+                    total_profit += profit
+                    if profit > 0: wins += 1
+                    else: losses += 1
+    except: pass
+    
+    total = wins + losses
+    win_rate = (wins / total * 100) if total > 0 else 0
+
+    active_trades = []
+    for t_name, t_data in trade_data.items():
+        entry = safe_float(t_data.get('high_p', 0))
+        cur_p = safe_float(REALTIME_PRICES.get(t_name, entry))
+        pnl = ((cur_p - entry) / entry) * 100 if entry > 0 else 0
+        active_trades.append({
+            "ticker": t_name,
+            "entry_price": entry,
+            "current_price": cur_p,
+            "pnl_pct": pnl,
+            "score": t_data.get('pass_score', 0),
+            "mode": t_data.get('strategy_mode', 'UNKNOWN')
+        })
+
+    btc_trend_str = "알 수 없음"
+    try:
+        btc_trend_str = "단기 상승" if "Quantum" in SYSTEM_STATUS else ("단기 하락" if "Classic" in SYSTEM_STATUS else "균형")
+    except: pass
+
+    return {
+        "system_status": SYSTEM_STATUS,
+        "btc_trend": btc_trend_str,
+        "win_rate": win_rate,
+        "total_profit": total_profit,
+        "active_trades": active_trades
+    }
+
+if os.path.exists(dashboard_dir):
+    app.mount("/", StaticFiles(directory=dashboard_dir, html=True), name="static")
+else:
+    logging.warning("⚠️ 대시보드 정적 파일 폴더가 없습니다. 웹 UI를 불러올 수 없습니다.")
+
+async def run_fastapi_server():
+    try:
+        logging.info("🌐 로컬 대시보드 서버 준비 중... (접속: http://localhost:8080)")
+        config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_level="warning")
+        server = uvicorn.Server(config)
+        await server.serve()
+    except Exception as e:
+        logging.error(f"❌ 대시보드 서버 가동 실패: {e}")
 
 # 👇 [수정 후 코드] 저장하러 가기 "전"에 스위치를 먼저 끕니다!
 async def db_flush_task():
@@ -3117,8 +3185,10 @@ async def main():
     trade_data = await load_trade_status_db()
     asyncio.create_task(websocket_ticker_task())
     asyncio.create_task(system_watchdog()) # 🟢 워치독 실행!
+    asyncio.create_task(run_fastapi_server()) # 🟢 대시보드 서버 융합
 
     last_report_time = time.time()
+
     last_loss_check_time = time.time()
     last_checked_win_rate = 100.0
     last_daily_report_day = datetime.now().day

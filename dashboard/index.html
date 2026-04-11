@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATS Xeon Command Center</title>
+    <link rel="stylesheet" href="style.css">
+    <!-- Chart.js for graphs -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <!-- Sidebar -->
+        <aside class="sidebar glass-panel">
+            <div class="logo">
+                <span class="logo-text">ATS <span class="neon-text">XEON</span></span>
+                <div class="status-indicator">
+                    <span id="system-status-dot" class="dot pulse-green"></span>
+                    <span id="system-status-text">Online</span>
+                </div>
+            </div>
+            
+            <nav class="nav-menu">
+                <a href="#" class="nav-item active">Dashboard</a>
+                <a href="#" class="nav-item">Trade History</a>
+                <a href="#" class="nav-item">Settings</a>
+            </nav>
+
+            <div class="info-widget">
+                <p>BTC Trend</p>
+                <h3 id="btc-trend" class="neon-text">Scanning...</h3>
+            </div>
+        </aside>
+
+        <!-- Main Content -->
+        <main class="main-content">
+            <header class="top-bar glass-panel">
+                <h1 id="regime-status">System Initializing...</h1>
+                <div class="stats-row">
+                    <div class="stat-box">
+                        <span class="stat-label">Win Rate</span>
+                        <span id="win-rate" class="stat-value neon-text">--%</span>
+                    </div>
+                    <div class="stat-box">
+                        <span class="stat-label">Total Profit</span>
+                        <span id="total-profit" class="stat-value neon-purple">-- KRW</span>
+                    </div>
+                    <div class="stat-box">
+                        <span class="stat-label">Active Trades</span>
+                        <span id="active-trades-count" class="stat-value">0</span>
+                    </div>
+                </div>
+            </header>
+
+            <div class="content-grid">
+                <!-- Main Chart -->
+                <div class="chart-container glass-panel">
+                    <h2>Profit/Loss Timeline</h2>
+                    <canvas id="profitChart"></canvas>
+                </div>
+
+                <!-- Active Trades Feed -->
+                <div class="trades-container glass-panel">
+                    <h2>Active Positions</h2>
+                    <div class="trade-list" id="trade-list">
+                        <!-- Trade items will be injected here via JS -->
+                        <div class="empty-state">No active trades currently.</div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+    <script src="script.js"></script>
+</body>
+</html>
