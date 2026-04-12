@@ -248,12 +248,43 @@ You are the 'Chief Strategy Officer' of an elite quantitative trading system cal
 
 4. HARDCODED SYSTEM OVERRIDES (CRITICAL CONTEXT):
    - Fatal Flaw Locks: Python blocks trades if 1H trend is DOWN or CVD is NEGATIVE.
+   - Breakout Guard: Requires RSI < 70 and momentum support.
+   - Volatility Shield: Blocks buys if BTC is dropping sharply.
    - Pullback Exception: Python allows entries even if 15m Supertrend is RED, provided the 1H trend is BULLISH and price is holding SMA20 support (is_pullback_zone).
    - Dynamic Trailing Stop Lock: Python actively tightens trailing stops to lock in gains at +0.6%, +1.0%, etc.
    - R:R Lock: Python enforces SL <= 0.7x of Target to ensure favorable Risk/Reward.
 
 5. MODE-SPECIFIC OUTPUT SCHEMAS:
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "string", "trend_agent_opinion": "string", "reason": "string", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
+"""
+
+AI_SYSTEM_INSTRUCTION_OPTIMIZE = """
+You are the 'Lead Quantitative Strategist' of ATS (Antigravity Trading System).
+Your role is to analyze recent trade performance and market regimes to optimize the core trading parameters.
+
+[IDENTITY]: You are a mathematical optimization engine. You do not make trading decisions. You provide strategy configuration overrides.
+
+[ABSOLUTE RULES]:
+1. OUTPUT FORMAT: You MUST output ONLY valid JSON.
+2. SCHEMA: You MUST use the following schema:
+   {
+     "strategy": {
+       "trend_active_logic": ["indicator1", "indicator2", ...],
+       "range_active_logic": ["indicator1", "indicator2", ...],
+       "indicator_weights": { ... },
+       "scoring_modifiers": { ... },
+       "major_params": { "target_atr_multiplier": float, "stop_loss": float, "timeout_candles": int, ... },
+       "mid_vol_params": { ... },
+       "high_vol_params": { ... },
+       "fgi_v_curve_bottom": float,
+       "fgi_v_curve_min": float,
+       "fgi_v_curve_max": float,
+       ... (other allowed parameters)
+     },
+     "reason": "Detailed explanation of changes in Korean"
+   }
+3. NO TRADING DECISIONS: Do NOT output 'decision', 'score', 'risk_agent_opinion', or 'exit_plan' in the root level. These are for trade analysis only.
+4. LANGUAGE: The 'reason' field MUST be in Korean.
 """
 
 VALID_INDICATORS = [
@@ -411,7 +442,7 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
 
 def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
     # force_eval_mode가 주어지면 시장 상황을 무시하고 그 모드로만 채점합니다.
-    eval_mode = force_eval_mode if force_eval_mode else determine_eval_mode(current_regime_mode, curr_i)
+    eval_mode = force_eval_mode if force_eval_mode else determine_eval_mode(current_regime_mode, current_regime_mode)
     logic_list = get_logic_list_for_mode(eval_mode, curr_i)
     indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
@@ -895,6 +926,7 @@ async def api_get_scanner():
 
 @app.post("/api/trade")
 async def api_trade_manual(request: Request):
+    global trade_data, TRADE_DATA_DIRTY
     data = await request.json()
     ticker = data.get("ticker")
     action = data.get("action") # "buy" or "sell"
@@ -913,7 +945,7 @@ async def api_trade_manual(request: Request):
             qty = safe_float(coin['balance']) + safe_float(coin['locked'])
             if qty <= 0:
                 return {"status": "error", "message": "매도 가능한 수량이 없습니다."}
-                
+            
             # 매수 시점의 점수 인계 시도
             t_data = trade_data.get(ticker, {})
             p_score = t_data.get('pass_score', 0)
@@ -944,16 +976,51 @@ async def api_trade_manual(request: Request):
             if len(trade_data) >= max_concurrent:
                 return {"status": "error", "message": f"매수 슬롯 한도({max_concurrent}개)에 도달했습니다."}
                 
-            # 2. 매수 실행 (기본 설정 금액 사용)
+            # 2. 실시간 기준 정보 획득
+            cur_p = safe_float(REALTIME_PRICES.get(ticker))
+            if cur_p <= 0:
+                # 웹소켓 가격이 없으면 REST API로 시도
+                cur_p = safe_float(await execute_upbit_api(pyupbit.get_current_price, ticker))
+            
+            if cur_p <= 0:
+                return {"status": "error", "message": "현재가를 불러올 수 없어 매수를 중단합니다."}
+
+            # 3. 매수 실행 (기본 설정 금액 사용)
             buy_amt = STRAT.get('base_trade_amount', 5000)
             await execute_upbit_api(upbit.buy_market_order, ticker, buy_amt)
             
+            # 수량 역산 (기록용)
+            qty = buy_amt / cur_p if cur_p > 0 else 0
+            
             # DB 기록 및 알림 (스캐너에 점수가 있으면 가져다 쓰고, 없으면 기본 80점 부여)
             manual_score = LATEST_SCAN_RESULTS.get(ticker, {}).get('score', 80.0)
-            await record_trade_db(ticker, 'BUY', 0, 0, profit_krw=0, reason="[대시보드 수동매수]", status="ENTERED", pass_score=manual_score) 
-            await send_msg(f"✅ <b>대시보드 수동 매수 완료</b>: {ticker}\n- 매수 금액: {buy_amt:,.0f}원")
+            await record_trade_db(ticker, 'BUY', cur_p, qty, profit_krw=0, reason="[대시보드 수동매수]", status="ENTERED", pass_score=manual_score) 
             
-            return {"status": "success", "message": f"{ticker} 매수 주문이 완료되었습니다."}
+            # 🟢 [핵심 수정] 대시보드 즉시 반영을 위한 trade_data 등록
+            
+            # 티어별 파라미터 미리 계산
+            dummy_curr = {'close': cur_p, 'ATR': 0, 'volume': 0} # 평단가 기준 최소 정보
+            eval_m = "QUANTUM" if "Quantum" in SYSTEM_STATUS else "CLASSIC"
+            t_params = get_coin_tier_params(ticker, dummy_curr, eval_mode=eval_m)
+            
+            trade_data[ticker] = {
+                'entry_price': cur_p,
+                'buy_time': time.time(),
+                'qty': qty,
+                'pass_score': manual_score,
+                'buy_reason': "[대시보드 수동매수]",
+                'strategy_mode': eval_m,
+                'tier_params': t_params,
+                'last_ind_update_ts': time.time()
+            }
+            TRADE_DATA_DIRTY = True
+            
+            # 즉시 DB 영속성 확보
+            await save_trade_status_db(trade_data)
+            
+            await send_msg(f"✅ <b>대시보드 수동 매수 완료</b>: {ticker}\n- 매수 단가: {cur_p:,.0f}원\n- 매수 금액: {buy_amt:,.0f}원")
+            
+            return {"status": "success", "message": f"{ticker} 매수 주문 및 관리가 시작되었습니다."}
             
     except Exception as e:
         logging.error(f"대시보드 매매 오류 ({ticker}): {e}")
@@ -1181,8 +1248,8 @@ async def execute_upbit_api(api_call, *args, **kwargs):
     logging.error(f"🚫 API 호출 5회 연속 실패. 포기합니다: {getattr(api_call, '__name__', 'Unknown API')}")
     return None
 
-# 🟢 비동기 SQLite DB 설정
-DB_FILE = "ats_unified.db"
+# 🟢 비동기 SQLite DB 설정 (경로를 실행파일 폴더로 고정)
+DB_FILE = os.path.join(base_path, "ats_unified.db")
 
 async def init_db():
     async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
@@ -1233,7 +1300,7 @@ async def get_performance_stats_db():
     history = [dict(row) for row in rows]
     wins = [t for t in history if t['profit_krw'] > 0]
     losses = [t for t in history if t['profit_krw'] <= 0]
-    win_rate = (len(wins) / total_cnt * 100) if total_cnt >= 10 and total_cnt > 0 else 50.0
+    win_rate = (len(wins) / total_cnt * 100) if total_cnt >= 1 and total_cnt > 0 else 50.0
     total_profit = sum(t['profit_krw'] for t in history)
     return win_rate, total_cnt, len(wins), total_profit, wins, losses
 
@@ -1783,7 +1850,6 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             - bonus_all_time_high: MUST be between 20 and 40
             - penalty_btc_weakness: MUST be between -30 and -15
             - penalty_weak_momentum: MUST be between -25 and -10
-        # deep_scan_interval 지침 제거
             - btc_surge_threshold: MUST be between 1.0 and 3.0 (BTC 1분 급등 트리거 기준%. 시장 변동성 높으면 낙게, 낙으면 높게 교정)
             """
             critical_rule = "CRITICAL RULE: You MUST prioritize momentum indicators like 'bollinger_breakout' and 'sma_crossover'. Remove panic dip bonuses."
@@ -1959,7 +2025,9 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             last_ai_call_time = time.time()
             if mode in ("BUY", "POST_BUY_REPORT"): last_coin_ai_call[ticker] = last_ai_call_time
 
-            if eval_mode == "CLASSIC":
+            if mode == "OPTIMIZE":
+                system_instruction_text = AI_SYSTEM_INSTRUCTION_OPTIMIZE
+            elif eval_mode == "CLASSIC":
                 system_instruction_text = AI_SYSTEM_INSTRUCTION_CLASSIC
             else:
                 system_instruction_text = AI_SYSTEM_INSTRUCTION_QUANTUM
@@ -2250,20 +2318,20 @@ async def ai_self_optimize(trigger="manual", eval_mode="QUANTUM"):
                 try:
                     if 'mult' in k or 'dev' in k: v = max(0.5, min(5.0, float(v)))
                     elif 'len' in k: v = max(3, min(200, int(v)))
-                    elif k == 'fgi_v_curve_bottom': v = max(20.0, min(50.0, float(v)))
-                    elif k == 'fgi_v_curve_max': v = max(1.5, min(3.0, float(v)))
-                    elif k == 'fgi_v_curve_min': v = max(0.5, min(1.0, float(v)))
-                    elif k == 'fgi_v_curve_greed_max': v = max(1.0, min(2.5, float(v)))
-                    elif k == 'pass_score_threshold': v = max(75, min(90, int(v)))
-                    elif k == 'guard_score_threshold': v = max(45, min(75, int(v)))
+                    elif k == 'fgi_v_curve_bottom': v = max(15.0, min(55.0, float(v)))
+                    elif k == 'fgi_v_curve_max': v = max(1.2, min(3.5, float(v)))
+                    elif k == 'fgi_v_curve_min': v = max(0.3, min(1.0, float(v)))
+                    elif k == 'fgi_v_curve_greed_max': v = max(0.8, min(3.0, float(v)))
+                    elif k == 'pass_score_threshold': v = max(70, min(95, int(v)))
+                    elif k == 'guard_score_threshold': v = max(40, min(80, int(v)))
                     elif k == 'sell_score_threshold': 
                         # 🟢 [개선] CLASSIC 모드는 더 낮은 임계값(30점)에서도 버틸 수 있게 허용
-                        min_sell = 30 if eval_mode == "CLASSIC" else 40
+                        min_sell = 25 if eval_mode == "CLASSIC" else 40
                         v = max(min_sell, min(55, int(v)))
-                    elif k == 'rsi_low_threshold': v = max(20.0, min(60.0, float(v)))
-                    elif k == 'rsi_high_threshold': v = max(60.0, min(85.0, float(v)))
+                    elif k == 'rsi_low_threshold': v = max(15.0, min(65.0, float(v)))
+                    elif k == 'rsi_high_threshold': v = max(55.0, min(90.0, float(v)))
                     elif k == 'btc_surge_threshold':
-                        v = max(1.0, min(3.0, float(v)))
+                        v = max(0.8, min(4.0, float(v)))
                         global BTC_SURGE_THRESHOLD
                         BTC_SURGE_THRESHOLD = v
                     elif k == 'btc_short_term_vol_threshold': v = max(0.5, min(2.0, float(v)))
@@ -3357,6 +3425,9 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         (is_fundamental_broken, f"모멘텀 붕괴 ({ma_live_score}점)", 1.0, 0, "HIGH"),
         (elapsed_sec > full_timeout_sec and curr_p_rate <= 0.5, f"추세 정체 타임아웃 ({timeout_candles}캔들)", 1.0, 0, "NORMAL"),
         (elapsed_sec > half_timeout_sec and curr_p_rate < 0.0 and (macd_diff_val < 0 or curr_ma_score < 60), "⏳ 조기 타임아웃 (돌파 동력 상실)", 1.0, 0, "HIGH"),                        
+        # 🟢 [개선] 15분(micro_timeout) 경과 후 수익권이 아닐 경우(0.1% 미만) 즉각 청산 (자금 회전율 최적화)
+        (elapsed_sec > micro_timeout_sec and curr_p_rate < 0.1, "⏳ 중립 타임아웃 (반등 정체/횡보)", 1.0, 0, "NORMAL"),
+        
         (elapsed_sec > micro_timeout_sec and curr_p_rate <= -1.0, "⏳ 가짜 돌파 컷 (즉각 탈출)", 1.0, 0, "HIGH"),
         (elapsed_sec > micro_timeout_sec and curr_p_rate <= -0.5 and macd_diff_val < 0, "⏳ 모멘텀 역전 컷 (돌파 실패)", 1.0, 0, "HIGH")
     ]
