@@ -544,10 +544,17 @@ async function fetchScannerData() {
             const f = new Intl.NumberFormat('ko-KR');
             const priceStr = f.format(item.price);
             
+            // 🟢 [수정] 결격 사유(fatal_flaw)가 존재할 경우 배지로 강조
+            let flawBadge = '';
+            if (item.fatal_flaw && item.fatal_flaw !== 'PASS') {
+                flawBadge = `<div class="scanner-info" style="color: var(--neon-red); font-size: 10px;">🛑 ${item.fatal_flaw}</div>`;
+            }
+
             tr.innerHTML = `
                 <td>
                     <div style="font-weight: 600;">${item.ticker}</div>
                     <div class="scanner-info">${item.mode}</div>
+                    ${flawBadge}
                 </td>
                 <td>${priceStr}</td>
                 <td>
@@ -577,6 +584,31 @@ async function fetchScannerData() {
         });
     } catch (e) {
         console.error("Scanner fetch error:", e);
+    }
+}
+
+async function refreshScanner() {
+    const btn = document.getElementById('btn-refresh-scanner');
+    if (!btn) return;
+    
+    btn.disabled = true;
+    btn.textContent = "Scanning...";
+    
+    try {
+        const response = await fetch(`${API_BASE}/scanner/refresh`, { method: 'POST' });
+        const result = await response.json();
+        
+        // 🟢 스캔은 백그라운드에서 돌고 있으므로, 3초 후 결과 새로고침 시도
+        setTimeout(fetchScannerData, 3000);
+        setTimeout(() => {
+            btn.disabled = false;
+            btn.textContent = "점수 갱신";
+        }, 5000);
+        
+    } catch (e) {
+        console.error("Refresh failed:", e);
+        btn.disabled = false;
+        btn.textContent = "점수 갱신";
     }
 }
 

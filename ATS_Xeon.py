@@ -447,6 +447,14 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
     indicator_mults = get_indicator_multipliers(eval_mode, fgi_val)
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={})
     
+    # 🟢 [수익성 패치] V자 반등 에너지(CVD Slope) 필터 추가
+    cvd_curr = safe_float(curr_i.get('cvd', 0))
+    cvd_prev = safe_float(prev_i.get('cvd', 0))
+    cvd_slope = cvd_curr - cvd_prev
+    
+    # RSI가 낮음에도 CVD가 하락 중이면 '떨어지는 칼날' 가중 감점 (-15점)
+    cvd_penalty = -15 if safe_float(curr_i.get('rsi')) < 35 and cvd_slope < 0 else 0
+    
     earned_score, total_w = 0.0, 0.0
     curr_close = safe_float(curr_i.get('close'))
     curr_vol = safe_float(curr_i.get('volume'))
@@ -467,6 +475,7 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
         total_w += (m * w)
     
     score = int(earned_score / total_w) if total_w > 0 else 0
+    score = max(0.0, min(100.0, score + cvd_penalty))
 
     def calc_gradient_val(val, target, window, mode='DECREASE'):
         diff = abs(val - target)
@@ -846,26 +855,38 @@ async def api_get_dashboard(timeframe: str = 'all'):
     win_rate = (wins / total * 100) if total > 0 else 0
 
     active_trades = []
+    # 🟢 [수정] 업비트 실시간 잔고(balances)를 기반으로 데이터 일관성 확보
+    balances = BALANCE_CACHE['data']
+    if not isinstance(balances, list): balances = []
+    
+    # 잔고를 티커별로 매칭하기 쉽게 딕셔너리로 변환
+    held_balances = {f"KRW-{b['currency']}": b for b in balances if b['currency'] != 'KRW'}
+    
     for t_name, t_data in trade_data.items():
-        entry = safe_float(t_data.get('high_p', 0))
-        amount = safe_float(t_data.get('amount', 0))
-        cur_p = safe_float(REALTIME_PRICES.get(t_name, entry))
-        pnl = ((cur_p - entry) / entry) * 100 if entry > 0 else 0
+        if t_name not in held_balances: continue # 유령 포지션 방지
+            
+        coin = held_balances[t_name]
+        # 평단가 및 수량 추출 (업비트 실시간 잔고 우선)
+        avg_p = safe_float(coin.get('avg_buy_price'))
+        amount = safe_float(coin.get('balance')) + safe_float(coin.get('locked'))
+        cur_p = safe_float(REALTIME_PRICES.get(t_name, avg_p))
         
-        buy_amount_krw = entry * amount
+        # 실제 투자 가치와 현재 가치 계산
+        buy_amount_krw = avg_p * amount
         current_amount_krw = cur_p * amount
+        pnl = ((cur_p - avg_p) / avg_p) * 100 if avg_p > 0 else 0
         
         active_trades.append({
             "ticker": t_name,
-            "entry_price": entry,
+            "entry_price": avg_p,
             "current_price": cur_p,
             "amount": amount,
             "buy_amount": buy_amount_krw,
             "current_amount": current_amount_krw,
             "pnl_pct": pnl,
-            "score": t_data.get('pass_score', 0),
-            "mode": t_data.get('strategy_mode', 'UNKNOWN'),
-            "reason": t_data.get('buy_reason', '데이터 없음')
+            "score": t_data.get('pass_score', 80),
+            "mode": t_data.get('strategy_mode', 'QUANTUM'),
+            "reason": t_data.get('buy_reason', '자동 매수')
         })
 
     btc_trend_str = "알 수 없음"
@@ -887,20 +908,23 @@ async def api_get_history():
     history_data = []
     try:
         async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
-            # 최근 100건의 매매 역사 (역순)
-            query = "SELECT timestamp, ticker, side, price, profit_krw, reason, pass_score FROM trade_history ORDER BY id DESC LIMIT 100"
+            # 최근 100건의 매매 역사 (역순) - rating 필드 포함
+            query = "SELECT timestamp, ticker, side, price, profit_krw, reason, pass_score, rating FROM trade_history ORDER BY id DESC LIMIT 100"
             async with db.execute(query) as cursor:
                 async for row in cursor:
-                    # reason 문자열 처리에 따라 None일 수 있으므로 보호
-                    ai_reason = row[5] if row[5] else "System default closed."
+                    side = str(row[2])
+                    # 🟢 [수정] SELL일 경우 AI가 평가한 rating을 최종 점수로 표기
+                    final_score = safe_float(row[7]) if side == 'SELL' else safe_float(row[6])
+                    
+                    ai_reason = row[5] if row[5] else "시스템 자동 매매"
                     history_data.append({
                         "time": str(row[0]),
                         "ticker": str(row[1]),
-                        "side": str(row[2]),
+                        "side": side,
                         "price": safe_float(row[3]),
                         "profit_krw": safe_float(row[4]),
                         "reason": ai_reason,
-                        "score": safe_float(row[6])
+                        "score": final_score
                     })
     except Exception as e:
         logging.error(f"히스토리 DB 쿼리 오류: {e}")
@@ -918,11 +942,18 @@ async def api_get_scanner():
             "reason": info["reason"],
             "price": info["price"],
             "mode": info["mode"],
-            "mtf": info["mtf"]
+            "mtf": info["mtf"],
+            "fatal_flaw": info.get("reason", "PASS") # 🟢 [수정] 결격 사유 명시적 전달
         })
     # 점수 높은 순으로 정렬
     results.sort(key=lambda x: x['score'], reverse=True)
     return {"scanner": results, "timestamp": LATEST_SCAN_TS}
+
+@app.post("/api/scanner/refresh")
+async def api_scanner_refresh():
+    # 🟢 [추가] 즉시 전수 검사를 트리거합니다.
+    asyncio.create_task(run_full_scan(is_deep_scan=True))
+    return {"status": "success", "message": "점수 갱신(전수검사) 태스크가 시작되었습니다."}
 
 @app.post("/api/trade")
 async def api_trade_manual(request: Request):
@@ -1913,13 +1944,13 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         Sell Indicators: {clean_data.get('sell_ind')}
         Actual Sell Reason: {clean_data.get('actual_sell_reason')}
         
-        Mission: Rate the trade performance (0-100) based on the {strategy_desc} strategy, and suggest improvements in Korean.
-        Did it follow the Original Exit Plan? Should it have taken profit earlier based on Max Reached Profit? 
-        * CRITICAL NOTES: 
-        1. If closed via 'Trailing Stop' or 'Breakeven Lock' with positive profit, rate it highly (>75) as successful risk management.
-        2. 'Buy Indicators' are from an INCOMPLETE candle (live data). Do not overly penalize low volume if other oversold signals were extremely strong.
-        Provide JSON ONLY in this exact format:
-        {{"rating": 85, "status": "SUCCESS" or "FAIL" or "ACCEPTABLE", "reason": "상세한 분석 및 개선점(한국어)"}}
+        Mission:
+        1. 시스템의 손실 사례를 분석하여 강점이 발휘되지 못한 이유를 찾아내십시오.
+        2. 'Actual Sell Reason'과 'Analyze Payload'를 대조하여 지표의 한계를 지적하십시오.
+        3. [CRITICAL]: 핵심 내용을 반드시 '3문장 이내'로 요약하십시오.
+        4. [CRITICAL]: 반드시 'improvement' 필드에 다음 거래에서 승률을 높이기 위한 구체적이고 기술적인 제안을 한 문장으로 작성하십시오.
+        
+        Output JSON: {{"reason": "3문장 핵심 요약 (Korean)", "status": "SUCCESS"|"FAIL"|"ACCEPTABLE", "rating": 0~100, "improvement": "구체적인 한 문장 제언 (Korean)"}}
         """
         
     elif mode == "BUY": 
@@ -3292,7 +3323,10 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     
     target_p_price = avg_p + (entry_atr * target_atr_multiplier)
     target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
-    hard_s = exit_plan.get('stop_loss', -3.0) 
+    
+    # 🟢 [수익성 패치] R:R Guard: 익절 목표의 0.7배를 초과하는 손절은 금지
+    raw_hard_s = exit_plan.get('stop_loss', -3.0) 
+    hard_s = max(raw_hard_s, -abs(target_p * 0.7))
 
     current_atr_mult = exit_plan.get('atr_mult', get_dynamic_strat_value('atr_multiplier_for_stoploss', mode=eval_mode, default=1.8))
     
@@ -3426,7 +3460,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         (elapsed_sec > full_timeout_sec and curr_p_rate <= 0.5, f"추세 정체 타임아웃 ({timeout_candles}캔들)", 1.0, 0, "NORMAL"),
         (elapsed_sec > half_timeout_sec and curr_p_rate < 0.0 and (macd_diff_val < 0 or curr_ma_score < 60), "⏳ 조기 타임아웃 (돌파 동력 상실)", 1.0, 0, "HIGH"),                        
         # 🟢 [개선] 15분(micro_timeout) 경과 후 수익권이 아닐 경우(0.1% 미만) 즉각 청산 (자금 회전율 최적화)
-        (elapsed_sec > micro_timeout_sec and curr_p_rate < 0.1, "⏳ 중립 타임아웃 (반등 정체/횡보)", 1.0, 0, "NORMAL"),
+        (elapsed_sec > micro_timeout_sec and abs(curr_p_rate) < 0.2, "⏳ 중립 타임아웃 (반등 정체/본전 탈출)", 1.0, 0, "NORMAL"),
         
         (elapsed_sec > micro_timeout_sec and curr_p_rate <= -1.0, "⏳ 가짜 돌파 컷 (즉각 탈출)", 1.0, 0, "HIGH"),
         (elapsed_sec > micro_timeout_sec and curr_p_rate <= -0.5 and macd_diff_val < 0, "⏳ 모멘텀 역전 컷 (돌파 실패)", 1.0, 0, "HIGH")
@@ -3620,8 +3654,13 @@ async def main():
                 TRADE_DATA_DIRTY = True
 
     await send_msg(await build_report("초기 보고", True))
+    
+    # 🟢 [버그 픽스] 중복 스캔 방지를 위해 시작 스캔 실행 전 타이머를 미리 세팅합니다.
+    global last_deep_scan_ts
+    last_deep_scan_ts = time.time()
+    
     asyncio.create_task(background_scan_task(True)) # 🟢 [수정] 프로그램 시작 시 바로 딥 스캔 시작
-    last_global_buy_time = time.time() # 🟢 [버그 픽스] 중복 스캔 방지를 위해 시작 시점을 현재로 리셋
+    last_global_buy_time = time.time()
     asyncio.create_task(db_flush_task())
     asyncio.create_task(cache_cleanup_task())
     await asyncio.sleep(3)

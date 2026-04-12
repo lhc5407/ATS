@@ -112,7 +112,10 @@
                 <div class="glass-panel history-panel">
                     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
                         <h2 style="margin-bottom: 0;">Real-time Market Scanner</h2>
-                        <span id="scanner-update-time" class="text-muted" style="font-size: 13px;">Waiting for scan...</span>
+                        <div style="display: flex; align-items: center; gap: 12px;">
+                            <span id="scanner-update-time" class="text-muted" style="font-size: 13px;">Waiting for scan...</span>
+                            <button id="btn-refresh-scanner" class="trade-btn buy-btn" onclick="refreshScanner()">점수 갱신</button>
+                        </div>
                     </div>
                     <div class="history-table-container">
                         <table class="history-table">
