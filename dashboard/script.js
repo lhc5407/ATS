@@ -497,13 +497,15 @@ document.addEventListener('DOMContentLoaded', () => {
     // Initial fetch
     fetchDashboardData();
     
-    // Live updates (Dashboard only, ignore if not visible)
+    // Live updates (Dashboard Stats & Active Positions: 10 seconds)
     setInterval(() => {
         const dash = document.getElementById('dashboard-view');
-        if (dash && dash.style.display !== 'none') {
+        const hist = document.getElementById('history-view');
+        // 대시보드나 히스토리 뷰를 보고 있을 때만 갱신 (효율성)
+        if ((dash && dash.style.display !== 'none') || (hist && hist.style.display !== 'none')) {
             fetchDashboardData();
         }
-    }, 60000); // Updated to 1 minute per user request
+    }, 10000); 
     
     // Initial settings fetch to get trade limits
     fetchSettings();
@@ -544,23 +546,23 @@ async function fetchScannerData() {
             const f = new Intl.NumberFormat('ko-KR');
             const priceStr = f.format(item.price);
             
-            // 🟢 [수정] 결격 사유(fatal_flaw)가 존재할 경우 배지로 강조
-            let flawBadge = '';
+            // 🟢 [수정] 결격 사유(fatal_flaw)를 전용 컬럼으로 분리
+            let flawContent = '<span class="text-muted">PASS</span>';
             if (item.fatal_flaw && item.fatal_flaw !== 'PASS') {
-                flawBadge = `<div class="scanner-info" style="color: var(--neon-red); font-size: 10px;">🛑 ${item.fatal_flaw}</div>`;
+                flawContent = `<span style="color: var(--neon-red); font-size: 11px; font-weight: 600;">🛑 ${item.fatal_flaw}</span>`;
             }
 
             tr.innerHTML = `
                 <td>
                     <div style="font-weight: 600;">${item.ticker}</div>
                     <div class="scanner-info">${item.mode}</div>
-                    ${flawBadge}
                 </td>
                 <td>${priceStr}</td>
                 <td>
                     <span class="score-badge ${scoreClass}">${item.score.toFixed(1)}</span>
                 </td>
                 <td><span class="mtf-badge">${item.mtf}</span></td>
+                <td>${flawContent}</td>
                 <td>
                     <button class="trade-btn buy-btn" 
                         ${canBuy ? '' : 'disabled title="Max trades reached"'} 
@@ -571,7 +573,7 @@ async function fetchScannerData() {
             // Tooltip row or reason
             const reasonTr = document.createElement('tr');
             reasonTr.style.display = 'none';
-            reasonTr.innerHTML = `<td colspan="5" class="history-details"><strong>Scan Detail:</strong> ${item.reason}</td>`;
+            reasonTr.innerHTML = `<td colspan="6" class="history-details"><strong>Scan Detail:</strong> ${item.reason}</td>`;
             
             tr.addEventListener('click', (e) => {
                 if(e.target.tagName !== 'BUTTON') {
