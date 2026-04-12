@@ -558,10 +558,18 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
             elif not cvd_improving: fatal_reason = "실매수세부족 (CVD)"
             elif is_ob_bad: fatal_reason = "매도벽압박 (OB)"
             
-        if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.7):
-            if safe_float(curr_i.get('rsi')) <= 60:
+        if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.3):
+            if safe_float(curr_i.get('rsi')) <= 60: 
+                # 🟢 [개선] V자 반등 시 양봉(bullish_recovery) 중요도 유지 (+25)
+                if is_bullish_recovery:
+                    score += (current_score_mods.get('bonus_v_shape_rebound', 15) + 10)
+                
                 fatal_reason = "" # V자 반등 특례
                 v_shape_special = True
+
+        # 🟢 [사용자 제언 반영] RSI 45 하단 방어 (V자 반등 및 역추세 진입 시 탄력성 확보)
+        if not fatal_reason and safe_float(curr_i.get('rsi')) < 45:
+            fatal_reason = "낮은탄력(RSI<45)"
 
     # 데이터 주입 (보고서용)
     curr_i['is_volume_spike'] = is_volume_spike
@@ -884,7 +892,7 @@ async def api_get_dashboard(timeframe: str = 'all'):
             "buy_amount": buy_amount_krw,
             "current_amount": current_amount_krw,
             "pnl_pct": pnl,
-            "score": t_data.get('pass_score', 80),
+            "score": t_data.get('rating') if t_data.get('rating') is not None else t_data.get('pass_score', 80),
             "mode": t_data.get('strategy_mode', 'QUANTUM'),
             "reason": t_data.get('buy_reason', '자동 매수')
         })
@@ -913,8 +921,8 @@ async def api_get_history():
             async with db.execute(query) as cursor:
                 async for row in cursor:
                     side = str(row[2])
-                    # 🟢 [수정] SELL일 경우 AI가 평가한 rating을 최종 점수로 표기
-                    final_score = safe_float(row[7]) if side == 'SELL' else safe_float(row[6])
+                    # 🟢 [수정] rating이 존재하면(AI 평가 완료) 우선 사용, 없으면 pass_score 사용
+                    final_score = safe_float(row[7]) if row[7] is not None else safe_float(row[6])
                     
                     ai_reason = row[5] if row[5] else "시스템 자동 매매"
                     history_data.append({
@@ -1985,6 +1993,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         - 'is_pullback_zone': TRUE if price is currently holding SMA20 support (CRITICAL for Quantum Pullback).
         - 'dist_sma20': Percentage gap from SMA20. Large negative means extreme oversold (CRITICAL for Classic).
         - 'is_volume_spike' / 'is_bullish_recovery' / 'cvd_improving': These are mandatory confirmations for a safe entry.
+        - [NEW RULE]: For V-Shape/Bounce plays, prioritize 'is_bullish_recovery'. Never BUY if RSI < 45 (unless extreme trend-follow pullback in Quantum).
         
         Step 1. [Risk Agent]: Analyze downside risks, orderbook imbalance, and confirm if 'is_bullish_recovery' is TRUE.
         Step 2. [Trend Agent]: Analyze upside potential, volume validation ('is_volume_spike'), and CVD strength ('cvd_improving').
@@ -2519,7 +2528,7 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
         TRADE_DATA_DIRTY = True
 
 # --- [5. 공통 스캔 모듈] ---
-async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash, held_count, exit_plan, buy_mode="COUNCIL", pass_score=0, eval_mode="QUANTUM"):
+async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash, held_count, exit_plan, buy_mode="COUNCIL", pass_score=0, eval_mode="QUANTUM", rating=None):
     global last_global_buy_time, TRADE_DATA_DIRTY
     
     strat = get_strat_for_mode(buy_mode)
@@ -2617,16 +2626,19 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
 
             buy_ind_dict = curr_data if isinstance(curr_data, dict) else curr_data.to_dict()
 
+            # 🟢 [수정] AI Rating 연동
+            final_rating = rating if rating is not None else int(score)
+
             trade_data[ticker] = {
                 'high_p': final_buy_price, 'entry_atr': curr_data.get('ATR', 0), 'guard': False,
                 'buy_ind': buy_ind_dict, 
                 'last_notified_step': 0, 'buy_ts': now_ts,
                 'exit_plan': temp_exit_plan, 'buy_reason': reason, 'btc_buy_price': REALTIME_PRICES.get('KRW-BTC', 0),
-                'pass_score': pass_score, 'is_runner': False, 'score_history': [pass_score],
+                'pass_score': pass_score, 'rating': final_rating, 'is_runner': False, 'score_history': [final_rating],
                 'strategy_mode': buy_mode
             }
             TRADE_DATA_DIRTY = True
-            await record_trade_db(ticker, 'BUY', final_buy_price, buy_amt, profit_krw=0, reason=reason, status="ENTERED", rating=int(score), pass_score=pass_score)        
+            await record_trade_db(ticker, 'BUY', final_buy_price, buy_amt, profit_krw=0, reason=reason, status="ENTERED", rating=final_rating, pass_score=pass_score)        
             
             if buy_mode == "SNIPER":
                 await send_msg(f"🎯 <b>스나이퍼 선제 매수 완료</b>: {ticker} (파이썬:{pass_score:.1f}점)\n- <b>매수 금액: {buy_amt:,.2f}원</b>\n👉 <b>사후 결재 대기중.</b>")
@@ -2810,10 +2822,13 @@ async def run_full_scan(is_deep_scan=False):
             ana = await ai_analyze(p['t'], ai_data, mode="BUY", eval_mode=p['mode'], ignore_cooldown=True, mtf_trend=mtf_str_for_buy, market_regime=regime, rag_context=global_rag_context, expected_slippage=round(exp_slip, 2), exit_plan_preview=exit_preview, strategy_intent=intent, coin_tier=tier)
             
             if ana and ana.get('decision') == "BUY":
+                # 🟢 [수정] AI가 직접 매긴 score(또는 rating)를 추출하여 히스토리에 반영
+                ai_rating = safe_float(ana.get('score'), safe_float(ana.get('rating'), p['score']))
                 ai_approved.append({
-                    "t": p['t'], "final_score": ana['score'], "decision": "BUY", 
+                    "t": p['t'], "final_score": ai_rating, "decision": "BUY", 
                     "reason": ana['reason'], "exit_plan": ana['exit_plan'], 
-                    "data": p['data'], "mode": p['mode'], "pass_score": p['score']
+                    "data": p['data'], "mode": p['mode'], "pass_score": p['score'],
+                    "rating": ai_rating
                 })
             elif ana:
                 safe_reason = str(ana.get('reason', '사유 없음')).replace('<', '&lt;').replace('>', '&gt;')
@@ -2850,7 +2865,7 @@ async def run_full_scan(is_deep_scan=False):
 
             # (success_count는 상단에서 이미 0으로 초기화됨)
             for app in final_buy_targets:
-                buy_succeeded = await process_buy_order(app['t'], app['final_score'], app['reason'], app['data'], total_asset, cash, len(held_dict), app['exit_plan'], buy_mode=app['mode'], pass_score=app['pass_score'])
+                buy_succeeded = await process_buy_order(app['t'], app['final_score'], app['reason'], app['data'], total_asset, cash, len(held_dict), app['exit_plan'], buy_mode=app['mode'], pass_score=app['pass_score'], rating=app.get('rating'))
                 if buy_succeeded:
                     success_count += 1
                     cash -= (total_asset / STRAT.get('max_concurrent_trades', 5))
