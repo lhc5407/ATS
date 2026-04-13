@@ -77,6 +77,7 @@ function initChart() {
     });
 }
 
+// 🟢 [수정] Market Pulse 그래프 초기화 (툴팁 활성화 적용)
 function initMarketChart() {
     const ctx = document.getElementById('marketChart').getContext('2d');
     marketChart = new Chart(ctx, {
@@ -99,7 +100,21 @@ function initMarketChart() {
             maintainAspectRatio: false,
             plugins: {
                 legend: { display: false },
-                tooltip: { enabled: false }
+                // 🟢 [수정 포인트] 마우스 오버 시 날짜와 수치를 볼 수 있도록 툴팁 활성화!
+                tooltip: { 
+                    enabled: true,
+                    mode: 'index',
+                    intersect: false,
+                    displayColors: false,
+                    backgroundColor: 'rgba(15, 23, 42, 0.9)',
+                    titleColor: '#E2E8F0',
+                    bodyColor: '#FFF',
+                    callbacks: {
+                        label: function(context) {
+                            return 'FGI: ' + context.parsed.y;
+                        }
+                    }
+                }
             },
             scales: {
                 x: { display: false },
@@ -108,28 +123,57 @@ function initMarketChart() {
                     min: 0,
                     max: 100
                 }
+            },
+            interaction: {
+                mode: 'nearest',
+                axis: 'x',
+                intersect: false
             }
         }
     });
 }
 
-// Fetch and Update Data
-async function fetchDashboardData() {
+async function fetchMarketHistory() {
     try {
-        const response = await fetch(`${API_BASE}/dashboard?timeframe=${currentTimeframe}`);
-        if (!response.ok) throw new Error('API Error');
+        const response = await fetch(`${API_BASE}/market-history`);
         const data = await response.json();
+        
+        if (data.history && marketChart && data.history.length > 0) {
+            marketChart.data.labels = data.history.map(d => d.time);
+            marketChart.data.datasets[0].data = data.history.map(d => d.fgi);
+            
+            // 🟢 [핵심 추가] 최신 FGI 수치에 따른 동적 색상 렌더링 로직
+            const latestFgi = data.history[data.history.length - 1].fgi;
+            let color, bgColor, statusText;
 
-        updateUI(data);
-        // Hide offline overlay on success
-        const overlay = document.getElementById('offline-overlay');
-        if (overlay) overlay.style.display = 'none';
+            if (latestFgi <= 44) {
+                color = '#FF3366'; // Red (Fear)
+                bgColor = 'rgba(255, 51, 102, 0.1)';
+                statusText = 'Fear';
+            } else if (latestFgi >= 56) {
+                color = '#00FF66'; // Green (Greed)
+                bgColor = 'rgba(0, 255, 102, 0.1)';
+                statusText = 'Greed';
+            } else {
+                color = '#94A3B8'; // Gray (Neutral)
+                bgColor = 'rgba(148, 163, 184, 0.1)';
+                statusText = 'Neutral';
+            }
 
-        // Fetch market history separately
-        fetchMarketHistory();
+            // 1. 그래프 선 및 배경색을 시장 상태(공포/탐욕)에 맞게 실시간 변경
+            marketChart.data.datasets[0].borderColor = color;
+            marketChart.data.datasets[0].backgroundColor = bgColor;
 
-    } catch (error) {
-        console.error("Failed to fetch dashboard data:", error);
+            // 2. 제목 라벨 우측에 직관적인 숫자와 상태(Fear/Greed) 텍스트 주입
+            const labelEl = document.querySelector('.market-chart-box .stat-label');
+            if(labelEl) {
+                labelEl.innerHTML = `Market Pulse (FGI) <span style="color: ${color}; font-weight: bold; margin-left: 5px;">${latestFgi} ${statusText}</span>`;
+            }
+
+            marketChart.update();
+        }
+    } catch (e) {
+        console.error("Market history fetch failed:", e);
         document.getElementById('system-status-text').textContent = "Disconnected";
         document.getElementById('system-status-dot').className = "dot pnl-negative";
 
