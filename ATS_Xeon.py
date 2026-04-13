@@ -553,15 +553,26 @@ def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_v
         ob_imbalance = safe_float(curr_i.get('ob_imbalance', 0))
         is_ob_bad = ob_imbalance < -75.0
 
+        # 🟢 [AI 제언 반영] V자 반등 특례 및 모멘텀 필터링
         if not fatal_reason:
-            if not (is_volume_spike and is_bullish_recovery): fatal_reason = "반등신호대기 (거래량/양봉)"
-            elif not cvd_improving: fatal_reason = "실매수세부족 (CVD)"
-            elif is_ob_bad: fatal_reason = "매도벽압박 (OB)"
+            # V자 반등(강력한 거래량 + 하락폭 회복 에너지) 판별
+            if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.7):
+                if rsi_val <= 60:
+                    v_shape_special = True
+
+            # 기본 진입 조건 검사
+            if not v_shape_special:
+                if not (is_volume_spike and is_bullish_recovery): 
+                    fatal_reason = "반등신호대기 (거래량/양봉)"
             
-        if cvd_improving and (curr_vol > curr_vol_sma * 1.7 or prev_vol > safe_float(prev_i.get('vol_sma'), 1) * 1.7):
-            if safe_float(curr_i.get('rsi')) <= 60:
-                fatal_reason = "" # V자 반등 특례
-                v_shape_special = True
+            # 모멘텀 및 수급 필터링 (V자 반등이더라도 최소한의 모멘텀 확인)
+            if not fatal_reason:
+                if rsi_val < 40: 
+                    fatal_reason = "모멘텀부족 (RSI < 40)"
+                elif not cvd_improving: 
+                    fatal_reason = "실매수세부족 (CVD)"
+                elif is_ob_bad: 
+                    fatal_reason = "매도벽압박 (OB)"
 
     # 데이터 주입 (보고서용)
     curr_i['is_volume_spike'] = is_volume_spike
@@ -908,23 +919,19 @@ async def api_get_history():
     history_data = []
     try:
         async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
-            # 최근 100건의 매매 역사 (역순) - rating 필드 포함
             query = "SELECT timestamp, ticker, side, price, profit_krw, reason, pass_score, rating FROM trade_history ORDER BY id DESC LIMIT 100"
             async with db.execute(query) as cursor:
                 async for row in cursor:
                     side = str(row[2])
-                    # 🟢 [수정] SELL일 경우 AI가 평가한 rating을 최종 점수로 표기
-                    final_score = safe_float(row[7]) if side == 'SELL' else safe_float(row[6])
-                    
-                    ai_reason = row[5] if row[5] else "시스템 자동 매매"
                     history_data.append({
                         "time": str(row[0]),
                         "ticker": str(row[1]),
                         "side": side,
                         "price": safe_float(row[3]),
                         "profit_krw": safe_float(row[4]),
-                        "reason": ai_reason,
-                        "score": final_score
+                        # 🟢 [수정] 텍스트가 숫자로 변환되어 웹 JS에서 에러가 나는 현상 원천 차단
+                        "reason": str(row[5]) if row[5] else "사유 없음", 
+                        "score": safe_float(row[7])
                     })
     except Exception as e:
         logging.error(f"히스토리 DB 쿼리 오류: {e}")
@@ -3448,6 +3455,17 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
 
     # 🟢 [적응형 가드라인] 실시간 점수에 따른 익절/손절 강도(Tightness) 조절
     entry_score = safe_float(t.get('pass_score', 80), 80.0)
+    
+    # 5. 🟢 [AI 제언] 초기 반등 정체 탈출 (5분 Rule)
+    # 진입 후 5분이 지났는데 수익률이 0.3% 미만이고 점수가 하락 추세면 조기 종료
+    if elapsed_sec >= 300 and elapsed_sec < 900:
+        if max_p_rate < 0.3 and curr_ma_score < 70:
+            return True, False, 1.0, "초기반등실패(5분)", "URGENT", 0
+            
+    # 6. 🟢 [AI 제언] 시간 경과에 따른 동적 익절선 상향 (Stagnation Avoidance)
+    if elapsed_sec > 600 and max_p_rate < 0.5:
+        # 10분이 지났는데도 0.5% 수익도 못 냈으면 탈출선을 본절 위로 타이트하게 붙임
+        stop_p = max(stop_p, avg_p * 1.002)
     curr_score_val = safe_float(ma_live_score, entry_score)
     
     # 강도(Tightness) 계수 계산: 점수가 높으면 0.8(여유), 낮으면 1.2(타이트)
