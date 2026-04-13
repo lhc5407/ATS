@@ -174,12 +174,30 @@ async function fetchMarketHistory() {
         }
     } catch (e) {
         console.error("Market history fetch failed:", e);
-        document.getElementById('system-status-text').textContent = "Disconnected";
-        document.getElementById('system-status-dot').className = "dot pnl-negative";
+    }
+}
 
-        // Show offline overlay on failure
-        const overlay = document.getElementById('offline-overlay');
-        if (overlay) overlay.style.display = 'flex';
+// 🟢 [복구] 실수로 지워진 대시보드 메인 데이터 호출 함수
+async function fetchDashboardData() {
+    try {
+        const response = await fetch(`${API_BASE}/dashboard?timeframe=${currentTimeframe}`);
+        if (!response.ok) throw new Error('Dashboard fetch failed');
+        const data = await response.json();
+        
+        // 1. 대시보드 UI 수치 및 메인 차트 갱신
+        updateUI(data);
+        
+        // 2. 대시보드 갱신 시 FGI 미니 컬러 차트도 함께 갱신
+        if (typeof fetchMarketHistory === 'function') {
+            fetchMarketHistory();
+        }
+    } catch (e) {
+        console.error("Dashboard fetch error:", e);
+        const statusEl = document.getElementById('regime-status');
+        if (statusEl) {
+            statusEl.textContent = "Data Fetch Error";
+            statusEl.style.color = "var(--neon-red)";
+        }
     }
 }
 
@@ -734,17 +752,4 @@ async function executeTrade(ticker, action, event) {
         alert("통신 오류가 발생했습니다.");
     }
 }
-async function fetchMarketHistory() {
-    try {
-        const response = await fetch(`${API_BASE}/market-history`);
-        const data = await response.json();
-        
-        if (data.history && marketChart) {
-            marketChart.data.labels = data.history.map(d => d.time);
-            marketChart.data.datasets[0].data = data.history.map(d => d.fgi);
-            marketChart.update();
-        }
-    } catch (e) {
-        console.error("Market history fetch failed:", e);
-    }
-}
+

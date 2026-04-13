@@ -1390,11 +1390,15 @@ async def clean_unused_caches():
             if t not in active_tickers:
                 del INDICATOR_CACHE[t]
             
+    # 🟢 [버그 픽스] 각각의 딕셔너리를 독립적으로 순회하며 좀비 코인 데이터를 완벽하게 삭제합니다.
     for t in list(REALTIME_CVD.keys()):
-        if t not in active_tickers:
-            if t in REALTIME_CVD: del REALTIME_CVD[t]
-            if t in REALTIME_PRICES_TS: del REALTIME_PRICES_TS[t]
-            if t in REALTIME_PRICES: del REALTIME_PRICES[t]
+        if t not in active_tickers: del REALTIME_CVD[t]
+        
+    for t in list(REALTIME_PRICES_TS.keys()):
+        if t not in active_tickers: del REALTIME_PRICES_TS[t]
+        
+    for t in list(REALTIME_PRICES.keys()):
+        if t not in active_tickers: del REALTIME_PRICES[t]
 
 async def update_top_volume_tickers():
     global STRAT
@@ -3635,10 +3639,12 @@ async def system_watchdog():
                 last_main_loop_time = now 
                 
             # Level 1 (경고)
-            dead_tickers = [t for t, ts in REALTIME_PRICES_TS.items() if now - ts > 60]
+            active_tickers = set(STRAT.get('tickers', []) + list(trade_data.keys()) + ["KRW-BTC"])
+            dead_tickers = [t for t, ts in REALTIME_PRICES_TS.items() if t in active_tickers and now - ts > 300]
+            
             if len(dead_tickers) > 15:
-                await send_msg(f"⚠️ <b>[WARNING] 네트워크 지연 감지</b>\n{len(dead_tickers)}개 종목의 실시간 데이터 수신이 1분 이상 끊겼습니다. (WebSocket 재구독 시도 중)")
-                for dt in dead_tickers: REALTIME_PRICES_TS[dt] = now 
+                await send_msg(f"⚠️ <b>[WARNING] 데이터 수신 지연 감지</b>\n{len(dead_tickers)}개 종목의 실시간 틱 데이터가 5분 이상 없습니다. (거래량이 마른 코인이거나 업비트 지연)")
+                for dt in dead_tickers: REALTIME_PRICES_TS[dt] = now
                 
         except Exception as e:
             logging.error(f"Watchdog 에러: {e}")
