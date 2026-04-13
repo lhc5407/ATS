@@ -178,6 +178,16 @@ body {
     font-weight: 700;
 }
 
+.market-chart-box {
+    width: 180px;
+    margin-right: 16px;
+}
+
+.mini-chart-container {
+    height: 35px;
+    width: 100%;
+}
+
 /* Content Grid */
 .content-grid {
     display: grid;

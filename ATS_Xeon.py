@@ -949,6 +949,26 @@ async def api_get_scanner():
     results.sort(key=lambda x: x['score'], reverse=True)
     return {"scanner": results, "timestamp": LATEST_SCAN_TS}
 
+@app.get("/api/market-history")
+async def api_get_market_history():
+    history = []
+    try:
+        async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
+            # 최근 48시간 데이터 조회
+            async with db.execute("SELECT timestamp, fgi_value, btc_price, regime_mode FROM market_history ORDER BY id DESC LIMIT 48") as cursor:
+                rows = await cursor.fetchall()
+                for row in rows:
+                    history.append({
+                        "time": row[0],
+                        "fgi": row[1],
+                        "btc_price": row[2],
+                        "regime": row[3]
+                    })
+    except Exception as e:
+        logging.error(f"시장 히스토리 조회 오류: {e}")
+    # 가로 방향 차트를 위해 시간순으로 반전
+    return {"history": list(reversed(history))}
+
 @app.post("/api/scanner/refresh")
 async def api_scanner_refresh():
     # 🟢 [추가] 즉시 전수 검사를 트리거합니다.
@@ -1290,6 +1310,8 @@ async def init_db():
             price REAL, amount REAL, profit_krw REAL, reason TEXT, status TEXT, rating INTEGER, improvement TEXT, pass_score INTEGER)""")
         await db.execute("""CREATE TABLE IF NOT EXISTS trade_status (
             ticker TEXT PRIMARY KEY, data_json TEXT)""")
+        await db.execute("""CREATE TABLE IF NOT EXISTS market_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT, fgi_value INTEGER, btc_price REAL, regime_mode TEXT)""")
         try: await db.execute("ALTER TABLE trade_history ADD COLUMN is_reported INTEGER DEFAULT 0")
         except: pass
         await db.commit()
@@ -1437,6 +1459,39 @@ async def get_market_regime():
         
         FGI_CACHE['data'] = {"fear_and_greed": f"{fgi_value} ({fgi_status})"}
         FGI_CACHE['timestamp'] = time.time()
+        
+        # 🟢 [추가] DB에 매시간 시장 상황 기록 (대시보드 차트용)
+        try:
+            async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
+                # 마지막 기록 확인
+                async with db.execute("SELECT timestamp FROM market_history ORDER BY id DESC LIMIT 1") as cursor:
+                    row = await cursor.fetchone()
+                    last_hour = row[0][:13] if row else "" # YYYY-MM-DD HH
+                    
+                    current_ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    current_hour = current_ts[:13]
+                    
+                    if current_hour != last_hour:
+                        btc_p = safe_float(REALTIME_PRICES.get('KRW-BTC', 0))
+                        # btc_p가 0이면 REST로 가져오기
+                        if btc_p == 0: btc_p = safe_float(await execute_upbit_api(pyupbit.get_current_price, 'KRW-BTC'))
+                        
+                        fgi_int = int(fgi_value)
+                        # Determine regime mode (approximate logic similar to main loop)
+                        btc_data = await get_btc_short_term_data()
+                        btc_trend = btc_data.get('trend', '균형')
+                        
+                        if fgi_int <= 35 or (btc_trend == "단기 하락" and fgi_int <= 50): regime = "CLASSIC" 
+                        elif fgi_int >= 65 or (btc_trend == "단기 상승" and fgi_int <= 50): regime = "QUANTUM" 
+                        else: regime = "HYBRID"
+
+                        await db.execute("INSERT INTO market_history (timestamp, fgi_value, btc_price, regime_mode) VALUES (?, ?, ?, ?)",
+                                        (current_ts, fgi_int, btc_p, regime))
+                        await db.commit()
+                        logging.info(f"📊 시장 상황 기록 완료: FGI {fgi_int}, Regime {regime}")
+        except Exception as db_e:
+            logging.error(f"⚠️ 시장 상황 DB 기록 실패: {db_e}")
+
         return FGI_CACHE['data']
     except Exception as e:
         # 에러 발생 시 기존에 캐싱된 값을 반환하여 봇이 절대 멈추지 않도록 방어

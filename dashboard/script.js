@@ -1,6 +1,7 @@
 // Constants & Globals
 const API_BASE = '/api';
 let profitChart = null;
+let marketChart = null;
 let currentTimeframe = 'all'; // Default timeframe
 let logInterval = null;
 let scannerInterval = null;
@@ -76,6 +77,42 @@ function initChart() {
     });
 }
 
+function initMarketChart() {
+    const ctx = document.getElementById('marketChart').getContext('2d');
+    marketChart = new Chart(ctx, {
+        type: 'line',
+        data: {
+            labels: [],
+            datasets: [{
+                label: 'FGI',
+                data: [],
+                borderColor: '#B026FF',
+                backgroundColor: 'rgba(176, 38, 255, 0.1)',
+                borderWidth: 2,
+                pointRadius: 0,
+                fill: true,
+                tension: 0.4
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            plugins: {
+                legend: { display: false },
+                tooltip: { enabled: false }
+            },
+            scales: {
+                x: { display: false },
+                y: { 
+                    display: false,
+                    min: 0,
+                    max: 100
+                }
+            }
+        }
+    });
+}
+
 // Fetch and Update Data
 async function fetchDashboardData() {
     try {
@@ -87,6 +124,9 @@ async function fetchDashboardData() {
         // Hide offline overlay on success
         const overlay = document.getElementById('offline-overlay');
         if (overlay) overlay.style.display = 'none';
+
+        // Fetch market history separately
+        fetchMarketHistory();
 
     } catch (error) {
         console.error("Failed to fetch dashboard data:", error);
@@ -450,6 +490,7 @@ async function controlSystem(action) {
 // ==========================================
 document.addEventListener('DOMContentLoaded', () => {
     initChart();
+    initMarketChart();
 
     // Setup timeframe filter buttons
     const filterBtns = document.querySelectorAll('.filter-btn');
@@ -647,5 +688,19 @@ async function executeTrade(ticker, action, event) {
     } catch (e) {
         console.error("Trade execution error:", e);
         alert("통신 오류가 발생했습니다.");
+    }
+}
+async function fetchMarketHistory() {
+    try {
+        const response = await fetch(`${API_BASE}/market-history`);
+        const data = await response.json();
+        
+        if (data.history && marketChart) {
+            marketChart.data.labels = data.history.map(d => d.time);
+            marketChart.data.datasets[0].data = data.history.map(d => d.fgi);
+            marketChart.update();
+        }
+    } catch (e) {
+        console.error("Market history fetch failed:", e);
     }
 }
