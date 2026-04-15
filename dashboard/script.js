@@ -77,7 +77,7 @@ function initChart() {
     });
 }
 
-// 🟢 [수정] Market Pulse 그래프 초기화 (툴팁 활성화 적용)
+// 🟢 Market Pulse 그래프 초기화 (툴팁 활성화 및 동적 색상 적용)
 function initMarketChart() {
     const ctx = document.getElementById('marketChart').getContext('2d');
     marketChart = new Chart(ctx, {
@@ -99,9 +99,9 @@ function initMarketChart() {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: { display: false },
-                // 🟢 [수정 포인트] 마우스 오버 시 날짜와 수치를 볼 수 있도록 툴팁 활성화!
-                tooltip: { 
+                legend: { display: false }, // 범례 숨김
+                // 🟢 마우스 오버 시 날짜와 수치를 볼 수 있도록 툴팁 활성화!
+                tooltip: {
                     enabled: true,
                     mode: 'index',
                     intersect: false,
@@ -110,7 +110,7 @@ function initMarketChart() {
                     titleColor: '#E2E8F0',
                     bodyColor: '#FFF',
                     callbacks: {
-                        label: function(context) {
+                        label: function (context) {
                             return 'FGI: ' + context.parsed.y;
                         }
                     }
@@ -118,7 +118,7 @@ function initMarketChart() {
             },
             scales: {
                 x: { display: false },
-                y: { 
+                y: {
                     display: false,
                     min: 0,
                     max: 100
@@ -137,12 +137,12 @@ async function fetchMarketHistory() {
     try {
         const response = await fetch(`${API_BASE}/market-history`);
         const data = await response.json();
-        
+
         if (data.history && marketChart && data.history.length > 0) {
             marketChart.data.labels = data.history.map(d => d.time);
             marketChart.data.datasets[0].data = data.history.map(d => d.fgi);
-            
-            // 🟢 [핵심 추가] 최신 FGI 수치에 따른 동적 색상 렌더링 로직
+
+            // 🟢 최신 FGI 수치에 따른 동적 색상 렌더링 로직
             const latestFgi = data.history[data.history.length - 1].fgi;
             let color, bgColor, statusText;
 
@@ -166,7 +166,7 @@ async function fetchMarketHistory() {
 
             // 2. 제목 라벨 우측에 직관적인 숫자와 상태(Fear/Greed) 텍스트 주입
             const labelEl = document.querySelector('.market-chart-box .stat-label');
-            if(labelEl) {
+            if (labelEl) {
                 labelEl.innerHTML = `Market Pulse (FGI) <span style="color: ${color}; font-weight: bold; margin-left: 5px;">${latestFgi} ${statusText}</span>`;
             }
 
@@ -183,10 +183,10 @@ async function fetchDashboardData() {
         const response = await fetch(`${API_BASE}/dashboard?timeframe=${currentTimeframe}`);
         if (!response.ok) throw new Error('Dashboard fetch failed');
         const data = await response.json();
-        
+
         // 1. 대시보드 UI 수치 및 메인 차트 갱신
         updateUI(data);
-        
+
         // 2. 대시보드 갱신 시 FGI 미니 컬러 차트도 함께 갱신
         if (typeof fetchMarketHistory === 'function') {
             fetchMarketHistory();
@@ -650,7 +650,7 @@ async function fetchScannerData() {
             const priceStr = f.format(item.price);
 
             // 🟢 [수정] 결격 사유(fatal_flaw)를 전용 컬럼으로 분리
-            let flawContent = '<span class="text-muted">PASS</span>';
+            let flawContent = '<span style="color: var(--neon-green);">PASS</span>';
             if (item.fatal_flaw && item.fatal_flaw !== 'PASS') {
                 flawContent = `<span style="color: var(--neon-red); font-size: 11px; font-weight: 600;">🛑 ${item.fatal_flaw}</span>`;
             }
@@ -752,4 +752,3 @@ async function executeTrade(ticker, action, event) {
         alert("통신 오류가 발생했습니다.");
     }
 }
-
