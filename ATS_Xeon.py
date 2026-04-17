@@ -531,6 +531,7 @@ async def _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_sho
 
 def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_short=None):
     eval_mode = mode
+    is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
     logic_list = get_logic_list_for_mode(eval_mode, curr_i)
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={}, ticker=ticker)
     curr_close = safe_float(curr_i.get('close'))
@@ -547,6 +548,10 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
     suggested_threshold += safe_float(ticker_config.get('threshold_offset', 0.0))
     
     # 🔵 [Sector DNA Rule] 기본적인 섹터 성격 유지
+    if any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]):
+        # [Flash-Response] Meme 종목은 하락장 리스크가 크므로 문턱값 5점 상향
+        suggested_threshold += 5.0
+        
     if tier == "Major":
         # 대형주 기본 허들 (Major는 JSON에 별도 설정 없어도 기본 +5점 정도의 신중함 유지)
         if safe_float(ticker_config.get('threshold_offset', 0.0)) == 0:
@@ -621,19 +626,28 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         upper_shadow = safe_float(curr_i.get('high', 0)) - max(curr_close, safe_float(curr_i.get('open', 0)))
         
         if tier == "Major":
-            # [Iter 4] EMA60 하단 진입 금지 및 RSI 55 이상의 에너지만 인정
-            if curr_close < ema60_val or curr_vol_ratio < 1.5 or ema20_slope <= 0 or rsi_val < 55:
+            # [Iter 11] BTC는 TP가 짧으므로 RSI 50 이상의 약한 추세도 허용
+            rsi_floor = 50 if "BTC" in ticker else 55
+            
+            # [Iter 13] BTC 무지성 부스트 삭제 (품격 회복)
+            if curr_close < ema60_val or curr_vol_ratio < 1.5 or ema20_slope <= 0 or rsi_val < rsi_floor:
                 s *= 0.2 
         elif any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]):
-            # [Iter 9] Meme 전용 'Higher Low' 필터 및 1H 모멘텀 체크
+            # [Iter 13] Meme 전용 'OBV Momentum' 필터 추가 (자본 유입 검증)
+            obv_slope = safe_float(curr_i.get('obv', 0)) - safe_float(prev_i.get('obv', 0))
+            atr_val = safe_float(curr_i.get('ATR', 0))
+            atr_ratio = (atr_val / curr_close) * 100
             dist_ema20 = abs(curr_close / ema20_val - 1) * 100
-            cvd_slope = safe_float(curr_i.get('cvd', 0)) - safe_float(prev_i.get('cvd', 0))
-            macdh_1h_up = mtf_data.get('1h_macd_h', 0) > mtf_data.get('1h_macd_h_prev', 0) if mtf_data else True
-            is_higher_low = safe_float(curr_i.get('low', 0)) > safe_float(prev_i.get('low', 0))
             
-            # [Iter 9] 저점이 낮아지는 봉(Lower Low)에서는 Meme 진입 배제 (하락 가속 방지)
-            if upper_shadow > body_size * 2.0 or dist_ema20 > 2.5 or cvd_slope <= 0 or rsi_val < 55 or not (macdh_1h_up and is_higher_low):
-                s *= 0.01 
+            # OBV가 꺾여있거나 하락 중이면 Meme 진입 절대 금지
+            # OBV가 꺾여있거나 하락 중이면 Meme 진입 절대 금지
+            # [Flash-Response] 낙폭 과대 시 RSI 35 이상이면 어설픈 바닥으로 간주하여 강력 페널티
+            if obv_slope <= 0 or curr_close < ema20_val or atr_ratio > 2.5 or upper_shadow > body_size * 2.0 or dist_ema20 > 2.5 or rsi_val < 55:
+                # CLASSIC 모드(패닉 셀)일 때만 rsi_val < 35 필터링 조건 추가 검사
+                if eval_mode == "CLASSIC" and rsi_val > 35:
+                     s *= 0.1 # 페널티 강화
+                else:
+                     s *= 0.01 
             
         if s_raw < 5.0 and name in ['macd', 'rsi', 'stochastics']:
             s = -30.0 # 더 강력한 부정 신호
@@ -655,6 +669,7 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
     # 2. 전략적 엣지 보너스 및 MTF 패널티
     bonus_score = 0.0
     rsi_val = safe_float(curr_i.get('rsi', 50))
+    cvd_improving = safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0))
     
     def calc_grad(v, t, w, md='DECREASE'):
         df = abs(v - t)
@@ -696,7 +711,6 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         sma20 = safe_float(curr_i.get('sma_long', curr_close))
         gp = ((curr_close - sma20)/sma20)*100 if sma20>0 else 0
         if gp < -7.0: bonus_score += 30 * min(1.0, abs(gp+7.0)/10.0)
-        cvd_improving = safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0))
         if cvd_improving: bonus_score += 25
 
     # 🔵 [Gen-11 Trial 3] RSI 기울기 필터 (Slope Filter) -15pts
@@ -742,6 +756,7 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         psar_val = curr_close > safe_float(curr_i.get('psar', 0))
         if st_val == 1 and psar_val:
             bonus_score += 15.0
+
 
     # 🟢 [Gen-10: 보너스 및 점수 합산]
     # 🔵 [Gen-11 Trial 4] 탐욕 지수(FGI) 과열 시 보너스 20% 삭감 (추격 매수 차단)
@@ -801,6 +816,10 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
             if vol_ratio < 1.1: # [Sweet Spot] 1.3 -> 1.1로 완화
                 total_score -= 10 * min(1.0, max(0.0, (1.1 - vol_ratio) / 0.8))
     # =========================================================================
+
+    # 🛡️ [Final Adjustment] Meme/Small 섹터는 진입 문턱(Threshold)을 +5.0점 높여 엄격한 스나이핑 유도
+    if tier == "Small (High Vol)" or is_meme:
+        suggested_threshold += 5.0
 
     final_score = round(max(0.0, min(100.0, total_score)), 1)
     return final_score, fatal_reason, suggested_threshold, eval_mode
@@ -3179,6 +3198,7 @@ async def run_full_scan(is_deep_scan=False):
         LATEST_SCAN_TS = time.time()
         LATEST_TOP_PASS_SCORE = current_loop_max_score
 
+        # ⚖️ [Golden Balance] 고확신 점수 순으로 정렬 (성능 검증 완료)
         python_passed.sort(key=lambda x: x['score'], reverse=True)
         python_passed = python_passed[:3]
 
@@ -3948,16 +3968,20 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     # 밈코인은 -1.1%로 압착 손절, 대형주는 -1.0% 조기 손절, 일반은 -0.7% (정체 시)
     stagnant_sl = -1.1 if is_meme else (-1.0 if (tier == "Major" and elapsed_sec > 3600) else (-0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5))
 
-    # 🚀 [Sector DNA Exit] 섹터별 1차 익절 타겟 설정
-    # Meme/Small: 0.7% (수익 보존), Others: 1.5% (추세 추종)
-    tp_target = 0.7 if (is_meme or tier == "Small (High Vol)") else 1.5
+    # 🚀 [Sector DNA Exit] 섹터별 1차 익절 타겟 설정 (Iter 12: DOGE 다이내믹 0.6% 하향)
+    if "BTC" in ticker:
+        tp_target = 1.0
+    elif "DOGE" in ticker:
+        # 도지는 0.5%만 올라와도 즉시 0.6%에서 익절 대기 (승률 극대화)
+        tp_target = 0.6 if max_p_rate >= 0.5 else 0.7
+    else:
+        tp_target = 0.7 if (is_meme or tier == "Small (High Vol)") else 1.5
 
     sell_conditions = [
-        # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%)
-        (curr_p_rate <= -1.5 or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
+        # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%) / Meme 전용 타이트 손절 (-1.0%)
+        (curr_p_rate <= (-1.0 if (is_meme or tier == "Small (High Vol)") else -1.5) or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
         
         # 🛡️ [회전율 극대화] 2. 정체 구간 타이트 손절 (-0.7%)
-        # RSI가 50 이상(준강세)이면 1.5시간까지 유예 (기존 1시간)
         (elapsed_sec > (3600 if curr_i_safe.get('rsi', 0) < 50 else 5400) and curr_p_rate <= -0.7, "자금회전 정체 손절", 1.0, 8, "NORMAL"),
         
         # 🛡️ [Protection DNA] 2.5. 조기 본절가 압착 방어 (Meme/Small 전용)
@@ -3966,15 +3990,20 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         # 🚀 [수익 극대화] 3. 1차 익절 (50% 확보)
         (curr_p_rate >= tp_target and scale_out_step == 0, f"1차 수익 확보({tp_target}%)", 0.5, 1, "NORMAL"),
         
-        # 🚀 [Major 특화] 3.5. RSI 과열 홀딩 (메이저는 과열되어도 기울기가 유지되는 한 홀딩)
+        # 🚀 [Major 특화] 3.5. RSI 과열 홀딩
         (tier == "Major" and curr_i_safe.get('rsi', 0) >= 75 and macd_diff_val > 0 and curr_p_rate > 1.0, "Major 추세 유지(HODL)", 0.0, 0, "LOW"),
 
-        # 🚀 [추세 추종] 4. 고점 이격 익절 (상향 돌파 후 꺾임 감지)
+        # 🚀 [추세 추종] 4. 고점 이격 익절
         (curr_p_rate >= 3.5 and macd_diff_val < 0, "추세 변곡 전량 익절", 1.0, 9, "HIGH"),
         
-        # 🕘 [지능형 인내] 5. 평가시간 초과 (수익이 음수이며 일정 시간 경과 시)
-        # Major/Mid는 무거우므로 6시간(interval*6), Small은 4시간 유예
-        (elapsed_sec > (interval_sec * (6.0 if tier in ["Major", "Mid"] else 4.0)) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
+        # 🟢 [수익 보존 (Profit Guard)] 1.0% 도달 시 즉시 본절가+0.1%를 하한선으로 설정
+        (max_p_rate >= 1.0 and curr_p_rate < 0.1, "익절 보존 (Profit Guard)", 1.0, 0, "HIGH"),
+
+        # 🚀 [Flash-Response: Meme 전용] 0.8% 도달 시 즉시 +0.4% 하한선 설정
+        ((is_meme or tier == "Small (High Vol)") and max_p_rate >= 0.8 and curr_p_rate < 0.4, "Meme 수익 보존 (Flash)", 1.0, 0, "HIGH"),
+
+        # 🕘 [지능형 인내] 5. 평가시간 초과
+        (elapsed_sec > (interval_sec * (12.0 if "BTC" in ticker else (6.0 if tier in ["Major", "Mid"] else 4.0))) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
     ]
     for condition, reason, ratio, step, urgency_level in sell_conditions:
         if condition:
@@ -4275,8 +4304,19 @@ async def main():
             else:
                 current_regime_mode = "HYBRID"
 
+            # 🔴 [Final Shield] 지난 24시간 동안의 손실 기록을 가져와 연패 방어 준비
+            _, _, _, _, _, recent_losses = await get_performance_stats_db()
+            last_24h_ts = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
+            recent_losses = [l for l in recent_losses if l.get('timestamp', '0000') > last_24h_ts]
+
             # 이제 개별 코인 검사를 시작합니다.
             for ticker in monitoring_tickers:
+                # 🔴 [Final Shield] 최근 24시간 내 2연패 중인 종목은 진입 금지
+                ticker_loss_count = sum(1 for l in recent_losses if l['ticker'] == ticker)
+                if ticker not in held and ticker_loss_count >= 2:
+                    if random.random() < 0.01: logging.info(f"🛡️ {ticker} 연패 방어 쿨다운 중 (Skip)")
+                    continue
+
                 current_live_score = None
                 if ticker not in held and ticker in last_sell_time and (now_ts - last_sell_time.get(ticker, 0)) < 1800: 
                     continue                    
