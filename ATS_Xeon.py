@@ -2092,16 +2092,17 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
                 
             strategy = "Deep Dip / Oversold Mean Reversion (낙폭 과대 역추세 매매)"
             important_ranges = """
-            - pass_score_threshold: MUST be between 75 and 85 (Higher is safer)
-            - guard_score_threshold: MUST be between 50 and 60
-            - sell_score_threshold: MUST be between 30 and 45
-            - bonus_golden_combo: MUST be between 25 and 45
-            - bonus_mtf_panic_dip: MUST be between 15 and 35
-            - bonus_st_oversold_bounce: MUST be between 10 and 25
-            - penalty_st_downtrend: MUST be between -10 and 0 (Keep low for dips)
-            - major_params/target_atr_multiplier: 1.5 ~ 3.0 (FOR QUICK SCALPS)
-            - mid/high_vol_params/target_atr_multiplier: 2.5 ~ 4.5
-            - timeout_candles: 3 ~ 8 (CRITICAL: Keep this low for scalping)
+            - pass_score_threshold: MUST be between 82 and 90 (Ultra Sniper Mode)
+            - guard_score_threshold: MUST be between 55 and 65
+            - sell_score_threshold: MUST be between 40 and 50
+            - bonus_golden_combo: MUST be between 30 and 50
+            - bonus_mtf_panic_dip: MUST be between 20 and 40
+            - bonus_st_oversold_bounce: MUST be between 15 and 30
+            - penalty_st_downtrend: MUST be between -15 and -5
+            - major_params/stop_loss: -1.5 ~ -1.0 (ULTRA TIGHT)
+            - major_params/target_atr_multiplier: 1.2 ~ 2.5 (QUICK SNIPE)
+            - mid/high_vol_params/target_atr_multiplier: 2.0 ~ 3.5
+            - timeout_candles: 4 ~ 10 (CRITICAL: High Velocity)
             - btc_surge_threshold: 1.0 ~ 2.0
             """
             critical_rule = "CRITICAL RULE: You MUST include 'z_score' and 'bollinger' in BOTH 'trend_active_logic' and 'range_active_logic'. Remove breakout modifiers like 'bonus_volume_explosion'."
@@ -2157,6 +2158,13 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         [IMPORTANT RANGES]
         {important_ranges}
         {critical_rule}
+        
+        [SPECIAL SNIPER INSTRUCTION]:
+        - CURRENT BEST MODEL USES: stop_loss = -1.5%, pass_score_threshold = 85.
+        - You MUST design prompts and parameters to support this 'High Velocity' strategy. 
+        - Do NOT suggest stop-loss wider than -2.5% unless volatility is extreme.
+        - Target ATR multipliers should favor 1.2 to 2.8 ranges for consistency.
+        
         {mission}
         """
         
@@ -2181,8 +2189,9 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
             Mission:
             1. 시스템의 손실/수익 사례를 분석하십시오.
             2. [CRITICAL]: 핵심 내용을 반드시 '3문장 이내'로 요약하십시오 (Korean).
-            3. [CRITICAL]: 'improvement' 필드에 다음 거래 승률을 높이기 위한 제언을 작성하십시오.
-            4. 🧬 [DNA 진화 (선택)]: 만약 이 코인({ticker})의 특성상 파라미터 튜닝이 영구적으로 필요하다고 판단되면(예: 휩소가 심해서 stop_loss를 넓혀야 함 등), 'dna_tweak' 필드를 통해 제안하십시오. (예: {{"major_params": {{"stop_loss": -4.0}}}})
+            3. [SNIPER AUDIT]: 수익 1.2% 돌파 후 절반 익절이 정상 작동했는지, -1.5% 손절이 지켜졌는지 체크하십시오.
+            4. [IMPROVEMENT]: 'improvement' 필드에 다음 거래 승률을 높이기 위한 제언을 반드시 포함하십시오.
+            5. [DNA EVOLVE]: 코인 특성상 파라미터 튜닝이 필요하면 'dna_tweak'으로 제안하되, 손절선을 -2.5% 보다 넓게 잡는 것은 금지 수준으로 신중해야 합니다.
             
             Output JSON: {{"reason": "3문장 핵심 요약", "status": "SUCCESS"|"FAIL"|"ACCEPTABLE", "rating": 0~100, "improvement": "제언", "dna_tweak": {{}} }}
             """
@@ -2280,7 +2289,7 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         Mission: Read the New Suggestions systematically. If they contain valuable insights or logical corrections that are NOT already in the 'Current AI Prompt', rewrite the Prompt.
         * IMPORTANT RULE: Do NOT add instructions for conditions that are ALREADY handled by the Python Engine's 'HARDCODED SYSTEM OVERRIDES' (e.g., Fatal Flaw locks, Volume validation, Trailing Stops). Focus on nuanced, agentic evaluations that Python cannot natively compute.
         
-        # 🟢 [수정 2] 텔레그램 HTML 파싱 에러 방지를 위한 텍스트 포맷 규칙 추가
+
         * FORMATTING RULE: Do NOT use angle brackets (<, >) in your text. Use words like 'under', 'below', or 'less than' instead of mathematical symbols to prevent HTML parsing errors.
         
         Your goal is to formulate a concise, powerful, and directive guideline (in Korean) that will guide future agentic trade analysis based on empirical failures.
@@ -2398,15 +2407,15 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
                         
                 raw_plan = res_json.get('exit_plan', {})
                 strategy_mode = clean_data.get('strategy_mode', 'QUANTUM')
-                default_stop = -1.6 if strategy_mode == "QUANTUM" else -2.5
-                default_atr = 1.0 if strategy_mode == "QUANTUM" else 1.5
-                default_timeout = 5 if strategy_mode == "QUANTUM" else 10
+                default_stop = -1.5 # [Sniper Upgrade] 기본 손절선 상향
+                default_atr = 1.2   # [Sniper Upgrade] 목표가 1차 타점 동기화
+                default_timeout = 8 # [Sniper Upgrade] 회전율 우선
                 
                 exit_plan = {
-                    "target_atr_multiplier": max(1.0, min(10.0, safe_float(raw_plan.get('target_atr_multiplier', 3.5)))),
-                    "stop_loss": max(-4.0, min(-0.5, safe_float(raw_plan.get('stop_loss', default_stop)))),
+                    "target_atr_multiplier": max(1.0, min(8.0, safe_float(raw_plan.get('target_atr_multiplier', 2.8)))),
+                    "stop_loss": max(-3.5, min(-0.5, safe_float(raw_plan.get('stop_loss', default_stop)))),
                     "atr_mult": max(0.5, min(4.0, safe_float(raw_plan.get('atr_mult', default_atr)))),
-                    "timeout": max(2, min(15, int(safe_float(raw_plan.get('timeout', default_timeout)))))
+                    "timeout": max(2, min(20, int(safe_float(raw_plan.get('timeout', default_timeout)))))
                 }
                 
                 return {
@@ -3837,6 +3846,9 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     is_failed_bounce = elapsed_sec > (interval_sec * 3.0) and curr_p_rate <= -0.8
     early_hard_cut = elapsed_sec > (interval_sec * 1.5) and curr_p_rate <= -1.3
     
+    # 🔵 [자금 회전율] 정체 구간 손절선 상향 (-0.7%)
+    stagnant_sl = -0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5
+
     sell_conditions = [
         # 🛡️ [고밀도 압착] 1. 타이트한 최종 손절 (-1.5%)
         (curr_p_rate <= -1.5 or real_price <= stop_p, f"칼손절 가동", 1.0, 9, "HIGH"),
@@ -4243,7 +4255,7 @@ async def main():
                         if isinstance(prev_i, dict) and isinstance(curr_i, dict):
                             btc_short_trend = btc_short.get('trend', "혼조세")
                             # 🟢 [수정 완료] 코인에 내재된 eval_mode를 강제로 주입하여 잣대의 일관성 유지!
-                            current_live_score, _, _ = evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=eval_mode)
+                            current_live_score, _, _, _ = await evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=eval_mode)
                     ma_live_score = current_live_score # 기본값
                     if current_live_score is not None:
                         score_hist = t.get('score_history', [])
