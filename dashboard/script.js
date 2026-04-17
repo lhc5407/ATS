@@ -762,3 +762,26 @@ async function executeTrade(ticker, action, event) {
         alert("통신 오류가 발생했습니다.");
     }
 }
+
+// ==========================================
+// 💓 Dashboard Global Heartbeat (3s Pulse)
+// ==========================================
+window.onload = () => {
+    if (typeof initChart === 'function') initChart();
+    if (typeof initMarketChart === 'function') initMarketChart();
+    
+    // Initial Fetch
+    fetchDashboardData();
+    if (typeof fetchScannerData === 'function') fetchScannerData();
+    if (typeof fetchHistoryData === 'function') fetchHistoryData();
+    
+    // Global Loop (3 Seconds)
+    setInterval(() => {
+        fetchDashboardData();
+        // Ensure scanner is updated if currently visible
+        const scannerBox = document.getElementById('scanner-view');
+        if (scannerBox && scannerBox.style.display !== 'none') {
+            if (typeof fetchScannerData === 'function') fetchScannerData();
+        }
+    }, 3000);
+};
