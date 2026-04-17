@@ -517,10 +517,15 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
 
     # 🔵 [Gen-8: 거래량 필수 필터]
     vol_sma = safe_float(curr_i.get('vol_sma', 0.0001))
-    # 🔵 [Gen-11 Trial 7] 알트코인은 분출 직전 포착을 위해 1.0배로 완화
-    # 🔵 [Golden Balance] 거래량 필터 재강화 (1.25배로 원복)
-    if curr_vol < vol_sma * 1.25: 
-        return 0.0, "거래량부족", suggested_threshold, eval_mode
+    # 🔵 [Yield Flip: BTC 패닉 필터] 비트코인이 급락 중이면 모든 매수 금지
+    btc_p = safe_float(curr_i.get('btc_close', 0))
+    btc_prev_p = safe_float(prev_i.get('btc_close', 0))
+    if btc_p < btc_prev_p * 0.995: # -0.5% 급락 시
+        return 0.0, "BTC패닉드랍", suggested_threshold, eval_mode
+
+    # 🔵 [Yield Flip: 거래량 임계값 상향]
+    if curr_vol < vol_sma * 1.5: 
+        return 0.0, "거래량에너지부족", suggested_threshold, eval_mode
 
     foundation_mult = safe_float(get_dynamic_strat_value('foundation_multiplier', mode=eval_mode, default=2.0))
     earned_score, total_w = 0.0, 0.0001
@@ -3031,27 +3036,22 @@ async def run_full_scan(is_deep_scan=False):
             if isinstance(curr, pd.Series): curr = curr.to_dict()
             if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-            score_1st, fatal_1st, mode = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], mtf_data=None)
+            score_1st, fatal_1st, pass_cut_1st, mode_1st = await evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short["trend"], mtf_data=None)
 
-            if not fatal_1st:
-                current_loop_max_score = max(current_loop_max_score, score_1st)
-
-            pass_cut = get_dynamic_strat_value('pass_score_threshold', mode=mode, default=80)
-            
-            if fatal_1st or score_1st < (pass_cut - 20):
-                # 🟢 [수정 1] "알수없음" -> "생략 (1차탈락)"으로 변경하여 사용자 오해 방지
-                new_scan_data[t] = {"score": score_1st, "reason": fatal_1st if fatal_1st else "PASS", "price": safe_float(curr.get('close')), "mode": mode, "mtf": "생략 (1차탈락)"}
+            if fatal_1st or score_1st < pass_cut_1st:
+                new_scan_data[t] = {"score": score_1st, "reason": fatal_1st if fatal_1st else "PASS", "price": safe_float(curr.get("close")), "mode": mode_1st, "mtf": "스킵 (기준미달)"}
                 continue
                 
-            passed_1st_stage.append((t, prev, curr, mode, pass_cut))
+            passed_1st_stage.append((t, prev, curr, mode_1st, pass_cut_1st))
 
         # 🟢 [병렬화 2단계] 1차 합격자들에 대한 MTF 동시 조회 및 정밀 채점
         python_passed = []
         
         async def _fetch_mtf_and_eval(t, prev, curr, mode, pass_cut):
             mtf_res = await get_mtf_trend(t)
-            f_score, f_fatal, f_threshold = evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
-            return t, f_score, f_fatal, mtf_res, prev, curr, mode, f_threshold
+            # 2차 정밀 심사 (MTF 포함)
+            f_score, f_fatal, f_pass_cut, f_mode = await evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
+            return t, f_score, f_fatal, mtf_res, prev, curr, f_mode, f_pass_cut
 
         if passed_1st_stage:
             mtf_tasks = [_fetch_mtf_and_eval(*args) for args in passed_1st_stage]
@@ -3461,7 +3461,7 @@ async def send_score_debug_report():
             if not isinstance(p, dict) or not isinstance(c, dict): return None
             
             # 🟢 [적용 2] 디버그 모드 역시 단 한 줄로 압축 완료!
-            score, fatal_reason, mode = evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
+            score, fatal_reason, sug_cut, mode = await evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
             return {"t": t, "score": score, "fatal_reason": fatal_reason, "mode": mode}
             
     tasks = [fetch_and_score(t) for t in tickers]
@@ -3650,32 +3650,47 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     # 🟢 [Pylance/Flake8 방어] 변수 초기화 및 타입 안전성 확보
     curr_p_rate = safe_float(p_rate, 0.0)
     curr_ma_score = float(ma_live_score) if ma_live_score is not None else 80.0
+    scale_out_step = t.get('scale_out_step', 0)
     
     eval_mode = t.get('strategy_mode', 'QUANTUM')
     
-    # 🟢 [버그 수정] elapsed_sec 등 시간 관련 변수들을 최상단으로 이동 (하단 로직에서 참조 전 정의 필수)
+    _ind_snap = INDICATOR_CACHE.get(ticker)
+    curr_i_safe = _ind_snap[2] if _ind_snap and len(_ind_snap) >= 3 else t.get('buy_ind', {})
+    macd_diff_val = curr_i_safe.get('macd_h_diff', 0) if curr_i_safe.get('macd_h_diff') is not None else 0
+    
     exit_plan = t.get('exit_plan', {})
     timeout_candles = exit_plan.get('timeout', get_dynamic_strat_value('timeout_candles', mode=eval_mode, default=8))
     interval_str = STRAT.get('interval', 'minute15')
     if interval_str.startswith('minute'):
         interval_sec = int(interval_str.replace('minute', '')) * 60
-    elif interval_str == 'day': interval_sec = 86400  
-    elif interval_str == 'week': interval_sec = 604800 
-    elif interval_str == 'month': interval_sec = 2592000 
-    else: interval_sec = 900 
-        
+    else: interval_sec = 900
+    
     elapsed_sec = now_ts - t.get('buy_ts', now_ts)
     full_timeout_sec = timeout_candles * interval_sec
     half_timeout_sec = full_timeout_sec / 2
-    micro_timeout_sec = interval_sec * 1 
+    micro_timeout_sec = interval_sec * 1
     nano_timeout_sec = 300
-    entry_atr = t.get('entry_atr', 0)
+    
+    entry_score = safe_float(t.get('pass_score', 80), 80.0)
+    entry_atr = safe_float(t.get('entry_atr', 0))
     target_atr_multiplier = exit_plan.get('target_atr_multiplier', 4.5)
+    
+    # [와이드 스코프] 다단계 목표가 및 모멘텀 판별 조건
+    if entry_score >= 90.0: target_atr_multiplier *= 1.2
+    base_tp_pct = (entry_atr * target_atr_multiplier / avg_p) * 100 if entry_atr > 0 and avg_p > 0 else 3.5
+    
+    tp_1 = max(1.2, base_tp_pct * 0.4)
+    tp_2 = base_tp_pct
+    tp_3 = base_tp_pct * 1.8
+    tp_4 = base_tp_pct * 3.0
+    is_momentum_bending = (macd_diff_val < 0)
+    
+    nano_timeout_sec = 300
     
     target_p_price = avg_p + (entry_atr * target_atr_multiplier)
     target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
     
-    # 🟢 [수익성 패치] R:R Guard: 노이즈(Whipsaw)를 견디기 위해 손절 한도를 여유롭게 상향 (0.7 -> 1.5)
+    # 🟢 [수익성 패치] R:R Guard: 노이즈(Whipsaw)를 견디기 위해 손절 한도를 여유롭게 상향
     raw_hard_s = exit_plan.get('stop_loss', -3.5) 
     hard_s = max(raw_hard_s, -abs(target_p * 1.5))
 
@@ -3713,10 +3728,10 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     if max_p_rate >= 4.0:
         t['breakeven_locked'] = True
         hard_breakeven_floor = avg_p * 1.025  # 4% 도달 시 최소 2.5% 이익 보존
-    elif max_p_rate >= 2.5:
+    elif max_p_rate >= 1.0:
         t['breakeven_locked'] = True
         hard_breakeven_floor = avg_p * 1.010  # 2.5% 도달 시 최소 1.0% 이익 보존
-    elif max_p_rate >= 1.5:
+    elif max_p_rate >= 1.0:
         t['breakeven_locked'] = True
         hard_breakeven_floor = avg_p * 1.002  # 1.5% 도달 시 본전(+0.2%)만 방어
 
@@ -3752,17 +3767,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
 
     # =========================================================================
-    # 🚨 [누락 복구] 조건식 판별에 필요한 필수 변수 및 지표 상태값을 먼저 정의합니다.
-    scale_out_step = t.get('scale_out_step', 0)
-    
-    _ind_snap = INDICATOR_CACHE.get(ticker)
-    curr_i_safe = _ind_snap[2] if _ind_snap else {}
-    
-    macd_diff_val = curr_i_safe.get('macd_h_diff', 0)
-    if macd_diff_val is None: macd_diff_val = 0
-        
-    entry_score = safe_float(t.get('pass_score', 80), 80.0)
-
+    # (Indicator snapshot/macd_diff moved to top)
     is_fundamental_broken = False
     if current_live_score is not None and ma_live_score < get_dynamic_strat_value('sell_score_threshold', mode=eval_mode, default=45):
         # 🔵 [Batch 3 Trial 5] 메이저는 점수 하락 시 더 민감하게 탈출 (전용 버퍼 1.2배 축소)
@@ -3833,26 +3838,19 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     early_hard_cut = elapsed_sec > (interval_sec * 1.5) and curr_p_rate <= -1.3
     
     sell_conditions = [
-        # 🔵 [스나이퍼 추가 전략] 1.2% 돌파 시 이유 불문 절반(50%) 안전수익 확보!
-        (curr_p_rate >= 1.2 and scale_out_step == 0, "기계적 절반 익절 안전장치 (+1.2%)", 0.5, 1, "NORMAL"),
+        # 🛡️ [고밀도 압착] 1. 타이트한 최종 손절 (-1.5%)
+        (curr_p_rate <= -1.5 or real_price <= stop_p, f"칼손절 가동", 1.0, 9, "HIGH"),
         
-        # 🔵 [버그수정] TP1 도달 시 조건 없는 1차 익절 수행 (RSI 85 이상 제약 삭제)
-        (curr_p_rate >= tp_1 and scale_out_step <= 1, f"목표 수익 도달 1차 익절 (+{tp_1:.1f}%)", 0.4, 2, "NORMAL"),
-        (curr_p_rate >= tp_2 and scale_out_step <= 2, f"초과 수익 돌파 최종 익절 (+{tp_2:.1f}%)", 1.0, 3, "NORMAL"),
+        # 🚀 [고밀도 압착] 2. 1차 익절 (1.2%에서 절반 무조건 확보)
+        (curr_p_rate >= 1.2 and scale_out_step == 0, "안전수익 확보 (50%)", 0.5, 1, "NORMAL"),
+
+        # 🚀 [고밀도 압착] 3. 추세 추종 익절 (+3.5% 도달 시 매도 준비)
+        (curr_p_rate >= 3.5 and macd_diff_val < 0, "고점 꺾임 전량 익절", 1.0, 9, "HIGH"),
         
-        (is_nano_failed, f"⚡ 초기 반등 실패 (투매 즉각 컷)", 1.0, 0, "HIGH"),
-        (early_hard_cut, "🔪 초기 치명상 방어 (가혹한 즉각 손절)", 1.0, 0, "HIGH"),
-        (is_failed_bounce, "⏳ 늪지대 고립 (반등 동력 상실로 인한 탈출)", 1.0, 0, "HIGH"),
-        (elapsed_sec > nano_timeout_sec and curr_ma_score > 0 and (entry_score - curr_ma_score) >= 25 and curr_p_rate < 0.0, f"점수 급락 탈출 ({entry_score} ➡️ {curr_ma_score})", 1.0, 0, "HIGH"),
-        (is_micro_failed, "⏳ 장기 모멘텀 상실 (연장)", 1.0, 0, "HIGH"),
-        (is_sideways_decay, "⏳ 횡보 한계 도달 (인내심 초과)", 1.0, 0, "HIGH"),
-        (elapsed_sec > full_timeout_sec and curr_p_rate < 0.0 and (macd_diff_val < 0 or curr_ma_score < 60), "⏳ 평가시간 초과 손절", 1.0, 0, "HIGH"),
-        (is_fundamental_broken, f"기초 체력 붕괴 ({ma_live_score}점)", 1.0, 0, "HIGH"),
-        
-        (curr_p_rate <= safe_hard_s, f"절대 손절선 이탈 ({safe_hard_s}%)", 1.0, 0, "HIGH"),
-        (real_price <= stop_p, "트레일링 스탑 이탈 (수익 보존/손절)", 1.0, 0, "HIGH"),
-        
-        (elapsed_sec > (full_timeout_sec * 2) and curr_p_rate <= 0.5, f"장기 추세 정체 타임아웃 ({timeout_candles * 2}캔들)", 1.0, 0, "NORMAL")
+        (is_nano_failed, f"초기 반등 실패", 1.0, 0, "HIGH"),
+        (early_hard_cut, "초기 치명상 방어", 1.0, 0, "HIGH"),
+        (is_fundamental_broken, f"기초 체력 붕괴", 1.0, 0, "HIGH"),
+        (elapsed_sec > full_timeout_sec and curr_p_rate < 0.0, "평가시간 초과 손절", 1.0, 0, "HIGH")
     ]
     for condition, reason, ratio, step, urgency_level in sell_conditions:
         if condition:
