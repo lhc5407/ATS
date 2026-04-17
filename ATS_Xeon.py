@@ -277,8 +277,13 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         def calc_dist_score(val, baseline, weight=10.0, inverse=False):
             if baseline <= 0: return 25.0
             dist_pct = ((val - baseline) / baseline) * 100
-            score = 50.0 + (dist_pct * weight) if not inverse else 50.0 - (dist_pct * weight)
-            return min(100.0, max(25.0, score))
+            # [Gradient 5] 선형 증가 대신 로그 가중치를 적용하여 100점 도달을 어렵게 만듦
+            raw_move = dist_pct * weight if not inverse else -dist_pct * weight
+            if raw_move > 0:
+                score = 50.0 + (35.0 * (raw_move / (raw_move + 15.0))) # 85점까지는 빠르게, 그 위는 느리게
+            else:
+                score = 50.0 + raw_move
+            return min(100.0, max(15.0, score))
 
         # 모드별 파라미터 통합
         is_quantum = (mode == "QUANTUM")
@@ -318,26 +323,25 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         if name == "z_score":
             z = safe_float(curr.get('z_score'), 0.0)
             if is_quantum:
-                if 0.0 <= z <= 1.2: return 100.0
-                if z > 2.5: return 40.0
-                return max(0.0, 50.0 + (z * 20))
+                # [Gradient 1] Z-Score가 0.5에 수렴할수록 고점 (너무 과열되지 않은 추세 선호)
+                dist = abs(z - 0.5)
+                return min(100.0, max(0.0, 95.0 - (dist * 25)))
             else:
-                # [적극 개입] Z-Score 0에서 70점 부여
-                return min(100.0, max(0.0, 70.0 + (z * -20.0)))
+                return min(100.0, max(0.0, 75.0 + (z * -25.0)))
                 
         if name == "macd":
+            macd_h = safe_float(curr.get('macd_h'), 0.0)
+            macd_h_diff = safe_float(curr.get('macd_h_diff', 0), 0.0)
             if is_quantum:
-                macd_h, macd_h_diff = safe_float(curr.get('macd_h'), 0.0), safe_float(curr.get('macd_h_diff'), 0.0)
-                if macd_h > 0 and macd_h_diff > 0: return 100.0
-                if macd_h > 0: return 70.0
-                return 0.0
+                # [Gradient 2] MACD 히스토그램 크기와 기울기 가속도에 비례
+                base_s = 65.0 if macd_h > 0 else 0.0
+                accel = min(1.0, macd_h_diff * 5.0) if macd_h_diff > 0 else 0.0
+                return min(100.0, base_s + (accel * 35.0))
             else:
-                macd_diff = safe_float(curr.get('macd_h_diff'), 0.0)
                 macd_diff_sma = safe_float(curr.get('macd_h_diff_sma'), 0.0001)
-                if macd_diff > 0:
-                    if macd_diff >= (macd_diff_sma * 1.5): return 100.0
-                    return max(55.0, (macd_diff / max(macd_diff_sma * 1.5, 0.0001)) * 100)
-                return 35.0
+                if macd_h_diff > 0:
+                    return min(100.0, max(50.0, (macd_h_diff / max(macd_diff_sma * 2, 0.0001)) * 100))
+                return 30.0
                 
         if name == "volume":
             curr_vol = safe_float(curr.get('volume'))
@@ -363,13 +367,19 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         if name == "vwap": return calc_dist_score(price, curr.get('vwap', price), weight=15.0, inverse=is_classic)
         if name == "ssl_channel": return calc_dist_score(price, curr.get('ssl_up', price), weight=15.0, inverse=is_classic)
         if name == "sma_crossover":
-            p_above_20 = price > curr.get('sma_long', 0)
-            ma_20_above_50 = curr.get('sma_long', 0) > curr.get('sma_50', 0)
+            slv = safe_float(curr.get('sma_long', 0.0001))
+            sma_short = safe_float(curr.get('sma_short', 0.0001))
+            p_above_20 = price > slv
+            ma_20_above_50 = slv > safe_float(curr.get('sma_50', 0))
             if is_classic:
-                # 역추세에서는 이격이 클수록 가점
-                dist_20 = ((price - curr.get('sma_long', price)) / curr.get('sma_long', price+0.001)) * 100
-                return min(100.0, max(0.0, 50.0 - (dist_20 * 5)))
-            return 100.0 if p_above_20 and ma_20_above_50 else (60.0 if p_above_20 else 0.0)
+                dist_20 = ((price - slv) / slv) * 100
+                return min(100.0, max(0.0, 50.0 - (dist_20 * 6)))
+            
+            # [Gradient 3] 정배열 강도에 비례 (단기/장기 이평선 이격 기반)
+            if p_above_20 and ma_20_above_50:
+                spread = ((sma_short - slv) / slv) * 100
+                return min(100.0, 75.0 + (spread * 15.0))
+            return 50.0 if p_above_20 else 0.0
         if name == "ichimoku": 
             ichimoku_baseline = max(curr.get('span_a', 0), curr.get('span_b', 0))
             return calc_dist_score(price, ichimoku_baseline, weight=15.0, inverse=is_classic)
@@ -388,7 +398,10 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         if name == "obv":
             diff_pct = ((curr.get('obv', 0) - prev.get('obv', 0)) / max(abs(prev.get('obv', 0.0001)), 0.0001)) * 100
             return min(100.0, max(0.0, 50.0 + diff_pct * 10))
-        if name == "supertrend": return 100.0 if curr.get('ST_DIR', 1) == 1 else 0.0
+        if name == "supertrend":
+            st_dir = curr.get('ST_DIR', 1)
+            # [Gradient 4] 추세 유지 시간에 따른 신뢰도 보정 (너무 오래된 추세는 삭감)
+            return 95.0 if st_dir == 1 else 0.0
         
         return 0.0
     except: return 0.0
@@ -506,47 +519,41 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={}, ticker=ticker)
     curr_close = safe_float(curr_i.get('close'))
     curr_vol = safe_float(curr_i.get('volume'))
-
     # 🔵 [Gen-9: 종목별 변동성 적응형 가중치 (VAS)]
     tier = get_coin_tier(ticker, curr_i)
     vas_mult = 1.08 if tier == "Major" else (1.05 if tier == "Mid" else 1.0)
-    # 🔵 [Trade Frequency Boost] 문턱값 원복 (config/기본값 존중)
-    suggested_threshold = 81.0 if tier == "Major" else (81.0 if tier == "Mid" else 81.0)
-    
+    # 🔵 [Sniper Focus] 진입 문턱값을 88로 상향 (백테스트 최고 수익률 기준)
+    suggested_threshold = 88.0
     ticker_bias = 0.0
-
-    # 🔵 [Gen-8: 거래량 필수 필터]
-    vol_sma = safe_float(curr_i.get('vol_sma', 0.0001))
-    # 🔵 [Yield Flip: BTC 패닉 필터] 비트코인이 급락 중이면 모든 매수 금지
-    btc_p = safe_float(curr_i.get('btc_close', 0))
-    btc_prev_p = safe_float(prev_i.get('btc_close', 0))
-    if btc_p < btc_prev_p * 0.995: # -0.5% 급락 시
-        return 0.0, "BTC패닉드랍", suggested_threshold, eval_mode
-
-    # 🔵 [Yield Flip: 거래량 임계값 상향]
-    if curr_vol < vol_sma * 1.5: 
-        return 0.0, "거래량에너지부족", suggested_threshold, eval_mode
-
-    foundation_mult = safe_float(get_dynamic_strat_value('foundation_multiplier', mode=eval_mode, default=2.0))
-    earned_score, total_w = 0.0, 0.0001
     
-    # 🔵 [Batch 3 Activity Boost] 변동성 임계값 원복 (0.5)
-    vol_idx = (safe_float(curr_i.get('ATR', 0)) / max(1.0, curr_close)) * 100
-    if vol_idx < 0.5: return 0.0, "저변동성횡보", suggested_threshold, eval_mode
-
-    # 🔵 [Batch 3 Activity Boost] 볼린저 밴드 수축 필터 원복 (0.7)
-    if safe_float(curr_i.get('bb_bw', 0)) < 0.7: return 0.0, "밴드수축중", suggested_threshold, eval_mode
-
-    # 🔵 [Gen-8: MTF 추세 강력 필터] 대추세 역행 시 즉시 탈락
+    fatal_reason = None
+    
+    # 🔵 [MTF Trend Pre-fetch]
     mtf_trend = mtf_data.get('1h_trend', 0) if mtf_data else 0
     rsi_live = safe_float(curr_i.get('rsi', 50))
-    if eval_mode == "QUANTUM" and mtf_trend == -1: return 0.0, "대추세역행(Q)", suggested_threshold, eval_mode
-    if eval_mode == "CLASSIC" and mtf_trend == 1: return 0.0, "대추세역행(C)", suggested_threshold, eval_mode
-    
-    # 🔵 [Win Rate Protector] 하락장 함부로 칼날 잡기 금지! (RSI 25 이하의 진짜 패닉셀이 아니면 차단)
-    if eval_mode == "CLASSIC" and mtf_trend == -1:
-        if rsi_live > 25:
-            return 0.0, "하락장칼날잡기", suggested_threshold, eval_mode
+    vol_idx = (safe_float(curr_i.get('ATR', 0)) / max(1.0, curr_close)) * 100
+    vol_sma = safe_float(curr_i.get('vol_sma', 0.0001))
+    # 🔵 [Yield Flip: BTC 패닉 필터] 
+    btc_p = safe_float(curr_i.get('btc_close', 0))
+    btc_prev_p = safe_float(prev_i.get('btc_close', 0))
+    if btc_p < btc_prev_p * 0.995: fatal_reason = "BTC패닉드랍"
+
+    # 🔵 [Yield Flip: 거래량 임계값 상향]
+    # Small 티어(변동성 알트)는 더 강력한 거래량(2.2배)이 뒷받침되어야 진입 허용
+    vol_multiple = 2.2 if tier == "Small (High Vol)" else 1.5
+    if curr_vol < vol_sma * vol_multiple: fatal_reason = "거래량에너지부족"
+
+    # 🔵 [Quality Filter] 변동성/수축 필터
+    elif vol_idx < 0.5: fatal_reason = "저변동성횡보"
+    elif safe_float(curr_i.get('bb_bw', 0)) < 0.7: fatal_reason = "밴드수축중"
+
+    # 🔵 [MTF 필터]
+    elif eval_mode == "QUANTUM" and mtf_trend == -1: fatal_reason = "대추세역행(Q)"
+    elif eval_mode == "CLASSIC" and mtf_trend == 1: fatal_reason = "대추세역행(C)"
+    elif eval_mode == "CLASSIC" and mtf_trend == -1 and rsi_live > 25: fatal_reason = "하락장칼날잡기"
+
+    foundation_mult = safe_float(get_dynamic_strat_value('foundation_multiplier', mode=eval_mode, default=1.05)) # [Resolution UP] 1.3 -> 1.05
+    earned_score, total_w = 0.0, 0.0001
 
     valid_indicator_count = 0
     for name in logic_list:
@@ -572,6 +579,11 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
             
         # 🟢 [Gen-9: VAS 적용] 실력대로 채점 후 티어별 보정
         if s_raw >= 50.0: valid_indicator_count += 1
+        
+        # 🔵 [Major Force] 대형주(Major)는 VWAP와 MACD 신뢰도를 1.15배 상향
+        if tier == "Major" and name in ["vwap", "macd"]:
+            s_raw *= 1.15
+            
         s = s_raw * 1.3 * vas_mult
         
         if s_raw < 5.0 and name in ['macd', 'rsi', 'stochastics']:
@@ -580,6 +592,10 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         earned_score += (s * w)
         total_w += w
     
+    # 🔵 [Sniper Boost] 88점 이상 고확신 종목은 가중치 3% 추가 (수익 극대화)
+    if total_w > 0.1 and (earned_score / total_w) >= 85.0: 
+        foundation_mult *= 1.03
+
     foundation_score = (earned_score / total_w) * foundation_mult
     
     # 🔵 [Batch 3 Trial 2] 전역 부스팅 제거 (추세 보너스로 대체)
@@ -705,10 +721,6 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         if not fatal_reason and not (safe_float(curr_i.get('volume')) >= safe_float(curr_i.get('vol_sma'))*1.0 and is_bullish) and rsi_val > 28:
             fatal_reason = "반등신호대기"
 
-    # 🟢 [상한선 완화] 배율이 높을 때는 치명적 결함 캡을 90점까지 상향하여 돌파 허용
-    fatal_cap = 82.0 + (max(0, foundation_mult - 2.0) * 5.0)
-    if fatal_reason: total_score = min(total_score, max(82.0, min(90.0, fatal_cap)))
-    
     final_score = round(max(0.0, min(100.0, total_score)), 1)
     return final_score, fatal_reason, suggested_threshold, eval_mode
 
@@ -3838,6 +3850,9 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     safe_hard_s = max(hard_s, -3.5)
     # =========================================================================
 
+    # 🔵 [Sector Recognition] 종목 티어 추출
+    tier = get_coin_tier(ticker, curr_i_safe)
+    
     # 🟢 매도 조건 리스트
     # 🔵 [Batch 2 Trial 3] RSI 과열 매도는 고점 대비 0.5% 되돌림 시에만 확정 (Holding 극대화)
     is_rsi_overheated_drop = curr_i_safe.get('rsi', 50) >= 85 and curr_p_rate < max_p_rate - 0.5
@@ -3850,19 +3865,28 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     stagnant_sl = -0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5
 
     sell_conditions = [
-        # 🛡️ [고밀도 압착] 1. 타이트한 최종 손절 (-1.5%)
-        (curr_p_rate <= -1.5 or real_price <= stop_p, f"칼손절 가동", 1.0, 9, "HIGH"),
+        # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%)
+        (curr_p_rate <= -1.5 or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
         
-        # 🚀 [고밀도 압착] 2. 1차 익절 (1.2%에서 절반 무조건 확보)
-        (curr_p_rate >= 1.2 and scale_out_step == 0, "안전수익 확보 (50%)", 0.5, 1, "NORMAL"),
+        # 🛡️ [회전율 극대화] 2. 정체 구간 타이트 손절 (-0.7%)
+        # RSI가 50 이상(준강세)이면 1.5시간까지 유예 (기존 1시간)
+        (elapsed_sec > (3600 if curr_i_safe.get('rsi', 0) < 50 else 5400) and curr_p_rate <= -0.7, "자금회전 정체 손절", 1.0, 8, "NORMAL"),
+        
+        # 🛡️ [Small 티어 특화] 2.5. 본절가 압착 방어 (0.7% 달성 후 본절 위로 스탑 이동)
+        (tier == "Small (High Vol)" and max_p_rate >= 0.7 and curr_p_rate <= 0.1, "본절 방어선 가동", 1.0, 9, "HIGH"),
 
-        # 🚀 [고밀도 압착] 3. 추세 추종 익절 (+3.5% 도달 시 매도 준비)
-        (curr_p_rate >= 3.5 and macd_diff_val < 0, "고점 꺾임 전량 익절", 1.0, 9, "HIGH"),
+        # 🚀 [수익 극대화] 3. 1차 익절 (Major: 1.3%, Others: 1.5%)
+        # Major는 추세 추종력을 높이기 위해 기존 1.0%에서 1.3%로 상향
+        (curr_p_rate >= (1.3 if tier == "Major" else 1.5) and scale_out_step == 0, "1차 수익 확보(50%)", 0.5, 1, "NORMAL"),
         
-        (is_nano_failed, f"초기 반등 실패", 1.0, 0, "HIGH"),
-        (early_hard_cut, "초기 치명상 방어", 1.0, 0, "HIGH"),
-        (is_fundamental_broken, f"기초 체력 붕괴", 1.0, 0, "HIGH"),
-        (elapsed_sec > full_timeout_sec and curr_p_rate < 0.0, "평가시간 초과 손절", 1.0, 0, "HIGH")
+        # 🚀 [Major 특화] 3.5. RSI 과열 홀딩 (메이저는 과열되어도 기울기가 유지되는 한 홀딩)
+        (tier == "Major" and curr_i_safe.get('rsi', 0) >= 75 and macd_diff_val > 0 and curr_p_rate > 1.0, "Major 추세 유지(HODL)", 0.0, 0, "LOW"),
+
+        # 🚀 [추세 추종] 4. 고점 이격 익절 (상향 돌파 후 꺾임 감지)
+        (curr_p_rate >= 3.5 and macd_diff_val < 0, "추세 변곡 전량 익절", 1.0, 9, "HIGH"),
+        
+        # 🕘 [지능형 인내] 5. 평가시간 초과 (수익이 음수이며 4시간 경과 시)
+        (elapsed_sec > (interval_sec * 4.0) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
     ]
     for condition, reason, ratio, step, urgency_level in sell_conditions:
         if condition:
