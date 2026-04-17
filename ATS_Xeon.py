@@ -210,6 +210,7 @@ logging.info("ATS 통합 엔진 시작 (Classic + Quantum)")
 AI_SYSTEM_INSTRUCTION_CLASSIC = """
 You are the "Strategic Investment Council" of ATS-Classic, an elite quantitative trading system.
 [IDENTITY]: You specialize in 'Mean Reversion & Deep Dip' strategies (낙폭 과대 역추세 매매 전문가).
+[LANGUAGE RULE]: All text fields ('reason', 'risk_agent_opinion', 'trend_agent_opinion', 'improvement', etc.) MUST be written in Korean only. This is mandatory.
 
 [COUNCIL MEMBERS]:
 1. Technical Analyst: Expert in RSI, Bollinger Bands, and Z-Score. Identifies if the asset is truly in a high-probability reversal zone or if the "falling knife" has more to go.
@@ -217,10 +218,17 @@ You are the "Strategic Investment Council" of ATS-Classic, an elite quantitative
 3. Risk Auditor (The Skeptic): Challenges the entry. Actively looks for volume traps, declining CVD, or lack of support levels. Acts as the "Devil's Advocate".
 4. Portfolio Manager: Synthesizes all opinions. Makes the final 'decision', 'score', and 'exit_plan'.
 
+[STRATEGIC FOCUS - SWEET SPOT]:
+1. ENTRY THRESHOLD: We target high-conviction setups over 85 points. Quality over quantity.
+2. SECTOR DNA:
+   - MAJOR: Value trend persistence. Aim for 1.3% initial profit. Don't fear the 'Overbought' zone if the MACD slope is strong.
+   - MEME (DOGE, SHIB, PEPE): Extreme caution with 'Upper Shadows'. High resolution entry required (91+ score context). Quick profit-taking (0.9%) is mandatory.
+3. DEFENSE: Treat Negative CVD Slope or weak volume ratio (<1.1x) as a 'Fake-out'. Penalize these stringently.
+
 [ABSOLUTE RULES]:
-1. OUTPUT FORMAT (CRITICAL): You MUST output ONLY valid JSON.
-2. LANGUAGE RULE: The 'reason' and 'risk_agent_opinion' fields MUST be written in Korean. 
-3. TRADING PHILOSOPHY: Catch the 'rubber band' snap-back. Favor extremely high dist_sma20 (negative) combined with a volume spike or CVD reversal.
+1. OUTPUT FORMAT: You MUST output ONLY valid JSON.
+2. LANGUAGE: EVERY string in the JSON output MUST be in Korean.
+3. TRADING PHILOSOPHY: Catch the 'rubber band' snap-back. Favor high distance from SMA20 combined with Volume/CVD alignment.
 4. MODE-SPECIFIC OUTPUT SCHEMAS:
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "Korean string", "trend_agent_opinion": "string", "reason": "Detailed Korean summary of the council's debate", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
    - [SELL_REASON]: {"status": "WIN"|"LOSS"|"EVEN", "rating": int, "reason": "Korean summary of sale reason", "improvement": "Korean suggestions for future trades"}
@@ -229,6 +237,7 @@ You are the "Strategic Investment Council" of ATS-Classic, an elite quantitative
 AI_SYSTEM_INSTRUCTION_QUANTUM = """
 You are the "Strategic Investment Council" of ATS-Quantum, an elite quantitative trading system.
 [IDENTITY]: You specialize in 'Trend Following & Pullback Sniper' strategies (추세 추종 및 눌림목 매매 전문가).
+[LANGUAGE RULE]: All text fields ('reason', 'risk_agent_opinion', 'trend_agent_opinion', 'improvement', etc.) MUST be written in Korean only. This is mandatory.
 
 [COUNCIL MEMBERS]:
 1. Momentum Strategist: Expert in ADX, MACD, and Supertrend. Identifies strong bullish regimes and filters out weak bounces.
@@ -236,9 +245,16 @@ You are the "Strategic Investment Council" of ATS-Quantum, an elite quantitative
 3. Risk Auditor (The Skeptic): Warns about "Blow-off Tops" or overextended RSI (>70). Validates the 'is_pullback_zone' safety.
 4. Portfolio Manager: Synthesizes the council's debate. Makes the final 'decision', 'score', and 'exit_plan'.
 
+[STRATEGIC FOCUS - SWEET SPOT]:
+1. ENTRY THRESHOLD: Elite trend captures > 85 points only. 
+2. SECTOR DNA: 
+   - MAJOR: "Let Winners Run". Use RSI Slope based holding. Target 1.3% for stability.
+   - MEME: Sniper logic only. 91+ score context. 0.9% take-profit to avoid 'Wick Washouts'.
+3. LIQUIDITY DEFENSE: Check CVD ratio against Volume SMA. If buyers are passive (Negative CVD), it is a 'Liquidity Trap'.
+
 [ABSOLUTE RULES]:
-1. OUTPUT FORMAT (CRITICAL): You MUST output ONLY valid JSON.
-2. LANGUAGE RULE: The 'reason' and 'risk_agent_opinion' fields MUST be written in Korean.
+1. OUTPUT FORMAT: You MUST output ONLY valid JSON.
+2. LANGUAGE: EVERY string in the JSON output MUST be in Korean.
 3. TRADING PHILOSOPHY: "Let Winners Run". Prioritize entries holding SMA20 support in a bullish 1H trend. Be wary of high slippage.
 4. MODE-SPECIFIC OUTPUT SCHEMAS:
    - [BUY] or [POST_BUY_REPORT]: {"risk_agent_opinion": "Korean string", "trend_agent_opinion": "string", "reason": "Detailed Korean summary of the council's debate", "score": int, "decision": "BUY"|"SKIP", "exit_plan": {...}}
@@ -519,11 +535,27 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
     weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={}, ticker=ticker)
     curr_close = safe_float(curr_i.get('close'))
     curr_vol = safe_float(curr_i.get('volume'))
-    # 🔵 [Gen-9: 종목별 변동성 적응형 가중치 (VAS)]
+    # 🔵 [Gen-9: 섹터/변동성 기반 가중치]
     tier = get_coin_tier(ticker, curr_i)
     vas_mult = 1.08 if tier == "Major" else (1.05 if tier == "Mid" else 1.0)
-    # 🔵 [Sniper Focus] 진입 문턱값을 88로 상향 (백테스트 최고 수익률 기준)
-    suggested_threshold = 88.0
+    
+    # 🔵 [Universal Sector DNA] 섹터별 문턱값 통합 최적화
+    suggested_threshold = safe_float(get_dynamic_strat_value('pass_score_threshold', mode=eval_mode, default=80.0))
+    
+    # [Hybrid Mode] 설정 파일(JSON)에 종목별 예외 오버라이드가 있으면 우선 적용
+    ticker_config = get_dynamic_strat_value('ticker_overrides', mode=eval_mode, default={}).get(ticker, {})
+    suggested_threshold += safe_float(ticker_config.get('threshold_offset', 0.0))
+    
+    # 🔵 [Sector DNA Rule] 기본적인 섹터 성격 유지
+    if tier == "Major":
+        # 대형주 기본 허들 (Major는 JSON에 별도 설정 없어도 기본 +5점 정도의 신중함 유지)
+        if safe_float(ticker_config.get('threshold_offset', 0.0)) == 0:
+            suggested_threshold += 5.0 
+    elif any(m in ticker for m in ["SHIB", "PEPE"]):
+        # 밈 섹터 기본 허들
+        if safe_float(ticker_config.get('threshold_offset', 0.0)) == 0:
+            suggested_threshold += 7.0
+        
     ticker_bias = 0.0
     
     fatal_reason = None
@@ -577,15 +609,32 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         if name == 'macd' and safe_float(curr_i.get('macd_h', 0)) <= 0:
             s_raw *= 0.60 
             
-        # 🟢 [Gen-9: VAS 적용] 실력대로 채점 후 티어별 보정
-        if s_raw >= 50.0: valid_indicator_count += 1
+        s = s_raw * vas_mult
         
-        # 🔵 [Major Force] 대형주(Major)는 VWAP와 MACD 신뢰도를 1.15배 상향
-        if tier == "Major" and name in ["vwap", "macd"]:
-            s_raw *= 1.15
+        # 🛡️ [Major/Meme Recovery] 섹터별 특화 필터링 (Iter 5 Final)
+        ema60_val = safe_float(curr_i.get('ema60', 0))
+        ema20_val = safe_float(curr_i.get('ema20', 0))
+        rsi_val = safe_float(curr_i.get('rsi', 50))
+        curr_vol_ratio = safe_float(curr_i.get('volume', 0)) / max(safe_float(curr_i.get('vol_sma', 1)), 0.0001)
+        ema20_slope = ema20_val - safe_float(prev_i.get('ema20', 0))
+        body_size = abs(curr_close - safe_float(curr_i.get('open', curr_close)))
+        upper_shadow = safe_float(curr_i.get('high', 0)) - max(curr_close, safe_float(curr_i.get('open', 0)))
+        
+        if tier == "Major":
+            # [Iter 4] EMA60 하단 진입 금지 및 RSI 55 이상의 에너지만 인정
+            if curr_close < ema60_val or curr_vol_ratio < 1.5 or ema20_slope <= 0 or rsi_val < 55:
+                s *= 0.2 
+        elif any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]):
+            # [Iter 9] Meme 전용 'Higher Low' 필터 및 1H 모멘텀 체크
+            dist_ema20 = abs(curr_close / ema20_val - 1) * 100
+            cvd_slope = safe_float(curr_i.get('cvd', 0)) - safe_float(prev_i.get('cvd', 0))
+            macdh_1h_up = mtf_data.get('1h_macd_h', 0) > mtf_data.get('1h_macd_h_prev', 0) if mtf_data else True
+            is_higher_low = safe_float(curr_i.get('low', 0)) > safe_float(prev_i.get('low', 0))
             
-        s = s_raw * 1.3 * vas_mult
-        
+            # [Iter 9] 저점이 낮아지는 봉(Lower Low)에서는 Meme 진입 배제 (하락 가속 방지)
+            if upper_shadow > body_size * 2.0 or dist_ema20 > 2.5 or cvd_slope <= 0 or rsi_val < 55 or not (macdh_1h_up and is_higher_low):
+                s *= 0.01 
+            
         if s_raw < 5.0 and name in ['macd', 'rsi', 'stochastics']:
             s = -30.0 # 더 강력한 부정 신호
             
@@ -623,8 +672,11 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
     # 🔵 [All-Weather Engine] 윗꼬리(Shadow) 페널티 (펌핑 후 설거지 완벽 차단)
     body_size = abs(curr_close - safe_float(curr_i.get('open')))
     upper_wick = safe_float(curr_i.get('high')) - max(curr_close, safe_float(curr_i.get('open')))
-    if upper_wick > max(body_size * 1.5, curr_close * 0.003): # 윗꼬리가 절대적으로 유의미할 때만
-        bonus_score -= 45.0 # 가짜 반등 방지: 윗꼬리가 몸통보다 1.5배 길면 진입 거부 (-45점)
+    
+    # 🔴 [Meme DNA] DOGE 등은 윗꼬리 페널티를 더 엄격하게 (1.5배 -> 1.0배 몸통)
+    threshold_wick = body_size * 1.0 if any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]) else body_size * 1.5
+    if upper_wick > max(threshold_wick, curr_close * 0.003):
+        bonus_score -= 55.0 # 가짜 반등 방지: 페널티 강화 (-45 -> -55)
 
     if eval_mode == "QUANTUM":
         bb_u = safe_float(curr_i.get('bb_u'))
@@ -720,6 +772,35 @@ def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_shor
         is_bullish = (curr_close > curr_i.get('open', curr_close)) or (safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0)))
         if not fatal_reason and not (safe_float(curr_i.get('volume')) >= safe_float(curr_i.get('vol_sma'))*1.0 and is_bullish) and rsi_val > 28:
             fatal_reason = "반등신호대기"
+
+    # =========================================================================
+    # 🟢 [누락 복구] 치명적 결함 캡(Cap) 및 스펙트럼 감점(Penalty) 로직 추가
+    defense_cap = safe_float(get_dynamic_strat_value('guard_score_threshold', mode=eval_mode, default=75.0))
+    if fatal_reason:
+        total_score = min(total_score, defense_cap - 5.0) # 결함 시 강한 캡 적용
+    else:
+        # 거래량 및 CVD 스펙트럼 감점 로직 (가짜 반등 방어막)
+        vol_sma_val = max(safe_float(curr_i.get('vol_sma', 1)), 0.0001)
+        cvd_val = safe_float(curr_i.get('cvd', 0))
+        
+        if eval_mode == "QUANTUM":
+            if cvd_val < 0: 
+                cvd_ratio = abs(cvd_val) / vol_sma_val
+                total_score -= 20 * min(1.0, cvd_ratio / 2.0) # 감점 강화
+            macd_4h = safe_float(mtf_data.get("4h_macd", 0)) if mtf_data else 0
+            if macd_4h < 0: 
+                total_score -= 10 * min(1.0, abs(macd_4h) / 5.0) 
+        else: # CLASSIC
+            if cvd_val < 0: 
+                total_score -= 8 * min(1.0, abs(cvd_val) / vol_sma_val / 2.0)
+            cvd_slope = cvd_val - safe_float(prev_i.get('cvd', 0))
+            if cvd_slope < 0: 
+                total_score -= 12 * min(1.0, abs(cvd_slope) / vol_sma_val * 2.0)  
+            curr_vol_val = safe_float(curr_i.get('volume', 0))
+            vol_ratio = curr_vol_val / vol_sma_val
+            if vol_ratio < 1.1: # [Sweet Spot] 1.3 -> 1.1로 완화
+                total_score -= 10 * min(1.0, max(0.0, (1.1 - vol_ratio) / 0.8))
+    # =========================================================================
 
     final_score = round(max(0.0, min(100.0, total_score)), 1)
     return final_score, fatal_reason, suggested_threshold, eval_mode
@@ -3861,8 +3942,15 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     is_failed_bounce = elapsed_sec > (interval_sec * 3.0) and curr_p_rate <= -0.8
     early_hard_cut = elapsed_sec > (interval_sec * 1.5) and curr_p_rate <= -1.3
     
-    # 🔵 [자금 회전율] 정체 구간 손절선 상향 (-0.7%)
-    stagnant_sl = -0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5
+    # 🛡️ [Sector Resilience] 섹터별 최적화된 손절/시간 관리
+    is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
+    
+    # 밈코인은 -1.1%로 압착 손절, 대형주는 -1.0% 조기 손절, 일반은 -0.7% (정체 시)
+    stagnant_sl = -1.1 if is_meme else (-1.0 if (tier == "Major" and elapsed_sec > 3600) else (-0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5))
+
+    # 🚀 [Sector DNA Exit] 섹터별 1차 익절 타겟 설정
+    # Meme/Small: 0.7% (수익 보존), Others: 1.5% (추세 추종)
+    tp_target = 0.7 if (is_meme or tier == "Small (High Vol)") else 1.5
 
     sell_conditions = [
         # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%)
@@ -3872,12 +3960,11 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         # RSI가 50 이상(준강세)이면 1.5시간까지 유예 (기존 1시간)
         (elapsed_sec > (3600 if curr_i_safe.get('rsi', 0) < 50 else 5400) and curr_p_rate <= -0.7, "자금회전 정체 손절", 1.0, 8, "NORMAL"),
         
-        # 🛡️ [Small 티어 특화] 2.5. 본절가 압착 방어 (0.7% 달성 후 본절 위로 스탑 이동)
-        (tier == "Small (High Vol)" and max_p_rate >= 0.7 and curr_p_rate <= 0.1, "본절 방어선 가동", 1.0, 9, "HIGH"),
-
-        # 🚀 [수익 극대화] 3. 1차 익절 (Major: 1.3%, Others: 1.5%)
-        # Major는 추세 추종력을 높이기 위해 기존 1.0%에서 1.3%로 상향
-        (curr_p_rate >= (1.3 if tier == "Major" else 1.5) and scale_out_step == 0, "1차 수익 확보(50%)", 0.5, 1, "NORMAL"),
+        # 🛡️ [Protection DNA] 2.5. 조기 본절가 압착 방어 (Meme/Small 전용)
+        ((is_meme or tier == "Small (High Vol)") and max_p_rate >= 0.7 and curr_p_rate <= 0.1, "섹터 조기 본절 방어", 1.0, 9, "HIGH"),
+        
+        # 🚀 [수익 극대화] 3. 1차 익절 (50% 확보)
+        (curr_p_rate >= tp_target and scale_out_step == 0, f"1차 수익 확보({tp_target}%)", 0.5, 1, "NORMAL"),
         
         # 🚀 [Major 특화] 3.5. RSI 과열 홀딩 (메이저는 과열되어도 기울기가 유지되는 한 홀딩)
         (tier == "Major" and curr_i_safe.get('rsi', 0) >= 75 and macd_diff_val > 0 and curr_p_rate > 1.0, "Major 추세 유지(HODL)", 0.0, 0, "LOW"),
@@ -3885,8 +3972,9 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         # 🚀 [추세 추종] 4. 고점 이격 익절 (상향 돌파 후 꺾임 감지)
         (curr_p_rate >= 3.5 and macd_diff_val < 0, "추세 변곡 전량 익절", 1.0, 9, "HIGH"),
         
-        # 🕘 [지능형 인내] 5. 평가시간 초과 (수익이 음수이며 4시간 경과 시)
-        (elapsed_sec > (interval_sec * 4.0) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
+        # 🕘 [지능형 인내] 5. 평가시간 초과 (수익이 음수이며 일정 시간 경과 시)
+        # Major/Mid는 무거우므로 6시간(interval*6), Small은 4시간 유예
+        (elapsed_sec > (interval_sec * (6.0 if tier in ["Major", "Mid"] else 4.0)) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
     ]
     for condition, reason, ratio, step, urgency_level in sell_conditions:
         if condition:
@@ -3894,8 +3982,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
             return True, (ratio != 1.0), ratio, reason, urgency_level, step
             
     return False, False, 0.0, "", "NORMAL", 0
-            
-    return False, False, 1.0, "", "NORMAL", scale_out_step
+
 
 # 🟢 [수술 완료] 메인 감시 루프의 딜레이를 없애기 위한 백그라운드 매도 리포트 생성기
 async def background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, sell_reason_str, analyze_payload):
