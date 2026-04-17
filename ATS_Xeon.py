@@ -499,8 +499,16 @@ def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
 
 
 async def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
-    """비동기 버전 (라이브용): 병렬 채점 지원"""
+    """비동기 버전 (라이브용): 병렬 채점 지원 및 강제 모드 준수"""
     btc_obj = {'trend': btc_short_trend} if isinstance(btc_short_trend, str) else btc_short_trend
+    
+    # 🔴 [Integrity Fix] 강제 모드가 지정된 경우 해당 모드만 수행 (모드 스위칭 오류 방어)
+    if force_eval_mode == "CLASSIC":
+        return await _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
+    if force_eval_mode == "QUANTUM":
+        return await _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
+
+    # 강제 모드가 없는 경우(최초 스캔 등) 두 모드를 병렬 채점하여 더 높은 점수 채택
     c_task = _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
     q_task = _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
     (c_res, q_res) = await asyncio.gather(c_task, q_task)
