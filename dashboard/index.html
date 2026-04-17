@@ -43,26 +43,53 @@
 
         <!-- Main Content -->
         <main class="main-content">
-            <header class="top-bar glass-panel">
-                <h1 id="regime-status">System Initializing...</h1>
-                <div class="stats-row">
-                    <div class="stat-box market-chart-box">
-                        <span class="stat-label">Market Pulse (FGI)</span>
-                        <div class="mini-chart-container">
-                            <canvas id="marketChart"></canvas>
-                        </div>
+            <div class="radar-bar glass-panel" style="margin-bottom: 24px; padding: 12px 24px; display: flex; justify-content: space-between; align-items: center; font-size: 14px; border-radius: 12px;">
+                <div style="display: flex; gap: 20px; align-items: center;">
+                    <span id="regime-status" style="font-family: var(--font-display); font-weight: 700; color: var(--neon-cyan);">Initializing System...</span>
+                </div>
+                <div id="active-trades-wrapper" class="text-muted">
+                    Active Positions: <span id="active-trades-count" class="neon-purple" style="font-weight: 800; font-family: var(--font-display);">0</span>
+                </div>
+            </div>
+
+            <header class="top-bar">
+                <div class="stat-card">
+                    <div class="stat-label">
+                        <span class="dot pulse-green"></span> Total Assets
                     </div>
-                    <div class="stat-box">
-                        <span class="stat-label">Win Rate</span>
-                        <span id="win-rate" class="stat-value neon-text">--%</span>
+                    <div class="stat-value">
+                        <span class="stat-prefix">₩</span>
+                        <span id="total-balance">--</span>
                     </div>
-                    <div class="stat-box">
-                        <span class="stat-label">Total Profit</span>
-                        <span id="total-profit" class="stat-value neon-purple">-- KRW</span>
+                    <div class="stat-trend trend-up">Stable Engine Flow</div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">Available Cash</div>
+                    <div class="stat-value">
+                        <span class="stat-prefix">₩</span>
+                        <span id="available-cash">--</span>
                     </div>
-                    <div class="stat-box">
-                        <span class="stat-label">Active Trades</span>
-                        <span id="active-trades-count" class="stat-value">0</span>
+                    <div class="stat-trend" id="cash-usage-text">--% utilization</div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">Cumulative P&L</div>
+                    <div id="cumulative-pnl" class="stat-value pnl-positive">
+                        <span class="stat-prefix">₩</span>
+                        <span id="total-profit-val">0</span>
+                    </div>
+                    <div id="win-rate-text" class="stat-trend">Win Rate: --%</div>
+                </div>
+
+                <div class="stat-card">
+                    <div class="stat-label">P/L Ratio (Xeon Focus)</div>
+                    <div class="stat-value">
+                        <span id="pl-ratio-val">--</span>
+                        <span class="stat-suffix">/ 1.0</span>
+                    </div>
+                    <div class="pl-gauge-container">
+                        <div id="pl-gauge-fill" class="pl-gauge-fill" style="width: 0%"></div>
                     </div>
                 </div>
             </header>

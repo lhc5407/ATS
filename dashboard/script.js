@@ -77,9 +77,12 @@ function initChart() {
     });
 }
 
-// 🟢 Market Pulse 그래프 초기화 (툴팁 활성화 및 동적 색상 적용)
+// 🟢 Market Pulse 그래프 초기화 (Null Guard 추가)
 function initMarketChart() {
-    const ctx = document.getElementById('marketChart').getContext('2d');
+    const chartEl = document.getElementById('marketChart');
+    if (!chartEl) return; // 요소 없으면 조용히 패스
+
+    const ctx = chartEl.getContext('2d');
     marketChart = new Chart(ctx, {
         type: 'line',
         data: {
@@ -99,8 +102,7 @@ function initMarketChart() {
             responsive: true,
             maintainAspectRatio: false,
             plugins: {
-                legend: { display: false }, // 범례 숨김
-                // 🟢 마우스 오버 시 날짜와 수치를 볼 수 있도록 툴팁 활성화!
+                legend: { display: false },
                 tooltip: {
                     enabled: true,
                     mode: 'index',
@@ -118,11 +120,7 @@ function initMarketChart() {
             },
             scales: {
                 x: { display: false },
-                y: {
-                    display: false,
-                    min: 0,
-                    max: 100
-                }
+                y: { display: false, min: 0, max: 100 }
             },
             interaction: {
                 mode: 'nearest',
@@ -135,6 +133,8 @@ function initMarketChart() {
 
 async function fetchMarketHistory() {
     try {
+        if (!marketChart) return; // 초기화 안됐으면 중단
+
         const response = await fetch(`${API_BASE}/market-history`);
         const data = await response.json();
 
@@ -170,7 +170,7 @@ async function fetchMarketHistory() {
                 labelEl.innerHTML = `Market Pulse (FGI) <span style="color: ${color}; font-weight: bold; margin-left: 5px;">${latestFgi} ${statusText}</span>`;
             }
 
-            marketChart.update();
+            marketChart.update('none');
         }
     } catch (e) {
         console.error("Market history fetch failed:", e);
@@ -202,32 +202,42 @@ async function fetchDashboardData() {
 }
 
 function updateUI(data) {
-    // 1. System Status
-    document.getElementById('system-status-text').textContent = "Online";
-    document.getElementById('system-status-dot').className = "dot pulse-green";
+    // 1. System Status (Safe Binding)
+    const statusTextEl = document.getElementById('system-status-text');
+    const statusDotEl = document.getElementById('system-status-dot');
+    if (statusTextEl) statusTextEl.textContent = "Online";
+    if (statusDotEl) statusDotEl.className = "dot pulse-green";
 
-    document.getElementById('regime-status').textContent = data.system_status || "Initializing...";
+    const regimeEl = document.getElementById('regime-status');
+    if (regimeEl) regimeEl.textContent = data.system_status || "Initializing...";
 
-    const btcTrend = data.btc_trend || "알 수 없음";
+    const btcTrend = data.btc_trend || "Scanning...";
     const btcEl = document.getElementById('btc-trend');
-    btcEl.textContent = btcTrend;
-    btcEl.className = (btcTrend === "단기 상승" || btcTrend === "Bullish") ? "neon-text" : "neon-purple";
-
-    // 2. Stats Row
-    const winRateVal = typeof data.win_rate === 'number' ? data.win_rate : 0;
-    document.getElementById('win-rate').textContent = `${winRateVal.toFixed(1)}%`;
-
-    // Format KRW with commas
-    const profitVal = typeof data.total_profit === 'number' ? data.total_profit : 0;
-    const formattedProfit = new Intl.NumberFormat('ko-KR').format(Math.floor(profitVal));
-    const profitEl = document.getElementById('total-profit');
-    profitEl.textContent = `${formattedProfit} KRW`;
-
-    if (data.total_profit >= 0) {
-        profitEl.className = "stat-value neon-cyan";
-    } else {
-        profitEl.className = "stat-value pnl-negative";
+    if (btcEl) {
+        btcEl.textContent = btcTrend;
+        btcEl.className = (btcTrend === "단기 상승" || btcTrend === "Bullish") ? "neon-text" : "neon-purple";
     }
+
+    const activeCountEl = document.getElementById('active-trades-count');
+    if (activeCountEl) activeCountEl.textContent = data.active_trades ? data.active_trades.length : 0;
+    const f = new Intl.NumberFormat('ko-KR');
+    
+    // Asset Metrics
+    document.getElementById('total-balance').textContent = f.format(data.total_balance || 0);
+    document.getElementById('available-cash').textContent = f.format(data.available_cash || 0);
+    
+    const profitVal = data.total_profit || 0;
+    const profitEl = document.getElementById('total-profit-val');
+    if (profitEl) {
+        profitEl.textContent = f.format(Math.floor(profitVal));
+        document.getElementById('cumulative-pnl').className = `stat-value ${profitVal >= 0 ? 'pnl-positive' : 'pnl-negative'}`;
+    }
+    
+    document.getElementById('win-rate-text').textContent = `Win Rate: ${(data.win_rate || 0).toFixed(1)}%`;
+    document.getElementById('pl-ratio-val').textContent = (data.avg_pl_ratio || 1.0).toFixed(2);
+    
+    const gauge = document.getElementById('pl-gauge-fill');
+    if (gauge) gauge.style.width = `${Math.min(100, (data.avg_pl_ratio || 1.0) * 50)}%`;
 
     // 3. Active Trades
     const tradeList = document.getElementById('trade-list');

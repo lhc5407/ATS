@@ -1076,30 +1076,40 @@ else:
 async def api_get_dashboard(timeframe: str = 'all'):
     wins, losses, total_profit = 0, 0, 0.0
     chart_data = []
+    avg_pl_ratio = 1.0 
     
     try:
         async with aiosqlite.connect(DB_FILE, timeout=5.0) as db:
-            # 🟢 [최적화 1] 파이썬 for문 대신 DB 자체 집계 함수(SUM, COUNT)를 사용하여 속도 100배 향상 & RAM 절약
             async with db.execute("SELECT COUNT(CASE WHEN profit_krw > 0 THEN 1 END), COUNT(CASE WHEN profit_krw <= 0 THEN 1 END), SUM(profit_krw) FROM trade_history WHERE side='SELL'") as cursor:
                 stat_row = await cursor.fetchone()
                 if stat_row:
                     wins, losses = stat_row[0] or 0, stat_row[1] or 0
                     total_profit = stat_row[2] or 0.0
 
-            # 🟢 [최적화 2] 차트용 데이터는 필터링된 날짜의 데이터만 제한적으로 가져오기
+            # [P/L Ratio 계산]
+            query_pl = """
+                SELECT 
+                    AVG(CASE WHEN profit_krw > 0 THEN profit_krw END),
+                    AVG(CASE WHEN profit_krw <= 0 THEN ABS(profit_krw) END)
+                FROM trade_history WHERE side='SELL'
+            """
+            async with db.execute(query_pl) as cursor:
+                pl_row = await cursor.fetchone()
+                if pl_row and pl_row[1] and pl_row[1] > 0:
+                    avg_pl_ratio = (pl_row[0] or 0.0) / pl_row[1]
+                elif pl_row and pl_row[0]:
+                    avg_pl_ratio = 3.0 # 손실 없음
+
             now = datetime.now()
             if timeframe == 'day': cutoff = now - timedelta(days=1)
             elif timeframe == 'week': cutoff = now - timedelta(days=7)
-            else: cutoff = now - timedelta(days=365) # MAX 1년치 보호막
-
+            else: cutoff = now - timedelta(days=365)
             cutoff_str = cutoff.strftime('%Y-%m-%d %H:%M:%S')
 
-            # 이전 누적 수익 계산 (차트 시작점 뼈대 맞추기)
             async with db.execute("SELECT SUM(profit_krw) FROM trade_history WHERE side='SELL' AND timestamp < ?", (cutoff_str,)) as cursor:
                 prev_sum_row = await cursor.fetchone()
                 cumulative_profit = prev_sum_row[0] or 0.0
 
-            # 🟢 [최적화 3] 해당 기간의 데이터만 조회 (최대 1000개로 제한하여 웹 브라우저 CPU 다운 방지)
             query = "SELECT timestamp, profit_krw FROM trade_history WHERE side='SELL' AND timestamp >= ? ORDER BY timestamp ASC LIMIT 1000"
             async with db.execute(query, (cutoff_str,)) as cursor:
                 async for row in cursor:
@@ -1148,16 +1158,29 @@ async def api_get_dashboard(timeframe: str = 'all'):
             "reason": t_data.get('buy_reason', '자동 매수')
         })
 
-    btc_trend_str = "알 수 없음"
-    try:
-        btc_trend_str = "단기 상승" if "Quantum" in SYSTEM_STATUS else ("단기 하락" if "Classic" in SYSTEM_STATUS else "균형")
-    except: pass
+    # [실시간 자산 계산]
+    total_asset_bal = 0.0
+    cash_bal = 0.0
+    if isinstance(balances, list):
+        for b in balances:
+            c = b.get('currency', '')
+            b_val = safe_float(b.get('balance')) + safe_float(b.get('locked'))
+            if c == 'KRW':
+                cash_bal = b_val
+                total_asset_bal += b_val
+            else:
+                price = REALTIME_PRICES.get(f"KRW-{c}", safe_float(b.get('avg_buy_price')))
+                total_asset_bal += (b_val * price)
 
     return {
+        "status": "success",
         "system_status": SYSTEM_STATUS,
-        "btc_trend": btc_trend_str,
-        "win_rate": win_rate,
+        "btc_trend": BTC_SHORT_CACHE['data']['trend'],
+        "win_rate": round(win_rate, 2),
         "total_profit": total_profit,
+        "total_balance": round(total_asset_bal, 0),
+        "available_cash": round(cash_bal, 0),
+        "avg_pl_ratio": round(avg_pl_ratio, 2),
         "active_trades": active_trades,
         "chart_data": chart_data
     }
@@ -2930,8 +2953,11 @@ async def background_ai_post_report(ticker, curr_data, mtf, buy_price, pass_scor
         TRADE_DATA_DIRTY = True
 
 # --- [5. 공통 스캔 모듈] ---
-async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash, held_count, exit_plan, buy_mode="COUNCIL", pass_score=0, eval_mode="QUANTUM"):
+async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash, held_count, exit_plan, buy_mode="QUANTUM", pass_score=0):
     global last_global_buy_time, TRADE_DATA_DIRTY
+    
+    # eval_mode를 buy_mode와 동기화하여 불일치 원천 차단
+    eval_mode = buy_mode
     
     # 🟢 [보안 1] 가격 괴리율 보호 (Price Drift Protection)
     # 분석 시점의 가격(curr_data['close'])과 현재 실행 시점의 가격을 비교
@@ -2967,15 +2993,11 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
             risk_pct = max(0.005, min(0.04, kelly_fraction / 2.0))
         else:
             risk_pct = 0.005
-
+            
     atr_pct = (curr_data['ATR'] / curr_data['close']) if curr_data['close'] > 0 else 0.01
     atr_pct = max(0.005, atr_pct) 
     
-    risk_parity_amt = (total_asset * risk_pct) / atr_pct
-    max_slot_amt = (total_asset / max_trades) * 1.2
-
-    
-    buy_amt = min(risk_parity_amt, max_slot_amt, cash * 0.99)
+    buy_amt = min((total_asset * risk_pct) / atr_pct, (total_asset / max_trades) * 1.2, cash * 0.99)
     if (cash * 0.99) - buy_amt < 6000: buy_amt = cash * 0.99
         
     if buy_amt >= 6000: 
@@ -2987,62 +3009,39 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
             current_balances = await execute_upbit_api(upbit.get_balances)
             coin_currency = ticker.split('-')[1]
             
+            coin_info = None
             if isinstance(current_balances, list):
                 coin_info = next((b for b in current_balances if isinstance(b, dict) and b.get('currency') == coin_currency), None)
-            else:
-                coin_info = None
             
-            if coin_info and safe_float(coin_info.get('avg_buy_price')) > 0:
-                final_buy_price = safe_float(coin_info.get('avg_buy_price'))
-            else:
-                final_buy_price = safe_float(await execute_upbit_api(pyupbit.get_current_price, ticker))
+            final_buy_price = safe_float(coin_info.get('avg_buy_price')) if coin_info and safe_float(coin_info.get('avg_buy_price')) > 0 else safe_float(await execute_upbit_api(pyupbit.get_current_price, ticker))
 
             now_ts = time.time()
             last_buy_time[ticker], last_global_buy_time = now_ts, now_ts
             
-            temp_exit_plan = exit_plan if exit_plan else {"target_atr_multiplier": 5.5, "stop_loss": -3.5, "atr_mult": 2.0, "timeout": 24}
-            
             tier_params = get_coin_tier_params(ticker, curr_data, eval_mode=eval_mode)
             
-            if exit_plan:
-                temp_exit_plan = exit_plan  
-            else:
-                # 🟢 [손익비 최적화] ATR 기반 동적 손실 제한 도입 (Risk/Reward 균형)
-                atr_pct = (curr_data.get('ATR', 0) / curr_data.get('close', 1)) * 100
+            if not exit_plan:
+                atr_pct_val = (curr_data.get('ATR', 0) / curr_data.get('close', 1)) * 100
                 target_mult = tier_params.get('target_atr_multiplier', 4.5)
-                # 손절 멀티플라이어는 익절의 약 50~70% 수준으로 자동 산정 (익절 기대치보다 손절이 크지 않게)
                 sl_atr_mult = tier_params.get('atr_mult', 2.0) 
                 
-                dynamic_sl = -(atr_pct * sl_atr_mult)
-                hard_sl_cap = tier_params.get('stop_loss', -3.0)
+                final_sl = max(-(atr_pct_val * sl_atr_mult), tier_params.get('stop_loss', -3.0))
+                expected_target = atr_pct_val * target_mult
+                if abs(final_sl) > (expected_target * 0.7): final_sl = -(expected_target * 0.7)
                 
-                # 최종 손절선은 '동적 손절'과 '하드 캡' 중 더 촘촘한 것으로 선택
-                final_sl = max(dynamic_sl, hard_sl_cap)
-                
-                # 🚨 [안전장치] 손익비 최적화 (손실을 기대수익의 약 70% 이내로 압착)
-                expected_target = atr_pct * target_mult
-                if abs(final_sl) > (expected_target * 0.7):
-                    final_sl = -(expected_target * 0.7)
-                
-                temp_exit_plan = {
-                    "target_atr_multiplier": target_mult,
-                    "stop_loss": round(final_sl, 2),
-                    "atr_mult": sl_atr_mult,
-                    "timeout": tier_params.get('timeout_candles', 8)
+                exit_plan = {
+                    "target_atr_multiplier": target_mult, "stop_loss": round(final_sl, 2),
+                    "atr_mult": sl_atr_mult, "timeout": tier_params.get('timeout_candles', 8)
                 }
             
-            # 클래식 모드는 0.4% 이상의 본절점(Breakeven) 버퍼를 명시적으로 강화
-            temp_exit_plan['adaptive_breakeven_buffer'] = tier_params.get('adaptive_breakeven_buffer', 0.007)
-
-            buy_ind_dict = curr_data if isinstance(curr_data, dict) else curr_data.to_dict()
+            exit_plan['adaptive_breakeven_buffer'] = tier_params.get('adaptive_breakeven_buffer', 0.007)
 
             trade_data[ticker] = {
                 'high_p': final_buy_price, 'entry_atr': curr_data.get('ATR', 0), 'guard': False,
-                'buy_ind': buy_ind_dict, 
-                'last_notified_step': 0, 'buy_ts': now_ts,
-                'exit_plan': temp_exit_plan, 'buy_reason': reason, 'btc_buy_price': REALTIME_PRICES.get('KRW-BTC', 0),
-                'pass_score': pass_score, 'is_runner': False, 'score_history': [pass_score],
-                'strategy_mode': buy_mode
+                'buy_ind': curr_data if isinstance(curr_data, dict) else curr_data.to_dict(), 
+                'last_notified_step': 0, 'buy_ts': now_ts, 'exit_plan': exit_plan, 'buy_reason': reason, 
+                'btc_buy_price': REALTIME_PRICES.get('KRW-BTC', 0), 'pass_score': pass_score, 
+                'is_runner': False, 'score_history': [pass_score], 'strategy_mode': buy_mode
             }
             TRADE_DATA_DIRTY = True
             await record_trade_db(ticker, 'BUY', final_buy_price, buy_amt, profit_krw=0, reason=reason, status="ENTERED", rating=int(score), pass_score=pass_score, strategy_mode=eval_mode)        
@@ -3051,13 +3050,13 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
             btc_rsi = btc_data.get('rsi', 0)
             mode_icon = "📉" if eval_mode == "CLASSIC" else "🚀"
             
-            if buy_mode == "SNIPER":
-                await send_msg(f"🎯 <b>스나이퍼 매수 완료</b> [{eval_mode}]\n- 종목: {ticker} (파이썬:{pass_score:.1f}점)\n- <b>시황: BTC RSI {btc_rsi}</b> {mode_icon}\n- <b>금액: {buy_amt:,.0f}원</b>\n👉 <b>사후 분석 대기중.</b>")
+            safe_reason = str(reason).replace('<', '&lt;').replace('>', '&gt;')
+            if buy_mode == "SNIPER" or "선제공격" in str(reason):
+                await send_msg(f"🎯 <b>스나이퍼 매수 완료</b> [{buy_mode}]\n- 종목: {ticker} (파이썬:{pass_score:.1f}점)\n- <b>시황: BTC RSI {btc_rsi}</b> {mode_icon}\n- <b>금액: {buy_amt:,.0f}원</b>\n👉 <b>사후 분석 대기중.</b>")
                 mtf = await get_mtf_trend(ticker)
                 asyncio.create_task(background_ai_post_report(ticker, curr_data, mtf, final_buy_price, pass_score, eval_mode))
             else:
-                safe_reason = str(reason).replace('<', '&lt;').replace('>', '&gt;')
-                await send_msg(f"✅ <b>매수 승인</b> [{eval_mode}]\n- 종목: {ticker} ({pass_score:.1f} ➡️ AI:{score:.1f}점)\n- <b>시황: BTC RSI {btc_rsi}</b> {mode_icon}\n- <b>금액: {buy_amt:,.0f}원</b>\n- 분석: {safe_reason}")
+                await send_msg(f"✅ <b>매수 승인</b> [{buy_mode}]\n- 종목: {ticker} ({pass_score:.1f} ➡️ AI:{score:.1f}점)\n- <b>시황: BTC RSI {btc_rsi}</b> {mode_icon}\n- <b>금액: {buy_amt:,.0f}원</b>\n- 분석: {safe_reason}")
             return True
         else:
             await send_msg(f"🚫 <b>매수 취소</b>: {ticker} 스마트 매수 실패.\n- 사유: {fail_reason}")
@@ -3904,7 +3903,7 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
         atr_1x_pct = (entry_atr / avg_p) * 100 if avg_p > 0 else 1.5
         bailout_mult = 0.8 if get_coin_tier(ticker, t.get('buy_ind', {})) == "Major" else 1.0
         fundamental_bailout_limit = -max(0.5, min(3.0, atr_1x_pct * bailout_mult))
-        if (elapsed_sec > (interval_sec * 1.5) or p_rate < fundamental_bailout_limit) and curr_p_rate < 0.0:
+        if (elapsed_sec > (interval_sec * 1.5) or curr_p_rate < fundamental_bailout_limit) and curr_p_rate < 0.0:
             is_fundamental_broken = True
     # =========================================================================
 
@@ -3988,6 +3987,16 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     sell_conditions = [
         # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%) / Meme 전용 타이트 손절 (-1.0%)
         (curr_p_rate <= (-1.0 if (is_meme or tier == "Small (High Vol)") else -1.5) or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
+        
+        # 🛡️ [Intelligence Pack] 지능형 조기 탈출
+        (is_fundamental_broken, "펀더멘탈 붕괴", 1.0, 0, "HIGH"),
+        (is_failed_bounce, "반등 실패", 1.0, 0, "HIGH"),
+        
+        # 🛡️ [Protection Pack] 초단기 리스크 차단 (early_hard_cut)
+        (early_hard_cut, "초단기 한계 손절", 1.0, 0, "HIGH"),
+
+        # 🚀 [Profit Sniper] 과열 꺾임 익절
+        (is_rsi_overheated_drop, "과열 꺾임 익절", 1.0, 0, "HIGH"),
         
         # 🛡️ [회전율 극대화] 2. 정체 구간 타이트 손절 (-0.7%)
         (elapsed_sec > (3600 if curr_i_safe.get('rsi', 0) < 50 else 5400) and curr_p_rate <= -0.7, "자금회전 정체 손절", 1.0, 8, "NORMAL"),
