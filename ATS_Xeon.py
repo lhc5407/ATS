@@ -51,29 +51,36 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 
-def get_coin_tier(ticker: str, curr_data: dict = None) -> str:
-    """코인의 변동성 지수를 기반으로 티어(Major/Mid/Small) 명칭을 반환합니다."""
-    try:
-        if not isinstance(curr_data, dict): return "Major"
-        close_val = safe_float(curr_data.get('close'))
-        atr_val = safe_float(curr_data.get('ATR'))
-        if close_val <= 0 or atr_val <= 0: return "Major"
-        vol_idx = (atr_val / close_val) * 100
-        if vol_idx > 3.5: return "Small (High Vol)"
-        elif vol_idx > 1.5: return "Mid"
-        else: return "Major"
-    except: return "Major"
+from strategy_logic import (
+    evaluate_sell_conditions, 
+    safe_float, 
+    get_coin_tier, 
+    get_strategy_score,
+    run_sub_eval_logic,
+    get_constrained_value,
+    STRAT_CONSTRAINTS,
+    evaluate_strategy_sync
+)
 
-def get_coin_tier_params(ticker: str, curr_data: dict, eval_mode: str = "QUANTUM") -> dict:
-    try:
-        tier_name = get_coin_tier(ticker, curr_data)
-        # 🟢 [DNA 진화] 티어 파라미터 호출 시에도 ticker를 넘겨 고유 DNA가 있는지 확인합니다.
-        if tier_name == "Small (High Vol)": return get_dynamic_strat_value('high_vol_params', mode=eval_mode, default={}, ticker=ticker)
-        elif tier_name == "Mid": return get_dynamic_strat_value('mid_vol_params', mode=eval_mode, default={}, ticker=ticker)
-        else: return get_dynamic_strat_value('major_params', mode=eval_mode, default={}, ticker=ticker)
-    except Exception as e:
-        logging.error(f"티어 분류 오류 ({ticker}): {e}")
-        return get_dynamic_strat_value('major_params', mode=eval_mode, default={}, ticker=ticker)
+async def evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, current_regime_mode="HYBRID", 
+                                       fgi_val=50, btc_short_trend=None, force_eval_mode=None, mtf_data=None):
+    """
+    ATS_Xeon 전용 호환성 래퍼: strategy_logic.py의 통합 로직을 호출합니다.
+    """
+    # btc_short_trend를 dict 형태로 변환 (run_sub_eval_logic 예상 규격)
+    btc_obj = {"trend": btc_short_trend} if isinstance(btc_short_trend, str) else (btc_short_trend or {})
+    
+    # 1. 특정 모드(force_eval_mode)가 지정된 경우 (보유 종목 점검 등) 해당 모드로만 채점
+    if force_eval_mode:
+        return run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, force_eval_mode, STRAT_CONSTRAINTS, btc_short=btc_obj)
+    
+    # 2. 지정되지 않은 경우 (신규 스캔 등) 통합 로직이 최적의 모드를 자동 선택
+    return evaluate_strategy_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, STRAT_CONSTRAINTS, btc_short=btc_obj)
+
+def get_coin_tier_params(ticker: str, curr_i: dict, eval_mode: str = "QUANTUM") -> dict:
+    tier = get_coin_tier(ticker, curr_i)
+    if tier == "Small (High Vol)": return QUANTUM_STRAT.get('high_vol_params', {})
+    return QUANTUM_STRAT.get('major_params', {})
 
 # --- [0.1 DB 유틸리티] ---
 def _sanitize_data(obj):
@@ -133,13 +140,15 @@ _TA_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_
 if getattr(sys, 'frozen', False): base_path = os.path.dirname(sys.executable)
 else: base_path = os.path.dirname(os.path.abspath(__file__))
 
-# 🟢 [글로벌 상수] 모든 경로 연산의 기준점 (D드라이브 우선, 폴백 지원)
-BASE_PATH = r"D:\Xeon"
-if not os.path.exists(os.path.join(BASE_PATH, "config_quantum.json")):
-    BASE_PATH = base_path
+# 🟢 [글로벌 상수] 모든 경로 연산의 기준점 (C드라이브/D드라이브 우선 탐색)
+BASE_PATH = base_path  # 기본값: 실행 폴더
+for path in [r"C:\Xeon", r"D:\Xeon"]:
+    if os.path.exists(os.path.join(path, "config_quantum.json")):
+        BASE_PATH = path
+        break
 
 DB_FILE = os.path.join(BASE_PATH, "ats_unified.db")
-log_dir = os.path.join(BASE_PATH, "log")
+log_dir = os.path.join(base_path, "log")
 os.makedirs(log_dir, exist_ok=True)
 
 log_filename = datetime.now().strftime("ats_hybrid_log_%Y%m%d_%H%M%S.log")
@@ -301,536 +310,30 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         def calc_dist_score(val, baseline, weight=10.0, inverse=False):
             if baseline <= 0: return 25.0
             dist_pct = ((val - baseline) / baseline) * 100
-            # [Gradient 5] 선형 증가 대신 로그 가중치를 적용하여 100점 도달을 어렵게 만듦
-            raw_move = dist_pct * weight if not inverse else -dist_pct * weight
-            if raw_move > 0:
-                score = 50.0 + (35.0 * (raw_move / (raw_move + 15.0))) # 85점까지는 빠르게, 그 위는 느리게
-            else:
-                score = 50.0 + raw_move
-            return min(100.0, max(15.0, score))
-
-        # 모드별 파라미터 통합
-        is_quantum = (mode == "QUANTUM")
-        
-        if name == "rsi":
-            curr_rsi = safe_float(curr.get('rsi'), 50.0)
-            if is_quantum:
-                if 50 <= curr_rsi <= 65: return 100.0
-                if curr_rsi > 85: return 30.0 
-                return max(0.0, curr_rsi - 10)
-            else:
-                # [적극 개입] 중립(50)에서 60점 시작
-                base_rsi_s = min(100.0, max(0.0, (50.0 - curr_rsi) * 3.0 + 60))
-                # 🟢 [품질 향상] RSI 상승 반전 가점 (V자 반등 포착)
-                rsi_prev = safe_float(prev.get('rsi'), curr_rsi)
-                if curr_rsi > rsi_prev and curr_rsi < 45:
-                    base_rsi_s = min(100.0, base_rsi_s + 15.0)
-                return base_rsi_s
-                
-        if name == "bollinger":
-            bb_range = curr.get('bb_u', 1) - curr.get('bb_l', 0)
-            if bb_range <= 0: return 0.0 if is_quantum else 50.0
-            pos_pct = (price - curr.get('bb_l', 0)) / bb_range
-            if is_quantum:
-                return min(100.0, max(0.0, pos_pct * 100))
-            else:
-                # [Gen-6: 적극적 기초 점수 상향] 밴드 중앙에서 80점 부여 (1.5배 환경 최적화)
-                base_bb_s = min(100.0, max(0.0, 110.0 - (pos_pct * 60)))
-                # 🟢 [품질 향상] 밴드 하단 이탈 후 회귀 (과매도 해소 시점) - 강력한 가점
-                prev_close = safe_float(prev.get('close'), price)
-                bb_l_prev = safe_float(prev.get('bb_l'), 0)
-                bb_l_curr = safe_float(curr.get('bb_l'), 0)
-                if prev_close < bb_l_prev and price > bb_l_curr:
-                    base_bb_s = min(100.0, base_bb_s + 35.0)
-                return base_bb_s
-                
-        if name == "z_score":
-            z = safe_float(curr.get('z_score'), 0.0)
-            if is_quantum:
-                # [Gradient 1] Z-Score가 0.5에 수렴할수록 고점 (너무 과열되지 않은 추세 선호)
-                dist = abs(z - 0.5)
-                return min(100.0, max(0.0, 95.0 - (dist * 25)))
-            else:
-                return min(100.0, max(0.0, 75.0 + (z * -25.0)))
-                
-        if name == "macd":
-            macd_h = safe_float(curr.get('macd_h'), 0.0)
-            macd_h_diff = safe_float(curr.get('macd_h_diff', 0), 0.0)
-            if is_quantum:
-                # [Gradient 2] MACD 히스토그램 크기와 기울기 가속도에 비례
-                base_s = 65.0 if macd_h > 0 else 0.0
-                accel = min(1.0, macd_h_diff * 5.0) if macd_h_diff > 0 else 0.0
-                return min(100.0, base_s + (accel * 35.0))
-            else:
-                macd_diff_sma = safe_float(curr.get('macd_h_diff_sma'), 0.0001)
-                if macd_h_diff > 0:
-                    return min(100.0, max(50.0, (macd_h_diff / max(macd_diff_sma * 2, 0.0001)) * 100))
-                return 30.0
-                
-        if name == "volume":
-            curr_vol = safe_float(curr.get('volume'))
-            vol_sma = safe_float(curr.get('vol_sma'), 0.0001)
-            if is_quantum:
-                v_s = min(100.0, (curr_vol / (vol_sma + 1)) * 50)
-                # 🟢 [품질 향상] 거래량 스파이크 시 돌파 신뢰도 가중
-                if curr_vol > vol_sma * 1.5:
-                    v_s = min(100.0, v_s + 20.0)
-                return v_s
-            else:
-                return min(100.0, (curr_vol / (vol_sma + 1)) * 30 + 30)
-
-        if name == "bollinger_breakout" and is_quantum:
-            if price < curr.get('bb_u', 0): return 0.0
-            bw_expansion = max(0, (curr.get('bb_bw', 0) - prev.get('bb_bw', 0)) / max(prev.get('bb_bw', 0), 0.0001))
-            return min(100.0, 70.0 + (bw_expansion * 500))
-
-        # --- [공통 지표 - 모드별 반전 적용] ---
-        # CLASSIC(역추세) 모드에서는 지표 아래에 있을수록 가점, QUANTUM(추세) 모드에서는 지표 위에 있을수록 가점.
-        is_classic = (mode == "CLASSIC")
-        
-        if name == "vwap": return calc_dist_score(price, curr.get('vwap', price), weight=15.0, inverse=is_classic)
-        if name == "ssl_channel": return calc_dist_score(price, curr.get('ssl_up', price), weight=15.0, inverse=is_classic)
-        if name == "sma_crossover":
-            slv = safe_float(curr.get('sma_long', 0.0001))
-            sma_short = safe_float(curr.get('sma_short', 0.0001))
-            p_above_20 = price > slv
-            ma_20_above_50 = slv > safe_float(curr.get('sma_50', 0))
-            if is_classic:
-                dist_20 = ((price - slv) / slv) * 100
-                return min(100.0, max(0.0, 50.0 - (dist_20 * 6)))
-            
-            # [Gradient 3] 정배열 강도에 비례 (단기/장기 이평선 이격 기반)
-            if p_above_20 and ma_20_above_50:
-                spread = ((sma_short - slv) / slv) * 100
-                return min(100.0, 75.0 + (spread * 15.0))
-            return 50.0 if p_above_20 else 0.0
-        if name == "ichimoku": 
-            ichimoku_baseline = max(curr.get('span_a', 0), curr.get('span_b', 0))
-            return calc_dist_score(price, ichimoku_baseline, weight=15.0, inverse=is_classic)
-        if name == "stoch_rsi": 
-            diff = curr.get('st_rsi_k', 0) - curr.get('st_rsi_d', 0)
-            base, m_val = (65.0, 2) if mode == "QUANTUM" else (55.0, 3)
-            return min(100.0, max(0.0, base + (diff * m_val)))
-        if name == "stochastics": 
-            diff = curr.get('stoch_k', 0) - curr.get('stoch_d', 0)
-            base, mult = (60.0, 2) if mode == "QUANTUM" else (50.0, 3)
-            return min(100.0, max(0.0, base + (diff * mult)))
-        if name == "bollinger_bandwidth" or name == "atr_trend":
-            key = 'bb_bw' if name == "bollinger_bandwidth" else 'ATR'
-            diff_pct = ((curr.get(key, 0) - prev.get(key, 0)) / max(prev.get(key, 0.0001), 0.0001)) * 100
-            return min(100.0, max(0.0, 50.0 + diff_pct * 5))
-        if name == "obv":
-            diff_pct = ((curr.get('obv', 0) - prev.get('obv', 0)) / max(abs(prev.get('obv', 0.0001)), 0.0001)) * 100
-            return min(100.0, max(0.0, 50.0 + diff_pct * 10))
-        if name == "supertrend":
-            st_dir = curr.get('ST_DIR', 1)
-            # [Gradient 4] 추세 유지 시간에 따른 신뢰도 보정 (너무 오래된 추세는 삭감)
-            return 95.0 if st_dir == 1 else 0.0
-        
+    except Exception as e:
+        print(f"Error in get_strategy_score: {e}")
         return 0.0
-    except: return 0.0
-
-
-def determine_regime_mode(fgi_str: str, btc_short: dict) -> str:
-    try:
-        fgi_val = int(re.search(r'\d+', str(fgi_str)).group()) if re.search(r'\d+', str(fgi_str)) else 50
-    except: fgi_val = 50
-
-    if fgi_val <= 35 or (btc_short.get('trend') == "단기 하락" and fgi_val <= 50):
-        return "CLASSIC"
-    if fgi_val >= 65 or (btc_short.get('trend') == "단기 상승" and fgi_val >= 50):
-        return "QUANTUM"
-    return "HYBRID"
-
-
-def determine_eval_mode(current_regime_mode: str, curr: dict) -> str:
-    coin_rsi = safe_float(curr.get('rsi', 50.0))
-    
-    # 1. 개별 코인 RSI 기반 동적 할당 (최우선) - 기준 추가 완화 (50 -> 55)
-    # RSI가 55 이하로 조금이라도 내려가면 '눌림목' 가능성을 열어둠
-    if coin_rsi <= 55:
-        return "CLASSIC"
-    if coin_rsi >= 65:
-        return "QUANTUM"
-        
-    # 2. RSI 중립 구간(56~64)에서는 전역 시장 모드 반영
-    if current_regime_mode == "CLASSIC":
-        return "CLASSIC"
-    if current_regime_mode == "QUANTUM":
-        return "QUANTUM"
-        
-    # 3. HYBRID 공통 구간: ADX로 추세 강도 보완 판단
-    # ADX가 20 이하로 횡보 중이면 CLASSIC, 그 이상 강한 추세면 QUANTUM
-    return "QUANTUM" if safe_float(curr.get('adx')) > 20 else "CLASSIC"
-
-
-def get_logic_list_for_mode(eval_mode: str, curr_data: dict) -> list:
-    strat_config = get_strat_for_mode(eval_mode)
-    adx_val = safe_float(curr_data.get('adx', 0))
-    adx_threshold = safe_float(strat_config.get('major_params', {}).get('adx_strong_trend_threshold', 25.0))
-    
-    if adx_val > adx_threshold:
-        return strat_config.get('trend_active_logic', [])
-    else:
-        return strat_config.get('range_active_logic', [])
-
-
-def get_indicator_multipliers(eval_mode: str, fgi_val: float) -> dict:
-    v_min = safe_float(get_dynamic_strat_value('fgi_v_curve_min', mode=eval_mode, default=0.5))
-    v_max = safe_float(get_dynamic_strat_value('fgi_v_curve_max', mode=eval_mode, default=3.0))
-
-    if eval_mode == "CLASSIC":
-        # CLASSIC: 공포 시(FGI 낮을수록) 공격적으로 가점. 중립(50)에서는 1.0 유지.
-        v_bottom = safe_float(get_dynamic_strat_value('fgi_v_curve_bottom', mode=eval_mode, default=40.0))
-        if fgi_val <= v_bottom:
-            dynamic_fgi_mult = v_max
-        elif fgi_val >= 70:
-            dynamic_fgi_mult = v_min
-        else:
-            dynamic_fgi_mult = v_max - ((fgi_val - v_bottom) / (70 - v_bottom)) * (v_max - v_min)
-            
-        normalized_regime_val = max(0.0, min(1.0, (dynamic_fgi_mult - v_min) / max(v_max - v_min, 0.0001)))
-        return {
-            'rsi': 1.0 + (1.0 * normalized_regime_val),
-            'bollinger': 1.0 + (0.5 * normalized_regime_val),
-            'volume': 1.5 - (0.5 * normalized_regime_val)
-        }
-
-    # QUANTUM: 탐욕 시(FGI 높을수록) 돌파 가점. 중립(50)에서는 1.0 유지.
-    dynamic_fgi_mult = v_min + (((fgi_val - 50) / 30) * (v_max - v_min)) if fgi_val >= 50 else 1.0
-    normalized_regime_val = max(0.0, min(1.0, (dynamic_fgi_mult - v_min) / max(v_max - v_min, 0.0001)))
-    return {
-        'rsi': 1.0 + (1.0 * normalized_regime_val),
-        'bollinger_breakout': 1.5 + (1.5 * normalized_regime_val),
-        'volume': 1.0 + (1.5 * normalized_regime_val)
-    }
-
-
-async def evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
-    """비동기 버전 (라이브용): 병렬 채점 지원 및 강제 모드 준수"""
-    btc_obj = {'trend': btc_short_trend} if isinstance(btc_short_trend, str) else btc_short_trend
-    
-    # 🔴 [Integrity Fix] 강제 모드가 지정된 경우 해당 모드만 수행 (모드 스위칭 오류 방어)
-    if force_eval_mode == "CLASSIC":
-        return await _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
-    if force_eval_mode == "QUANTUM":
-        return await _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
-
-    # 강제 모드가 없는 경우(최초 스캔 등) 두 모드를 병렬 채점하여 더 높은 점수 채택
-    c_task = _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
-    q_task = _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
-    (c_res, q_res) = await asyncio.gather(c_task, q_task)
-    return c_res if c_res[0] >= q_res[0] else q_res
-
 def evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=None, mtf_data=None):
     """동기 버전 (백테스트용): 시장 상황에 따른 자동 전략 스위칭 적용"""
     btc_obj = {'trend': btc_short_trend} if isinstance(btc_short_trend, str) else btc_short_trend
     
-    # 🔵 [All-Weather Engine] ADX 기반 추세 강도 및 시장 상황 분석
-    adx_val = safe_float(curr_i.get('adx', 20))
+    # ── [중요] 실전 파라미터를 그대로 백테스트에 주입 ──
+    # 실제 운영 시 사용하는 STRAT_CONSTRAINTS를 그대로 사용합니다.
     
-    # 🔵 [전략 스위칭 로직] 강제 할당 제거: 오직 점수 경쟁 모델로 통합
     if force_eval_mode == "CLASSIC":
-        return _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
+        return run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", STRAT_CONSTRAINTS, btc_short=btc_obj)
     elif force_eval_mode == "QUANTUM":
-        return _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
+        return run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", STRAT_CONSTRAINTS, btc_short=btc_obj)
         
-    # 두 모드를 항시 모두 채점하여 더 높은 점수를 획득한 전략을 자동으로 기용 (자유 경쟁)
-    c_res = _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", btc_short=btc_obj)
-    q_res = _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", btc_short=btc_obj)
+    c_res = run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", STRAT_CONSTRAINTS, btc_short=btc_obj)
+    q_res = run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", STRAT_CONSTRAINTS, btc_short=btc_obj)
     
-    # 0번 인덱스는 획득 점수(score)입니다. 더 점수가 높은 진입 근거를 채택
     return c_res if c_res[0] >= q_res[0] else q_res
 
 async def _run_sub_eval(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_short=None):
-    return _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_short=btc_short)
+    return run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, STRAT_CONSTRAINTS, btc_short=btc_short)
 
-# ── [1단계: 논리적 방어선 (Hard Constraints) 및 최적값 상수화] ──
-# 최적화기(Optimizer)가 매매 로직의 본질을 훼손하는 것을 막는 절대적 안전장치입니다.
-# Iteration 12076/13205 최적값 기준으로 ±10%의 타격범위를 강제합니다.
-STRAT_CONSTRAINTS = {
-    "foundation_mult_q": 1.0,
-    "foundation_mult_c": 0.99624,
-    "sniper_boost": 0.024325,
-    "mtf_bonus_q": 21.305994,
-    "mtf_penalty_q": 17.725075,
-    "wick_penalty": 63.707575,
-    "wick_ratio_major": 2.076794,
-    "wick_ratio_meme": 1.284157,
-    "bb_breakout_bonus": 76.020182,
-    "sma_align_bonus": 31.949618,
-    "rsi_oversold_bonus": 41.259553,
-    "sma_gap_bonus": 45.906664,
-    "cvd_bonus": 6.397097,
-    "osc_conv_bonus_alt": 10.04641,
-    "osc_conv_bonus_maj": 0.0,
-    "sma_above_bonus": 0.0,
-    "squeeze_bonus_alt": 1.19474,
-    "squeeze_bonus_maj": 4.471591,
-    "st_psar_bonus": 18.514452,
-    "mid_sma_penalty": 39.541297,
-    "rsi_slope_penalty": 26.152818,
-    "divergence_penalty": 1.63891,
-    "fgi_bonus_dampen": 0.416058,
-    "vas_mult_major": 1.033274,
-    "vas_mult_mid": 1.128693,
-    "alt_accel_mult": 1.116018,
-    "rsi_overbought_mult": 0.553294,
-    "macd_negative_mult": 0.378432,
-    "major_weak_mult": 0.369703,
-    "meme_bad_mult": 0.021213,
-    "vol_multiple_small": 2.476126,
-    "vol_multiple_major": 2.457754,
-    "cvd_penalty_q": 24.066655,
-    "cvd_penalty_c": 5.598171,
-    "cvd_slope_penalty_c": 13.864037,
-    "vol_ratio_penalty_c": 9.403461,
-    "pass_score_threshold": 80.0
-}
-
-def clamp_value(val, min_v, max_v, default=0.0):
-    v = safe_float(val, default)
-    return max(min_v, min(v, max_v))
-
-def get_constrained_value(key, mode, opt_val=None):
-    """
-    설정 파일(config.json)에서 값을 읽어오되, STRAT_CONSTRAINTS의 ±10% 범위를 절대 벗어나지 못하도록 강제합니다.
-    """
-    base_val = STRAT_CONSTRAINTS.get(key, opt_val if opt_val is not None else 0.0)
-    
-    # 0인 경우 예외적 허용 범위 설정
-    if base_val == 0.0:
-        min_v, max_v = 0.0, 0.05
-    elif abs(base_val) < 0.1:
-        min_v = max(0.0, base_val - 0.02)
-        max_v = base_val + 0.02
-    else:
-        min_v = base_val * 0.9
-        max_v = base_val * 1.1
-        
-    # config.json에서 가져온 값
-    config_val = get_dynamic_strat_value(key, mode=mode, default=base_val)
-    return clamp_value(config_val, min_v, max_v, base_val)
-
-def _run_sub_eval_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, btc_short=None):
-    eval_mode = mode
-    is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
-    logic_list = get_logic_list_for_mode(eval_mode, curr_i)
-    weights = get_dynamic_strat_value('indicator_weights', mode=eval_mode, default={}, ticker=ticker)
-    curr_close = safe_float(curr_i.get('close'))
-    curr_vol = safe_float(curr_i.get('volume'))
-    
-    tier = get_coin_tier(ticker, curr_i)
-    
-    # ── [2단계: 최적화 파라미터의 코드 내 이식 (Iteration 12076 적용, ±10% 제한)] ──
-    vas_mult_major = get_constrained_value('vas_mult_major', eval_mode)
-    vas_mult_mid   = get_constrained_value('vas_mult_mid', eval_mode)
-    vas_mult = vas_mult_major if tier == "Major" else (vas_mult_mid if tier == "Mid" else 1.0)
-    
-    base_threshold = clamp_value(get_dynamic_strat_value('pass_score_threshold', mode=eval_mode, default=80.0), 75.0, 95.0, 80.0)
-    suggested_threshold = base_threshold
-    
-    ticker_config = get_dynamic_strat_value('ticker_overrides', mode=eval_mode, default={}).get(ticker, {})
-    suggested_threshold += clamp_value(ticker_config.get('threshold_offset', 0.0), -15.0, 15.0, 0.0)
-    
-    if any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]):
-        suggested_threshold += 5.0
-        
-    if tier == "Major":
-        if safe_float(ticker_config.get('threshold_offset', 0.0)) == 0:
-            suggested_threshold += 5.0 
-    elif any(m in ticker for m in ["SHIB", "PEPE"]):
-        if safe_float(ticker_config.get('threshold_offset', 0.0)) == 0:
-            suggested_threshold += 7.0
-        
-    fatal_reason = None
-    
-    mtf_trend = mtf_data.get('1h_trend', 0) if mtf_data else 0
-    rsi_live = safe_float(curr_i.get('rsi', 50))
-    vol_idx = (safe_float(curr_i.get('ATR', 0)) / max(1.0, curr_close)) * 100
-    vol_sma = safe_float(curr_i.get('vol_sma', 0.0001))
-    
-    btc_p = safe_float(curr_i.get('btc_close', 0))
-    btc_prev_p = safe_float(prev_i.get('btc_close', 0))
-    if btc_p < btc_prev_p * 0.995: fatal_reason = "BTC패닉드랍"
-
-    vol_mult_s = get_constrained_value('vol_multiple_small', eval_mode)
-    vol_mult_m = get_constrained_value('vol_multiple_major', eval_mode)
-    vol_multiple = vol_mult_s if tier == "Small (High Vol)" else vol_mult_m
-    
-    if curr_vol < vol_sma * vol_multiple: fatal_reason = "거래량에너지부족"
-    elif vol_idx < 0.5: fatal_reason = "저변동성횡보"
-    elif safe_float(curr_i.get('bb_bw', 0)) < 0.7: fatal_reason = "밴드수축중"
-    elif eval_mode == "QUANTUM" and mtf_trend == -1: fatal_reason = "대추세역행(Q)"
-    elif eval_mode == "CLASSIC" and mtf_trend == 1: fatal_reason = "대추세역행(C)"
-    elif eval_mode == "CLASSIC" and mtf_trend == -1 and rsi_live > 25: fatal_reason = "하락장칼날잡기"
-
-    f_mult_opt = STRAT_CONSTRAINTS['foundation_mult_q'] if eval_mode == "QUANTUM" else STRAT_CONSTRAINTS['foundation_mult_c']
-    foundation_mult = get_constrained_value('foundation_multiplier', eval_mode, f_mult_opt)
-    earned_score, total_w = 0.0, 0.0001
-
-    valid_indicator_count = 0
-    for name in logic_list:
-        w = safe_float(weights.get(name, 1.0), 1.0)
-        
-        if tier not in ["Major", "Mid"] and name in ['st', 'psar', 'trend']:
-            w *= 1.5
-            
-        s_raw = safe_float(get_strategy_score(name, prev_i, curr_i, curr_close, mode=eval_mode), 0.0)
-        
-        if name == 'rsi' and safe_float(curr_i.get('rsi', 50)) > 75:
-            s_raw *= get_constrained_value('rsi_overbought_mult', eval_mode)
-            
-        if name == 'rsi' and safe_float(prev_i.get('rsi')) < 30 and tier not in ["Major", "Mid"]:
-            s_raw *= 1.1
-
-        if name == 'macd' and safe_float(curr_i.get('macd_h', 0)) <= 0:
-            s_raw *= get_constrained_value('macd_negative_mult', eval_mode)
-            
-        s = s_raw * vas_mult
-        
-        ema60_val = safe_float(curr_i.get('ema60', 0))
-        ema20_val = safe_float(curr_i.get('ema20', 0))
-        rsi_val = safe_float(curr_i.get('rsi', 50))
-        curr_vol_ratio = safe_float(curr_i.get('volume', 0)) / max(safe_float(curr_i.get('vol_sma', 1)), 0.0001)
-        ema20_slope = ema20_val - safe_float(prev_i.get('ema20', 0))
-        body_size = abs(curr_close - safe_float(curr_i.get('open', curr_close)))
-        upper_shadow = safe_float(curr_i.get('high', 0)) - max(curr_close, safe_float(curr_i.get('open', 0)))
-        
-        major_weak = get_constrained_value('major_weak_mult', eval_mode)
-        meme_bad   = get_constrained_value('meme_bad_mult', eval_mode)
-        
-        if tier == "Major":
-            rsi_floor = 50 if "BTC" in ticker else 55
-            if curr_close < ema60_val or curr_vol_ratio < 1.5 or ema20_slope <= 0 or rsi_val < rsi_floor:
-                s *= major_weak
-        elif any(m in ticker for m in ["DOGE", "SHIB", "PEPE"]):
-            obv_slope = safe_float(curr_i.get('obv', 0)) - safe_float(prev_i.get('obv', 0))
-            atr_val = safe_float(curr_i.get('ATR', 0))
-            atr_ratio = (atr_val / curr_close) * 100
-            dist_ema20 = abs(curr_close / ema20_val - 1) * 100
-            
-            if obv_slope <= 0 or curr_close < ema20_val or atr_ratio > 2.5 or upper_shadow > body_size * 2.0 or dist_ema20 > 2.5 or rsi_val < 55:
-                if eval_mode == "CLASSIC" and rsi_val > 35:
-                     s *= 0.1
-                else:
-                     s *= meme_bad
-                
-        if s_raw < 5.0 and name in ['macd', 'rsi', 'stochastics']:
-            s = -30.0 
-            
-        earned_score += (s * w)
-        total_w += w
-        valid_indicator_count += 1
-        
-    if total_w > 0.1 and (earned_score / total_w) >= 85.0:
-        foundation_mult *= (1.0 + get_constrained_value('sniper_boost', eval_mode))
-        
-    foundation_score = (earned_score / total_w) * foundation_mult
-    
-    if tier not in ["Major", "Mid"] and valid_indicator_count >= 2:
-        foundation_score *= get_constrained_value('alt_accel_mult', eval_mode)
-        
-    bonus_score = 0.0
-    cvd_improving = safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0))
-    
-    def calc_grad(v, t, w, md='DECREASE'):
-        df = abs(v - t)
-        if md == 'DECREASE': return 1.0 - (df/w) if t < v < t+w else (1.0 if v <= t else 0.0)
-        else: return 1.0 - (df/w) if t-w < v < t else (1.0 if v >= t else 0.0)
-
-    mtf_bonus_q   = get_constrained_value('mtf_bonus_q', eval_mode)
-    mtf_penalty_q = get_constrained_value('mtf_penalty_q', eval_mode)
-    wick_penalty  = get_constrained_value('wick_penalty', eval_mode)
-    
-    wick_ratio_major = get_constrained_value('wick_ratio_major', eval_mode)
-    wick_ratio_meme  = get_constrained_value('wick_ratio_meme', eval_mode)
-    bb_breakout_bonus = get_constrained_value('bb_breakout_bonus', eval_mode)
-    sma_align_bonus   = get_constrained_value('sma_align_bonus', eval_mode)
-    
-    if eval_mode == "QUANTUM" and mtf_trend == 1: bonus_score += mtf_bonus_q
-    if eval_mode == "QUANTUM" and mtf_trend == -1: bonus_score -= mtf_penalty_q
-    
-    body_size_b = abs(curr_close - safe_float(curr_i.get('open')))
-    upper_wick = safe_float(curr_i.get('high')) - max(curr_close, safe_float(curr_i.get('open')))
-    threshold_wick = body_size_b * wick_ratio_meme if is_meme else body_size_b * wick_ratio_major
-    
-    if upper_wick > max(threshold_wick, curr_close * 0.003): bonus_score -= wick_penalty
-    
-    if eval_mode == "QUANTUM":
-        bb_u = safe_float(curr_i.get('bb_u', curr_close * 1.05))
-        if curr_close >= bb_u: bonus_score += bb_breakout_bonus * min(1.0, ((curr_close-bb_u)/max(bb_u,0.0001))*100/3.0) * min(1.5, curr_vol_ratio)
-        sma_short = safe_float(curr_i.get('ema20', 0))
-        sma_long = safe_float(curr_i.get('ema60', 0))
-        if sma_short > sma_long and curr_close > sma_short:
-            slv = safe_float(curr_i.get('sma_long', 0))
-            bonus_score += sma_align_bonus * max(0.2, 1.0-(abs(curr_close-slv)/max(slv,0.0001)*100/4.0))
-
-    if eval_mode == "CLASSIC":
-        rsi_oversold_bonus = get_constrained_value('rsi_oversold_bonus', eval_mode)
-        sma_gap_bonus      = get_constrained_value('sma_gap_bonus', eval_mode)
-        cvd_bonus          = get_constrained_value('cvd_bonus', eval_mode)
-        
-        if rsi_val < 35: bonus_score += rsi_oversold_bonus * calc_grad(rsi_val, 25, 10, 'DECREASE')
-        sma_long_c = safe_float(curr_i.get('sma_long', 0))
-        if sma_long_c > 0:
-            gp = ((curr_close - sma_long_c)/sma_long_c)*100
-            if gp < -7.0: bonus_score += sma_gap_bonus * min(1.0, abs(gp+7.0)/10.0)
-        if cvd_improving: bonus_score += cvd_bonus
-
-    rsi_diff = safe_float(curr_i.get('rsi', 0)) - safe_float(prev_i.get('rsi', 0))
-    if tier in ["Major", "Mid"] and 0 < rsi_diff < 2.0:
-        bonus_score -= get_constrained_value('rsi_slope_penalty', eval_mode)
-        
-    osc_conv_alt = get_constrained_value('osc_conv_bonus_alt', eval_mode)
-    osc_conv_maj = get_constrained_value('osc_conv_bonus_maj', eval_mode)
-    
-    macd_conv = safe_float(curr_i.get('macd_h', 0)) > safe_float(prev_i.get('macd_h', 0))
-    if macd_conv and rsi_diff > 0:
-        bonus_score += osc_conv_alt if tier not in ["Major", "Mid"] else osc_conv_maj
-        
-    if curr_close > safe_float(curr_i.get('ema20', 0)):
-        bonus_score += get_constrained_value('sma_above_bonus', eval_mode, 0.0)
-        
-    sqz_alt = get_constrained_value('squeeze_bonus_alt', eval_mode, 1.19474)
-    sqz_maj = get_constrained_value('squeeze_bonus_maj', eval_mode, 4.471591)
-    if safe_float(curr_i.get('bb_bw', 0)) > safe_float(prev_i.get('bb_bw', 0)):
-        bonus_score += sqz_alt if tier not in ["Major", "Mid"] else sqz_maj
-
-    if tier == "Mid" and curr_close < safe_float(curr_i.get('ema20', 0)) * 1.005:
-        bonus_score -= get_constrained_value('mid_sma_penalty', eval_mode, 39.541297)
-
-    macd_val = safe_float(curr_i.get('macd', 0))
-    prev_macd = safe_float(prev_i.get('macd', 0))
-    if rsi_diff > 0 and macd_val < prev_macd:
-        bonus_score -= get_constrained_value('divergence_penalty', eval_mode, 1.63891)
-
-    st_val = safe_float(curr_i.get('ST_DIR', 0))
-    psar_val = safe_float(curr_i.get('psar', 0)) < curr_close
-    if tier not in ["Major", "Mid"]:
-        if st_val == 1 and psar_val:
-            bonus_score += get_constrained_value('st_psar_bonus', eval_mode, 18.514452)
-
-    bonus_impact = 1.0
-    if fgi_val >= 65 and tier in ["Major", "Mid"]:
-        bonus_impact = get_constrained_value('fgi_bonus_dampen', eval_mode, 0.416058)
-        
-    total_score = foundation_score + (bonus_score * bonus_impact)
-
-    if eval_mode == "QUANTUM":
-        cvd_val = safe_float(curr_i.get('cvd', 0))
-        if cvd_val < 0:
-            total_score -= get_constrained_value('cvd_penalty_q', eval_mode, 24.066655) * min(1.0, abs(cvd_val)/1000.0)
-    else:
-        cvd_val = safe_float(curr_i.get('cvd', 0))
-        if cvd_val < 0:
-            total_score -= get_constrained_value('cvd_penalty_c', eval_mode, 5.598171)
-        if safe_float(curr_i.get('cvd', 0)) < safe_float(prev_i.get('cvd', 0)):
-            total_score -= get_constrained_value('cvd_slope_penalty_c', eval_mode, 13.864037)
-        if curr_vol_ratio < 1.0:
-            total_score -= get_constrained_value('vol_ratio_penalty_c', eval_mode, 9.403461)
-
-    return round(max(0.0, min(100.0, total_score)), 1), fatal_reason, suggested_threshold, eval_mode
+# (STRAT_CONSTRAINTS is now imported from strategy_logic.py)
 
 # 🟢 [FIX: 슬리피지 수학 공식 교정] 원화(KRW)를 기준으로 몇 개의 코인을 샀는지 부피(Volume)를 역산하여 정확한 VWAP 산출
 async def calculate_expected_slippage(ticker, buy_amt_krw):
@@ -3251,7 +2754,7 @@ async def run_full_scan(is_deep_scan=False):
             if isinstance(curr, pd.Series): curr = curr.to_dict()
             if not isinstance(prev, dict) or not isinstance(curr, dict): continue
 
-            score_1st, fatal_1st, pass_cut_1st, mode_1st = await evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short["trend"], mtf_data=None)
+            score_1st, fatal_1st, pass_cut_1st, mode_1st = await evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short["trend"], mtf_data=None)
 
             if fatal_1st or score_1st < pass_cut_1st:
                 new_scan_data[t] = {"score": score_1st, "reason": fatal_1st if fatal_1st else "PASS", "price": safe_float(curr.get("close")), "mode": mode_1st, "mtf": "스킵 (기준미달)"}
@@ -3265,7 +2768,7 @@ async def run_full_scan(is_deep_scan=False):
         async def _fetch_mtf_and_eval(t, prev, curr, mode, pass_cut):
             mtf_res = await get_mtf_trend(t)
             # 2차 정밀 심사 (MTF 포함)
-            f_score, f_fatal, f_pass_cut, f_mode = await evaluate_coin_fundamental(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
+            f_score, f_fatal, f_pass_cut, f_mode = await evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
             return t, f_score, f_fatal, mtf_res, prev, curr, f_mode, f_pass_cut
 
         if passed_1st_stage:
@@ -3687,7 +3190,7 @@ async def send_score_debug_report():
             if not isinstance(p, dict) or not isinstance(c, dict): return None
             
             # 🟢 [적용 2] 디버그 모드 역시 단 한 줄로 압축 완료!
-            score, fatal_reason, sug_cut, mode = await evaluate_coin_fundamental(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
+            score, fatal_reason, sug_cut, mode = await evaluate_coin_fundamental_sync(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
             return {"t": t, "score": score, "fatal_reason": fatal_reason, "mode": mode}
             
     tasks = [fetch_and_score(t) for t in tickers]
@@ -3869,262 +3372,7 @@ async def handle_telegram_updates():
         
         await asyncio.sleep(0.5)
 
-# 🟢 [신규 추가] 매도 조건 검사 전용 모듈 (스파게티 코드 분리)
-def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score):
-    global STRAT, INDICATOR_CACHE, TRADE_DATA_DIRTY
-    
-    # 🟢 [Pylance/Flake8 방어] 변수 초기화 및 타입 안전성 확보
-    curr_p_rate = safe_float(p_rate, 0.0)
-    curr_ma_score = float(ma_live_score) if ma_live_score is not None else 80.0
-    scale_out_step = t.get('scale_out_step', 0)
-    
-    eval_mode = t.get('strategy_mode', 'QUANTUM')
-    
-    _ind_snap = INDICATOR_CACHE.get(ticker)
-    curr_i_safe = _ind_snap[2] if _ind_snap and len(_ind_snap) >= 3 else t.get('buy_ind', {})
-    macd_diff_val = curr_i_safe.get('macd_h_diff', 0) if curr_i_safe.get('macd_h_diff') is not None else 0
-    
-    exit_plan = t.get('exit_plan', {})
-    timeout_candles = exit_plan.get('timeout', get_dynamic_strat_value('timeout_candles', mode=eval_mode, default=8))
-    interval_str = STRAT.get('interval', 'minute15')
-    if interval_str.startswith('minute'):
-        interval_sec = int(interval_str.replace('minute', '')) * 60
-    else: interval_sec = 900
-    
-    elapsed_sec = now_ts - t.get('buy_ts', now_ts)
-    full_timeout_sec = timeout_candles * interval_sec
-    half_timeout_sec = full_timeout_sec / 2
-    micro_timeout_sec = interval_sec * 1
-    nano_timeout_sec = 300
-    
-    entry_score = safe_float(t.get('pass_score', 80), 80.0)
-    entry_atr = safe_float(t.get('entry_atr', 0))
-    target_atr_multiplier = exit_plan.get('target_atr_multiplier', 4.5)
-    
-    # [와이드 스코프] 다단계 목표가 및 모멘텀 판별 조건
-    if entry_score >= 90.0: target_atr_multiplier *= 1.2
-    base_tp_pct = (entry_atr * target_atr_multiplier / avg_p) * 100 if entry_atr > 0 and avg_p > 0 else 3.5
-    
-    tp_1 = max(1.2, base_tp_pct * 0.4)
-    tp_2 = base_tp_pct
-    tp_3 = base_tp_pct * 1.8
-    tp_4 = base_tp_pct * 3.0
-    is_momentum_bending = (macd_diff_val < 0)
-    
-    nano_timeout_sec = 300
-    
-    target_p_price = avg_p + (entry_atr * target_atr_multiplier)
-    target_p = ((target_p_price - avg_p) / avg_p) * 100 if avg_p > 0 else 999.0
-    
-    # 🟢 [수익성 패치] R:R Guard: 노이즈(Whipsaw)를 견디기 위해 손절 한도를 여유롭게 상향
-    raw_hard_s = exit_plan.get('stop_loss', -3.5) 
-    hard_s = max(raw_hard_s, -abs(target_p * 1.5))
 
-    # 🔵 [Batch 3 Trial 3] 손절 숨통 확보 (1.5 -> 2.0) (잔파동 견디기)
-    current_atr_mult = exit_plan.get('atr_mult', get_dynamic_strat_value('atr_multiplier_for_stoploss', mode=eval_mode, default=2.0))
-    
-    entry_rsi = t.get('buy_ind', {}).get('rsi', 50)
-    if entry_rsi >= 70.0:
-        current_atr_mult = min(current_atr_mult, 1.5) 
-
-    invested_high_krw = avg_p * 1.0005
-    earned_high_krw = t['high_p'] * 0.9995
-    max_p_rate = ((earned_high_krw - invested_high_krw) / invested_high_krw) * 100 if invested_high_krw > 0 else 0
-    
-    dynamic_mult = current_atr_mult
-    if max_p_rate >= 5.0: dynamic_mult = current_atr_mult * 0.3  
-    elif max_p_rate >= 3.0: dynamic_mult = current_atr_mult * 0.5
-    elif max_p_rate >= 1.0: dynamic_mult = current_atr_mult * 0.7
-        
-    atr_stop = t['high_p'] - (entry_atr * dynamic_mult)
-    # 🟢 [Final Run] 트레일링 스탑 여유 공간 확장 (2% -> 3.5%)
-    chandelier_stop = t['high_p'] * 0.965 if max_p_rate >= 3.0 else 0
-    stop_p = max(atr_stop, chandelier_stop)
-    
-    adaptive_buffer = exit_plan.get('adaptive_breakeven_buffer', 0.003) # 기본 0.3% 버퍼
-    
-    # 1. 기본 절대 손절선 세팅
-    stop_p = max(stop_p, avg_p + (avg_p * (hard_s / 100.0)))
-    if entry_atr == 0: stop_p = max(stop_p, avg_p * 0.98) 
-    if t.get('is_runner', False): stop_p = max(stop_p, avg_p * 1.007)
-
-    # 2. 🟢 다단계 바닥(Floor) 끌어올리기 (잔파동 휩소 방지 및 이익 극대화)
-    # 🔵 [Golden Balance] 이익 잠금(Profit Lock) 작동 시점 대폭 지연 (Let Winners Run)
-    hard_breakeven_floor = 0
-    if max_p_rate >= 4.0:
-        t['breakeven_locked'] = True
-        hard_breakeven_floor = avg_p * 1.025  # 4% 도달 시 최소 2.5% 이익 보존
-    elif max_p_rate >= 1.0:
-        t['breakeven_locked'] = True
-        hard_breakeven_floor = avg_p * 1.010  # 2.5% 도달 시 최소 1.0% 이익 보존
-    elif max_p_rate >= 1.0:
-        t['breakeven_locked'] = True
-        hard_breakeven_floor = avg_p * 1.002  # 1.5% 도달 시 본전(+0.2%)만 방어
-
-    # 3. 🟢 꺾이면 팔자 + 촘촘한 샹들리에 추적 (노이즈 허용 밴드 확장)
-    calculated_guard_p = 0
-    if t.get('breakeven_locked') or (t.get('guard') and max_p_rate > 1.5): 
-        # 🔵 [Golden Balance] 노이즈 허용 폭(Buffer) 대폭 상향 (2% -> 3.5%)
-        dynamic_buffer = 0.035 # 기본 버퍼 3.5%
-        
-        if max_p_rate >= 2.0:
-            # ATR의 2.5배만큼 하단 버퍼 설정 (고정 비율보다 정밀함)
-            atr_val = safe_float(t.get('entry_atr', 0))
-            if atr_val > 0:
-                atr_buffer_p = (atr_val * 2.5 / real_price)
-                dynamic_buffer = min(dynamic_buffer, atr_buffer_p)
-            
-        # 메이저는 변동성이 적으므로 버퍼를 10% 더 축소
-        if get_coin_tier(ticker, t.get('buy_ind', {})) == "Major":
-            dynamic_buffer *= 0.9
-            
-        # 🔵 [Batch 3 Trial 2] 고확신 진입건은 숨쉴 구멍을 더 준다 (+0.35%p 버퍼 완화)
-        if safe_float(t.get('pass_score', 0)) >= 88.0:
-            dynamic_buffer += 0.0035 
-            
-        calculated_guard_p = max(calculated_guard_p, t['high_p'] * (1 - dynamic_buffer))
-
-        # CLASSIC 역추세 모드는 고점 대비 '수익의 60% 반납' 시 탈출
-        if eval_mode == "CLASSIC" and max_p_rate >= 2.0:
-            chandelier_stop = t['high_p'] - ((t['high_p'] - avg_p) * 0.6)
-            calculated_guard_p = max(calculated_guard_p, chandelier_stop)
-
-    # 4. 최종 트레일링 스탑라인 설정
-    stop_p = max(stop_p, hard_breakeven_floor, calculated_guard_p)
-
-    # =========================================================================
-    # (Indicator snapshot/macd_diff moved to top)
-    is_fundamental_broken = False
-    if current_live_score is not None and ma_live_score < get_dynamic_strat_value('sell_score_threshold', mode=eval_mode, default=45):
-        # 🔵 [Batch 3 Trial 5] 메이저는 점수 하락 시 더 민감하게 탈출 (전용 버퍼 1.2배 축소)
-        atr_1x_pct = (entry_atr / avg_p) * 100 if avg_p > 0 else 1.5
-        bailout_mult = 0.8 if get_coin_tier(ticker, t.get('buy_ind', {})) == "Major" else 1.0
-        fundamental_bailout_limit = -max(0.5, min(3.0, atr_1x_pct * bailout_mult))
-        if (elapsed_sec > (interval_sec * 1.5) or curr_p_rate < fundamental_bailout_limit) and curr_p_rate < 0.0:
-            is_fundamental_broken = True
-    # =========================================================================
-
-    # 5. 🟢 시간 및 점수 기반 컷 (하락 한도 완화: 1.2 -> 2.0 ATR)
-    nano_drop_limit = -max(2.5, (entry_atr/avg_p)*100*2.0 if avg_p>0 else 3.0)
-    is_nano_failed = elapsed_sec > nano_timeout_sec and max_p_rate < 0.3 and curr_p_rate <= nano_drop_limit
-    
-    micro_cut_limit = -1.0 if macd_diff_val < 0 else -1.5
-    is_micro_failed = elapsed_sec > micro_timeout_sec and curr_p_rate <= micro_cut_limit
-    
-    is_sideways_decay = elapsed_sec > (interval_sec * 2) and abs(curr_p_rate) < 0.3 and macd_diff_val < 0
-
-    # =========================================================================
-    # 🟢 [모드별 철학 분리] CLASSIC(역추세) vs QUANTUM(추세추종)
-    
-    if eval_mode == "CLASSIC":
-        # [CLASSIC] 스나이퍼 모드: 눌림목은 반등의 폭이 크므로 더 큰 수익을 노린다.
-        tp_1 = max(2.5, target_p * 1.2)  
-        tp_2 = max(4.5, target_p * 2.0)  
-        
-        # 횡보 인내심 강화: 1시간(4.0캔들)까지는 지하실 파기를 견딘다.
-        is_sideways_decay = elapsed_sec > (interval_sec * 4.0) and abs(curr_p_rate) < 0.4 and macd_diff_val < -0.5
-    else:
-        # [QUANTUM] 추세 추종 모드
-        # 🔵 [5% Target Tuning] 익절 스케일링 강화
-        vol_idx = (safe_float(t.get('entry_atr', 0)) / max(1.0, avg_p)) * 100
-        tp_mult = 1.4 if vol_idx < 1.0 else (2.8 if vol_idx > 2.5 else 2.0)
-        
-        tp_1 = max(3.0, target_p * tp_mult)  
-        tp_2 = max(6.0, target_p * (tp_mult * 1.8))
-        
-        # 🔵 [Batch 2 Trial 2] Moon-Shot: 문턱값 하향 (90 ➡️ 88.0) (SOL 혜택권 진입)
-        if safe_float(t.get('pass_score', 0)) >= 88.0:
-            tp_1 *= 1.3 # 1.2 ➡️ 1.3배로 추가 상향
-            tp_2 *= 1.3
-            
-        # 🔵 [Gen-11 Trial 2] 메이저 종목은 목표 익절가를 1.1배 상향 (빠른 확정)
-        if get_coin_tier(ticker, t.get('buy_ind', {})) == "Major":
-            tp_1 *= 1.1
-            tp_2 *= 1.1
-            
-        # 🔵 [Batch 2 Trial 2] RSI 강세 시 익절 가속 미루기 (Hyper-TP)
-        # RSI가 60 이상에서 우상향 중(강세)이면 익절 타점을 1.1배 추가 확장
-        _ind_snap = INDICATOR_CACHE.get(ticker)
-        if _ind_snap and len(_ind_snap) >= 3:
-            prev_ii, curr_ii = _ind_snap[1], _ind_snap[2]
-            if safe_float(curr_ii.get('rsi', 0)) > 60 and safe_float(curr_ii.get('rsi', 0)) > safe_float(prev_ii.get('rsi', 0)):
-                tp_1 *= 1.1
-                tp_2 *= 1.1
-            
-        # [삭제] QUANTUM 모드에서 횡보 인내를 강제로 30분으로 줄여버리던 덮어쓰기 로직 삭제 (상단의 4시간 룰 적용)
-    safe_hard_s = max(hard_s, -3.5)
-    # =========================================================================
-
-    # 🔵 [Sector Recognition] 종목 티어 추출
-    tier = get_coin_tier(ticker, curr_i_safe)
-    
-    # 🟢 매도 조건 리스트
-    # 🔵 [Batch 2 Trial 3] RSI 과열 매도는 고점 대비 0.5% 되돌림 시에만 확정 (Holding 극대화)
-    is_rsi_overheated_drop = curr_i_safe.get('rsi', 50) >= 85 and curr_p_rate < max_p_rate - 0.5
-    
-    # 🔵 [흑자 전환 마취튜닝] 상처 부위가 곪기 전에 잘라내는 가혹한 초단기 한계 손절선!
-    is_failed_bounce = elapsed_sec > (interval_sec * 3.0) and curr_p_rate <= -0.8
-    early_hard_cut = elapsed_sec > (interval_sec * 1.5) and curr_p_rate <= -1.3
-    
-    # 🛡️ [Sector Resilience] 섹터별 최적화된 손절/시간 관리
-    is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
-    
-    # 밈코인은 -1.1%로 압착 손절, 대형주는 -1.0% 조기 손절, 일반은 -0.7% (정체 시)
-    stagnant_sl = -1.1 if is_meme else (-1.0 if (tier == "Major" and elapsed_sec > 3600) else (-0.7 if (elapsed_sec > 3600 and -0.5 < curr_p_rate < 0.5) else -1.5))
-
-    # 🚀 [Sector DNA Exit] 섹터별 1차 익절 타겟 설정 (Iter 12: DOGE 다이내믹 0.6% 하향)
-    if "BTC" in ticker:
-        tp_target = 1.0
-    elif "DOGE" in ticker:
-        # 도지는 0.5%만 올라와도 즉시 0.6%에서 익절 대기 (승률 극대화)
-        tp_target = 0.6 if max_p_rate >= 0.5 else 0.7
-    else:
-        tp_target = 0.7 if (is_meme or tier == "Small (High Vol)") else 1.5
-
-    sell_conditions = [
-        # 🛡️ [수익 보호] 1. 최종 마지노선 손절 (-1.5%) / Meme 전용 타이트 손절 (-1.0%)
-        (curr_p_rate <= (-1.0 if (is_meme or tier == "Small (High Vol)") else -1.5) or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
-        
-        # 🛡️ [Intelligence Pack] 지능형 조기 탈출
-        (is_fundamental_broken, "펀더멘탈 붕괴", 1.0, 0, "HIGH"),
-        (is_failed_bounce, "반등 실패", 1.0, 0, "HIGH"),
-        
-        # 🛡️ [Protection Pack] 초단기 리스크 차단 (early_hard_cut)
-        (early_hard_cut, "초단기 한계 손절", 1.0, 0, "HIGH"),
-
-        # 🚀 [Profit Sniper] 과열 꺾임 익절
-        (is_rsi_overheated_drop, "과열 꺾임 익절", 1.0, 0, "HIGH"),
-        
-        # 🛡️ [회전율 극대화] 2. 정체 구간 타이트 손절 (-0.7%)
-        (elapsed_sec > (3600 if curr_i_safe.get('rsi', 0) < 50 else 5400) and curr_p_rate <= -0.7, "자금회전 정체 손절", 1.0, 8, "NORMAL"),
-        
-        # 🛡️ [Protection DNA] 2.5. 조기 본절가 압착 방어 (Meme/Small 전용)
-        ((is_meme or tier == "Small (High Vol)") and max_p_rate >= 0.7 and curr_p_rate <= 0.1, "섹터 조기 본절 방어", 1.0, 9, "HIGH"),
-        
-        # 🚀 [수익 극대화] 3. 1차 익절 (50% 확보)
-        (curr_p_rate >= tp_target and scale_out_step == 0, f"1차 수익 확보({tp_target}%)", 0.5, 1, "NORMAL"),
-        
-        # 🚀 [Major 특화] 3.5. RSI 과열 홀딩
-        (tier == "Major" and curr_i_safe.get('rsi', 0) >= 75 and macd_diff_val > 0 and curr_p_rate > 1.0, "Major 추세 유지(HODL)", 0.0, 0, "LOW"),
-
-        # 🚀 [추세 추종] 4. 고점 이격 익절
-        (curr_p_rate >= 3.5 and macd_diff_val < 0, "추세 변곡 전량 익절", 1.0, 9, "HIGH"),
-        
-        # 🟢 [수익 보존 (Profit Guard)] 1.0% 도달 시 즉시 본절가+0.1%를 하한선으로 설정
-        (max_p_rate >= 1.0 and curr_p_rate < 0.1, "익절 보존 (Profit Guard)", 1.0, 0, "HIGH"),
-
-        # 🚀 [Flash-Response: Meme 전용] 0.8% 도달 시 즉시 +0.4% 하한선 설정
-        ((is_meme or tier == "Small (High Vol)") and max_p_rate >= 0.8 and curr_p_rate < 0.4, "Meme 수익 보존 (Flash)", 1.0, 0, "HIGH"),
-
-        # 🕘 [지능형 인내] 5. 평가시간 초과
-        (elapsed_sec > (interval_sec * (12.0 if "BTC" in ticker else (6.0 if tier in ["Major", "Mid"] else 4.0))) and curr_p_rate < 0.0, "평가시간 종료", 1.0, 0, "HIGH")
-    ]
-    for condition, reason, ratio, step, urgency_level in sell_conditions:
-        if condition:
-            # 조건 만족 시: is_sell, is_partial_sell, sell_qty_ratio, sell_reason_str, urgency, next_step
-            return True, (ratio != 1.0), ratio, reason, urgency_level, step
-            
-    return False, False, 0.0, "", "NORMAL", 0
 
 
 # 🟢 [수술 완료] 메인 감시 루프의 딜레이를 없애기 위한 백그라운드 매도 리포트 생성기
@@ -4520,7 +3768,7 @@ async def main():
                         if isinstance(prev_i, dict) and isinstance(curr_i, dict):
                             btc_short_trend = btc_short.get('trend', "혼조세")
                             # 🟢 [수정 완료] 코인에 내재된 eval_mode를 강제로 주입하여 잣대의 일관성 유지!
-                            current_live_score, _, _, _ = await evaluate_coin_fundamental(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=eval_mode)
+                            current_live_score, _, _, _ = await evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, current_regime_mode, fgi_val, btc_short_trend, force_eval_mode=eval_mode)
                     ma_live_score = current_live_score # 기본값
                     if current_live_score is not None:
                         score_hist = t.get('score_history', [])
@@ -4551,7 +3799,7 @@ async def main():
 
                     # 🟢 [수술 완료] 약 100줄의 매도 판별 스파게티 코드를 모듈화하여 단 3줄로 종결!
                     is_sell, is_partial_sell, sell_qty_ratio, sell_reason_str, urgency, next_step = evaluate_sell_conditions(
-                        ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score
+                        ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score, curr_i, STRAT
                     )
 
                     if is_sell or is_partial_sell:
@@ -4818,7 +4066,7 @@ class BacktestEngine:
             price = safe_float(curr_i.get('close'))
             
             # 점수 계산 (내부 함수 활용)
-            # evaluate_coin_fundamental은 비동기이므로 호출 방식주의 (여기서는 동기 래퍼 필요할 수 있음)
+            # evaluate_coin_fundamental_sync은 비동기이므로 호출 방식주의 (여기서는 동기 래퍼 필요할 수 있음)
             # 하지만 백그라운드 태스크 내부에서 asyncio.run 또는 직접 await 가능하도록 설계
             # OOS에서는 단순화를 위해 _run_sub_eval_sync 직접 호출 고려
             pass
@@ -4845,7 +4093,7 @@ class BacktestEngine:
             curr_i = df.iloc[i].to_dict()
             price = safe_float(curr_i.get('close'))
             
-            score, fatal, thr, _ = await evaluate_coin_fundamental(ticker, prev_i, curr_i, "HYBRID", 50, "상승", force_eval_mode=eval_mode)
+            score, fatal, thr, _ = await evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, "HYBRID", 50, "상승", force_eval_mode=eval_mode)
             
             if not in_pos and score >= thr and not fatal:
                 qty = (cash * 0.999) / price
