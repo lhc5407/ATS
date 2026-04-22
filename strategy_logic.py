@@ -60,8 +60,23 @@ class ScoringParams:
     major_weak_mult:     float = 0.20
     meme_bad_mult:       float = 0.01
 
-    # [E] 시스템 제어
+    # [E] 지표 가중치 (Weights)
+    w_zscore:        float = 2.5
+    w_macd:          float = 2.0
+    w_rsi:           float = 1.0
+    w_volume:        float = 2.0
+    w_st:            float = 1.5
+    w_bb:            float = 1.0
+    w_vwap:          float = 1.0
+    w_ssl:           float = 1.0
+    w_sma:           float = 1.0
+    w_ichimoku:      float = 1.0
+    w_obv:           float = 1.0
+
+    # [F] 시스템 제어 및 임계값
     pass_score_threshold: float = 85.0
+    rsi_high_thr:         float = 75.0
+    rsi_low_thr:          float = 30.0
 
     # [G] 수익 극대화 파라미터 (새로 추가)
     sniper_confluence_bonus: float = 45.0
@@ -489,8 +504,21 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
     logic_list = ['supertrend', 'vwap', 'rsi', 'bollinger', 'macd', 'volume', 'ssl_channel', 'sma_crossover', 'ichimoku', 'stochastics', 'obv']
     if mode == "QUANTUM": logic_list.append('bollinger_breakout')
     
-    # ??? (??? 1.0 ??)
-    weights = {} # ?? ? p_dict?? ?? ??
+    # [1] 가중치 맵핑 (p_dict 기반으로 동적 생성)
+    weights = {
+        "z_score":           get_constrained_value('w_zscore', p_dict, mode),
+        "macd":              get_constrained_value('w_macd', p_dict, mode),
+        "rsi":               get_constrained_value('w_rsi', p_dict, mode),
+        "volume":            get_constrained_value('w_volume', p_dict, mode),
+        "supertrend":        get_constrained_value('w_st', p_dict, mode),
+        "bollinger":         get_constrained_value('w_bb', p_dict, mode),
+        "vwap":              get_constrained_value('w_vwap', p_dict, mode),
+        "ssl_channel":       get_constrained_value('w_ssl', p_dict, mode),
+        "sma_crossover":     get_constrained_value('w_sma', p_dict, mode),
+        "ichimoku":          get_constrained_value('w_ichimoku', p_dict, mode),
+        "obv":               get_constrained_value('w_obv', p_dict, mode),
+        "bollinger_breakout": 1.0 # 고정 보너스 성격
+    }
     
     curr_close = safe_float(curr_i.get('close'))
     curr_vol = safe_float(curr_i.get('volume'))
@@ -536,8 +564,8 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
         
         s_raw = get_strategy_score(name, prev_i, curr_i, curr_close, mode=mode)
         
-        # ?? ??
-        if name == 'rsi' and safe_float(curr_i.get('rsi', 50)) > 75:
+        # 지표별 조건 (임계값 가변화)
+        if name == 'rsi' and safe_float(curr_i.get('rsi', 50)) > get_constrained_value('rsi_high_thr', p_dict, mode):
             s_raw *= get_constrained_value('rsi_overbought_mult', p_dict, mode)
         if name == 'macd' and safe_float(curr_i.get('macd_h', 0)) <= 0:
             s_raw *= get_constrained_value('macd_negative_mult', p_dict, mode)

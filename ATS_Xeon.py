@@ -75,10 +75,10 @@ You are the "Strategic Investment Council" of ATS-Classic, an elite quantitative
 3. Risk Auditor (The Skeptic): Challenges the entry. Actively looks for volume traps, declining CVD, or lack of support levels. Acts as the "Devil's Advocate".
 4. Portfolio Manager: Synthesizes all opinions. Makes the final 'decision', 'score', and 'exit_plan'.
 [STRATEGIC FOCUS - SWEET SPOT]:
-1. ENTRY THRESHOLD: We target high-conviction setups over 85 points. Quality over quantity.
+1. ENTRY THRESHOLD: We target high-conviction setups over a dynamic score threshold (configured in settings). Quality over quantity.
 2. SECTOR DNA:
-  - MAJOR: Value trend persistence. Aim for 1.3% initial profit. Don't fear the 'Overbought' zone if the MACD slope is strong.
-  - MEME (DOGE, SHIB, PEPE): Extreme caution with 'Upper Shadows'. High resolution entry required (91+ score context). Quick profit-taking (0.9%) is mandatory.
+  - MAJOR: Value trend persistence. Aim for ATR-adaptive profit targets. Don't fear the 'Overbought' zone if the MACD slope is strong.
+  - MEME (DOGE, SHIB, PEPE): Extreme caution with 'Upper Shadows'. High resolution entry required. Quick profit-taking using tighter ATR multipliers is mandatory.
 3. DEFENSE: Treat Negative CVD Slope or weak volume ratio (<1.1x) as a 'Fake-out'. Penalize these stringently.
 [ABSOLUTE RULES]:
 1. OUTPUT FORMAT: You MUST output ONLY valid JSON.
@@ -98,10 +98,10 @@ You are the "Strategic Investment Council" of ATS-Quantum, an elite quantitative
 3. Risk Auditor (The Skeptic): Warns about "Blow-off Tops" or overextended RSI (>70). Validates the 'is_pullback_zone' safety.
 4. Portfolio Manager: Synthesizes the council's debate. Makes the final 'decision', 'score', and 'exit_plan'.
 [STRATEGIC FOCUS - SWEET SPOT]:
-1. ENTRY THRESHOLD: Elite trend captures > 85 points only. 
+1. ENTRY THRESHOLD: Elite trend captures only based on configured dynamic threshold.
 2. SECTOR DNA: 
-  - MAJOR: "Let Winners Run". Use RSI Slope based holding. Target 1.3% for stability.
-  - MEME: Sniper logic only. 91+ score context. 0.9% take-profit to avoid 'Wick Washouts'.
+  - MAJOR: "Let Winners Run". Use RSI Slope based holding. Target ATR-adaptive profits for stability.
+  - MEME: Sniper logic only. High score context required. Take-profit based on volatility (ATR) to avoid 'Wick Washouts'.
 3. LIQUIDITY DEFENSE: Check CVD ratio against Volume SMA. If buyers are passive (Negative CVD), it is a 'Liquidity Trap'.
 [ABSOLUTE RULES]:
 1. OUTPUT FORMAT: You MUST output ONLY valid JSON.
@@ -299,6 +299,11 @@ def get_strat_for_mode(mode="QUANTUM"):
     return CLASSIC_STRAT
   return QUANTUM_STRAT
 def get_dynamic_strat_value(key, mode=None, default=None, ticker=None):
+  # 0. OPTIMIZED_PARAMS(ScoringParams) 우선 확인
+  from dataclasses import asdict
+  opt_dict = asdict(OPTIMIZED_PARAMS)
+  if key in opt_dict: return opt_dict[key]
+  
   if ticker:
     dna = STRAT.get('ticker_dna', {}).get(ticker, {})
     if key in dna: return dna[key]
@@ -1406,7 +1411,27 @@ def generate_strategy_context_briefing(eval_mode: str) -> str:
   # 4.  (Mean Reversion) 민감 
   rsi_bon = safe_float(get_dynamic_strat_value('rsi_oversold_bonus', eval_mode, 41.2))
   if rsi_bon > 30.0 and eval_mode == "CLASSIC":
-    briefing.append("- DEEP DIP CATCHER: High reward for extreme oversold conditions (RSI < 30). Look for signs of selling exhaustion and immediate V-shape recovery potential.")
+    briefing.append("- DEEP DIP CATCHER: High reward for extreme oversold conditions. Look for signs of selling exhaustion.")
+
+  # 5. [신규] 수익 극대화 기조 (Profit Maximization Stance)
+  tp_mult = safe_float(get_dynamic_strat_value('tp_atr_mult', eval_mode, 4.5))
+  sl_mult = safe_float(get_dynamic_strat_value('sl_atr_mult', eval_mode, 2.0))
+  if tp_mult > 5.0:
+    briefing.append(f"- AGGRESSIVE PROFIT TARGETING: TP multiplier is high ({tp_mult}x ATR). We are looking for big trend runs.")
+  else:
+    briefing.append(f"- CONSERVATIVE SCALPING: TP multiplier is moderate ({tp_mult}x ATR). Prioritize securing profit quickly.")
+  
+  briefing.append(f"- RISK TOLERANCE: Dynamic SL is set at {sl_mult}x ATR.")
+
+  # 6. [신규] 진입 엄격도 (Entry Strictness)
+  pass_thr = safe_float(get_dynamic_strat_value('pass_score_threshold', eval_mode, 80.0))
+  briefing.append(f"- ENTRY QUALITY CONTROL: Target score threshold is {pass_thr}. Only high-conviction setups allowed.")
+
+  # 7. [신규] 스나이퍼 보너스 (Sniper Boost)
+  sniper_bon = safe_float(get_dynamic_strat_value('sniper_confluence_bonus', eval_mode, 45.0))
+  if sniper_bon > 50.0:
+    briefing.append(f"- SNIPER MODE ACTIVE: High bonus ({sniper_bon}) for perfect RSI+BB+CVD confluence entries.")
+
   return "\n".join(briefing)
 def _smooth_parameter_update(old_val: float, new_val: float, learning_rate: float = 0.3) -> float:
   """

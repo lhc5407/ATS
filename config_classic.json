@@ -183,6 +183,19 @@
         "step_up_l1_atr": 1.5,
         "step_up_l2_atr": 3.0,
         "vol_adj_mult_high": 1.2,
-        "vol_adj_mult_low": 0.8
+        "vol_adj_mult_low": 0.8,
+        "w_zscore": 2.5,
+        "w_macd": 2.0,
+        "w_rsi": 1.0,
+        "w_volume": 2.0,
+        "w_st": 1.5,
+        "w_bb": 1.0,
+        "w_vwap": 1.0,
+        "w_ssl": 1.0,
+        "w_sma": 1.0,
+        "w_ichimoku": 1.0,
+        "w_obv": 1.0,
+        "rsi_high_thr": 75.0,
+        "rsi_low_thr": 30.0
     }
 }
