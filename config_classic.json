@@ -176,6 +176,13 @@
         "cvd_penalty_q": 24.066655,
         "cvd_penalty_c": 5.598171,
         "cvd_slope_penalty_c": 13.864037,
-        "vol_ratio_penalty_c": 9.403461
+        "vol_ratio_penalty_c": 9.403461,
+        "sniper_confluence_bonus": 45.0,
+        "tp_atr_mult": 4.5,
+        "sl_atr_mult": 2.0,
+        "step_up_l1_atr": 1.5,
+        "step_up_l2_atr": 3.0,
+        "vol_adj_mult_high": 1.2,
+        "vol_adj_mult_low": 0.8
     }
 }
