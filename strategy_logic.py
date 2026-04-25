@@ -23,122 +23,80 @@ class ScoringParams:
     점수 계산 방정식에서 조정 가능한 모든 파라미터.
     """
     # [A] 파운데이션 승수
-    foundation_mult_q:   float = 2.20
-    foundation_mult_c:   float = 1.05
-    sniper_boost:        float = 0.03
+    foundation_mult_q:   float = 0.5
+    foundation_mult_c:   float = 3.684
+    sniper_boost:        float = 0.016
 
     # [B] 보너스 / 패널티
-    mtf_bonus_q:         float = 25.0
-    mtf_penalty_q:       float = 40.0
-    wick_penalty:        float = 55.0
-    wick_ratio_major:    float = 1.5
-    wick_ratio_meme:     float = 1.0
-    bb_breakout_bonus:   float = 55.0
-    sma_align_bonus:     float = 35.0
-    rsi_oversold_bonus:  float = 55.0
-    sma_gap_bonus:       float = 30.0
-    cvd_bonus:           float = 25.0
-    osc_conv_bonus_alt:  float = 15.0
-    osc_conv_bonus_maj:  float = 8.5
-    sma_above_bonus:     float = 5.0
-    squeeze_bonus_alt:   float = 12.0
-    squeeze_bonus_maj:   float = 5.0
-    st_psar_bonus:       float = 15.0
-    mid_sma_penalty:     float = 20.0
-    rsi_slope_penalty:   float = 15.0
-    divergence_penalty:  float = 15.0
-    fgi_bonus_dampen:    float = 0.80
+    mtf_bonus_q:         float = 0.0
+    mtf_penalty_q:       float = 0.0
+    wick_penalty:        float = 108.115
+    wick_ratio_major:    float = 0.641
+    wick_ratio_meme:     float = 1.715
+    bb_breakout_bonus:   float = 80.422
+    sma_align_bonus:     float = 59.2
+    rsi_oversold_bonus:  float = 0.0
+    sma_gap_bonus:       float = 0.0
+    cvd_bonus:           float = 0.0
+    osc_conv_bonus_alt:  float = 46.195
+    osc_conv_bonus_maj:  float = 27.696
+    sma_above_bonus:     float = 30.255
+    squeeze_bonus_alt:   float = 83.595
+    squeeze_bonus_maj:   float = 0.0
+    st_psar_bonus:       float = 3.353
+    mid_sma_penalty:     float = 32.793
+    rsi_slope_penalty:   float = 0.0
+    divergence_penalty:  float = 102.205
+    fgi_bonus_dampen:    float = 0.259
 
     # [C] 티어 승수
-    vas_mult_major:      float = 1.08
-    vas_mult_mid:        float = 1.05
-    alt_accel_mult:      float = 1.15
+    vas_mult_major:      float = 0.1
+    vas_mult_mid:        float = 8.0
+    alt_accel_mult:      float = 2.621
 
     # [D] 지표별 감쇄/승수
-    rsi_overbought_mult: float = 0.50
-    macd_negative_mult:  float = 0.60
-    major_weak_mult:     float = 0.20
-    meme_bad_mult:       float = 0.01
+    rsi_overbought_mult: float = 0.571
+    macd_negative_mult:  float = 3.937
+    major_weak_mult:     float = 3.009
+    meme_bad_mult:       float = 3.838
 
     # [E] 지표 가중치 (Weights)
-    w_zscore:        float = 2.5
-    w_macd:          float = 2.0
-    w_rsi:           float = 1.0
-    w_volume:        float = 2.0
-    w_st:            float = 1.5
-    w_bb:            float = 1.0
-    w_vwap:          float = 1.0
-    w_ssl:           float = 1.0
-    w_sma:           float = 1.0
-    w_ichimoku:      float = 1.0
-    w_obv:           float = 1.0
+    w_zscore:        float = 0.747
+    w_macd:          float = 0.0
+    w_rsi:           float = 0.763
+    w_volume:        float = 9.932
+    w_st:            float = 0.0
+    w_bb:            float = 0.357
+    w_vwap:          float = 0.0
+    w_ssl:           float = 2.032
+    w_sma:           float = 0.0
+    w_ichimoku:      float = 15.0
+    w_obv:           float = 0.0
 
     # [F] 시스템 제어 및 임계값
-    pass_score_threshold: float = 85.0
-    rsi_high_thr:         float = 75.0
-    rsi_low_thr:          float = 30.0
+    pass_score_threshold: float = 83.586
+    rsi_high_thr:         float = 50.0
+    rsi_low_thr:          float = 5.0
 
     # [G] 수익 극대화 파라미터 (새로 추가)
-    sniper_confluence_bonus: float = 45.0
-    tp_atr_mult:             float = 4.5
-    sl_atr_mult:             float = 2.0
-    step_up_l1_atr:          float = 1.5
-    step_up_l2_atr:          float = 3.0
-    vol_adj_mult_high:       float = 1.2
-    vol_adj_mult_low:        float = 0.8
-    vol_multiple_small:    float = 2.2
-    vol_multiple_major:    float = 1.5
-    cvd_penalty_q:         float = 20.0
-    cvd_penalty_c:         float = 8.0
-    cvd_slope_penalty_c:   float = 12.0
-    vol_ratio_penalty_c:   float = 10.0
-    
-    # 임계점수 (Optimizer에서 사용)
-    pass_score_threshold:  float = 85.0
+    sniper_confluence_bonus: float = 137.68
+    tp_atr_mult:             float = 0.5
+    sl_atr_mult:             float = 0.5
+    step_up_l1_atr:          float = 4.424
+    step_up_l2_atr:          float = 10.896
+    vol_adj_mult_high:       float = 2.693
+    vol_adj_mult_low:        float = 0.53
+    vol_multiple_small:    float = 16.17
+    vol_multiple_major:    float = 2.413
+    cvd_penalty_q:         float = 186.787
+    cvd_penalty_c:         float = 207.024
+    cvd_slope_penalty_c:   float = 0.0
+    vol_ratio_penalty_c:   float = 236.148
 
 
 # ── [최적화 파라미터] ────────────────────────────────────────────────────────
 # Optimizer를 통해 발굴된 최적 파라미터 세트. 모든 엔진의 기본값으로 사용됩니다.
-OPTIMIZED_PARAMS = ScoringParams(
-    foundation_mult_q=5.745365,
-    foundation_mult_c=0.515967,
-    sniper_boost=0.256428,
-    mtf_bonus_q=119.359476,
-    mtf_penalty_q=0.0,
-    wick_penalty=1.358166,
-    wick_ratio_major=0.0,
-    wick_ratio_meme=5.380842,
-    bb_breakout_bonus=0.0,
-    sma_align_bonus=174.09733,
-    rsi_oversold_bonus=90.583499,
-    sma_gap_bonus=0.0,
-    cvd_bonus=33.25972,
-    osc_conv_bonus_alt=27.550317,
-    osc_conv_bonus_maj=10.70363,
-    sma_above_bonus=46.002768,
-    squeeze_bonus_alt=17.967481,
-    squeeze_bonus_maj=7.02649,
-    st_psar_bonus=3.821377,
-    mid_sma_penalty=42.2882,
-    rsi_slope_penalty=1.829236,
-    divergence_penalty=47.594633,
-
-    fgi_bonus_dampen=1.840189,
-    vas_mult_major=0.458731,
-    vas_mult_mid=2.209255,
-    alt_accel_mult=2.86511,
-    rsi_overbought_mult=0.373925,
-    macd_negative_mult=1.062502,
-    major_weak_mult=0.866446,
-    meme_bad_mult=1.364843,
-    vol_multiple_small=3.77695,
-    vol_multiple_major=2.347211,
-    cvd_penalty_q=93.156509,
-    cvd_penalty_c=42.417935,
-    cvd_slope_penalty_c=0.0,
-    vol_ratio_penalty_c=34.79928,
-    pass_score_threshold=85.0
-)
+OPTIMIZED_PARAMS = ScoringParams()
 
 # ── [전역 상수] ───────────────────────────────────────────────────────────────
 GLOBAL_COMMISSION     = 0.0005     # 0.05%
@@ -245,11 +203,36 @@ def _calculate_ta_indicators_sync(df: pd.DataFrame, btc_df: pd.DataFrame = None,
     if df is None or len(df) < 50: return df
     p = strat_params or {}
     
+
+    
     # 기본 지표
     df['ATR'] = df.ta.atr(length=p.get('atr_len', 14))
     st = df.ta.supertrend(length=p.get('st_len', 20), multiplier=p.get('st_mult', 3.0))
     if st is not None: df['ST_DIR'] = st.iloc[:, 1]
+    # EMA
+    df['ema20'] = df.ta.ema(length=20)
+    df['ema60'] = df.ta.ema(length=60)
+    df['sma_short'] = df.ta.sma(length=5)
     
+    # Z-Score
+    df['sma_50'] = df.ta.sma(length=50)
+    df['std_50'] = df['close'].rolling(window=50).std()
+    df['z_score'] = (df['close'] - df['sma_50']) / (df['std_50'] + 0.0001)
+    
+    # SSL Channel
+    ssl_len = p.get('ssl_len', 70)
+    sma_h, sma_l = df.ta.sma(close=df['high'], length=ssl_len), df.ta.sma(close=df['low'], length=ssl_len)
+    df['c'] = np.where(df['close'] > sma_h, 1, np.where(df['close'] < sma_l, -1, np.nan))
+    df['d'] = pd.Series(df['c']).ffill().fillna(1)
+    df['ssl_up'], df['ssl_down'] = np.where(df['d'] == 1, sma_h, sma_l), np.where(df['d'] == 1, sma_l, sma_h)
+    
+    # Relative Strength (RS)
+    if btc_df is not None and not btc_df.empty:
+        df['rs'] = ((df['close'].pct_change() - btc_df['close'].pct_change()) * 100).fillna(0)
+    else:
+        df['rs'] = 0
+    
+    # VWAP
     df['vwap'] = df.ta.vwap()
     df['vol_sma'] = df['volume'].rolling(window=20).mean()
     
@@ -534,9 +517,9 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
     rsi_live = safe_float(curr_i.get('rsi', curr_i.get('RSI', 50)))
     
     # BTC 추세 체크 (인자로 전달받은 btc_short 활용)
-    btc_trend = btc_short.get('trend', 0) if isinstance(btc_short, dict) else 0
-    if btc_trend == -1:
-        fatal_reason = "BTC 역추세"
+    btc_trend = btc_short.get('trend', "") if isinstance(btc_short, dict) else ""
+    if "하락" in btc_trend:
+        fatal_reason = "BTC 단기 하락(역추세)"
     
     # [참고] ATR/atr 대소문자 모두 대응
     atr_val = safe_float(curr_i.get('atr', curr_i.get('ATR', 0)))

@@ -648,7 +648,7 @@ async def api_trade_manual(request: Request):
       await record_trade_db(ticker, 'BUY', cur_p, qty, profit_krw=0, reason="[대시보드 수동매수]", status="ENTERED", pass_score=manual_score, strategy_mode=eval_m) 
       # 어 라미터 미리 계산
       dummy_curr = {'close': cur_p, 'ATR': 0, 'volume': 0} # 단가 기 최소 보
-      t_params = get_coin_tier_params(ticker, dummy_curr, eval_mode=eval_m)
+      t_params = get_coin_tier_params(ticker, dummy_curr, start_config=get_strat_for_mode(eval_m))
       #  [버그 스] 메인 진(evaluate_sell_conditions) 구 는 벽 규격 로 주입
       trade_data[ticker] = {
         'high_p': cur_p, 
@@ -745,7 +745,7 @@ async def api_post_settings(data: SettingsUpdate):
       STRAT["base_trade_amount"] = data.base_trade_amount
       STRAT["max_slippage_pct"] = data.max_slippage_pct
     if 'CLASSIC_STRAT' in globals() and isinstance(CLASSIC_STRAT, dict):
-      CLASSIC_STRAT["max_concurrent_trades"] = data.max_concurrent_trades
+      CLASSIC_STRAT["max_concurrenta_trades"] = data.max_concurrent_trades
       CLASSIC_STRAT["base_trade_amount"] = data.base_trade_amount
       CLASSIC_STRAT["max_slippage_pct"] = data.max_slippage_pct
       logging.info("🌐 웹 대시보드(Settings)에서 봇의 핵심 파라미터가 실시간 오버라이드 되었습니다.")
@@ -802,32 +802,7 @@ def robust_clean(data):
   else: return data
 from typing import Any # 일  에 추 시거나 기 어 니 
 #  [ 규 추 ] 비 KRW 마켓   위(Tick Size) 계산
-def get_upbit_tick_size(price):
-  """업비트 KRW 마켓의 최신 호가 규격을 반영합니다. (2024년 기준)"""
-  if price >= 2000000: return 1000.0
-  elif price >= 1000000: return 500.0
-  elif price >= 500000: return 100.0
-  elif price >= 100000: return 50.0
-  elif price >= 10000: return 10.0
-  elif price >= 1000: return 1.0
-  elif price >= 100: return 0.1
-  elif price >= 10: return 0.01
-  elif price >= 1: return 0.001
-  else: return 0.0001
-#  [Pylance 벽 방어] Any  을 명시 여 Pylance 탐 강제 재 니 
-def safe_float(val: Any, default: float = 0.0) -> float:
-  if val is None:
-    return float(default)
-  try:
-    return float(val)
-  except (ValueError, TypeError):
-    #  AI가 '-1.5%' 처럼 기호 어 는 경우 자  마이 스 추출 여 변 합 다.
-    cleaned_val = re.sub(r'[^0-9.\-]', '', str(val))
-    if cleaned_val and cleaned_val != '-':
-      try: return float(cleaned_val)
-      except (ValueError, TypeError): return float(default)
-    return float(default)
-#  [개선 로직]  아 15초로 장  러  름) 출력 기능 추 
+
 async def send_msg(text):
   if not text: return
   text_str = str(text)
@@ -1141,13 +1116,6 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
     return df.iloc[-2], df.iloc[-1]
   except Exception as e:
     logging.error(f"지표 계산 오류: {e}")
-    return None, None
-    if not isinstance(strat_params, dict):
-      strat_params = {}
-    if btc_df is not None and not isinstance(btc_df, pd.DataFrame):
-      btc_df = None
-    df['ATR'] = df.ta.atr(length=strat_params.get('atr_len', 14))
-    df['ATR'] = df['ATR'].fillna(0).replace([np.inf, -np.inf], 0)
     st = df.ta.supertrend(length=strat_params.get('st_len', 20), multiplier=strat_params.get('st_mult', 3.0))
     if st is None or (isinstance(st, pd.DataFrame) and st.empty): 
       return None, None
@@ -1232,31 +1200,8 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
 INDICATOR_CACHE, INDICATOR_CACHE_SEC = {}, 60 
 OHLCV_CACHE = {} 
 BALANCE_CACHE, BALANCE_CACHE_SEC = {"data": None, "timestamp": 0}, 10
-#   [4 계: 략 기조 브리 성 (AI Alignment)]  
-def generate_strategy_context_briefing(eval_mode: str) -> str:
-  """
-    현재 설정된 핵심 파라미터(STRAT_CONSTRAINTS 및 config.json)를 AI가 이해할 수 있는 '영어 자연어'로 번역합니다.
-    이 브리핑은 AI의 프롬프트에 주입되어, 봇의 수치적 기조와 AI의 정성적 판단을 동기화시킵니다.
-  """
-  briefing = ["[CURRENT STRATEGY STANCE & PARAMETER BIAS]"]
-  wick_val = get_constrained_value('wick_penalty', eval_mode)
-  if wick_val > 50.0:
-    briefing.append(f"- EXTREME WICK PENALTY ({wick_val}): The system heavily penalizes upper shadows (wicks). If the candle shape is unstable or shows strong rejection at the top, you MUST REJECT (SKIP) the trade.")
-  mtf_pen = get_constrained_value('mtf_penalty_q', eval_mode)
-  mtf_bon = get_constrained_value('mtf_bonus_q', eval_mode)
-  if mtf_pen > 25.0:
-    briefing.append("- MACRO TREND STRICTNESS: High penalty for trading against the 1H/4H trend. Ensure the macro trend is NOT bearish.")
-  if mtf_bon > 25.0:
-    briefing.append("- MACRO TREND RIDING: Huge bonus for aligning with the macro trend. Aggressively look for trend-aligned entries.")
-  if eval_mode == "QUANTUM":
-    bb_bon = get_constrained_value('bb_breakout_bonus', eval_mode)
-    if bb_bon > 60.0:
-      briefing.append("- AGGRESSIVE BREAKOUT HUNTER: Prioritize explosive momentum and Bollinger Band breakouts.")
-  else:
-    rsi_bon = get_constrained_value('rsi_oversold_bonus', eval_mode)
-    if rsi_bon > 35.0:
-      briefing.append("- DEEP DIP CATCHER: Prioritize extreme oversold conditions and immediate reversal signs.")
-  return "\n".join(briefing)
+#   [4단계: 전략 기조 브리핑 생성 (AI Alignment)]  
+# (구버전 중복 제거됨, 1358행의 고도화된 버전 사용)
 async def get_indicators(ticker):
   global INDICATOR_CACHE, OHLCV_CACHE
   now = time.time()
@@ -2109,7 +2054,7 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
       final_buy_price = safe_float(coin_info.get('avg_buy_price')) if coin_info and safe_float(coin_info.get('avg_buy_price')) > 0 else safe_float(await execute_upbit_api(pyupbit.get_current_price, ticker))
       now_ts = time.time()
       last_buy_time[ticker], last_global_buy_time = now_ts, now_ts
-      tier_params = get_coin_tier_params(ticker, curr_data, eval_mode=eval_mode)
+      tier_params = get_coin_tier_params(ticker, curr_data, strat_config=get_strat_for_mode(eval_mode))
       if not exit_plan:
         atr_pct_val = (curr_data.get('ATR', 0) / curr_data.get('close', 1)) * 100
         target_mult = tier_params.get('target_atr_multiplier', 4.5)
@@ -2230,7 +2175,7 @@ async def run_full_scan(is_deep_scan=False):
       if isinstance(prev, pd.Series): prev = prev.to_dict()
       if isinstance(curr, pd.Series): curr = curr.to_dict()
       if not isinstance(prev, dict) or not isinstance(curr, dict): continue
-      score_1st, fatal_1st, pass_cut_1st, mode_1st = await evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short["trend"], mtf_data=None)
+      score_1st, fatal_1st, pass_cut_1st, mode_1st = evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short["trend"], mtf_data=None)
       if fatal_1st or score_1st < pass_cut_1st:
         new_scan_data[t] = {"score": score_1st, "reason": fatal_1st if fatal_1st else "PASS", "price": safe_float(curr.get("close")), "mode": mode_1st, "mtf": "스킵 (기준미달)"}
         continue
@@ -2240,7 +2185,7 @@ async def run_full_scan(is_deep_scan=False):
     async def _fetch_mtf_and_eval(t, prev, curr, mode, pass_cut):
       mtf_res = await get_mtf_trend(t)
       #  2   사 (MTF 함)
-      f_score, f_fatal, f_pass_cut, f_mode = await evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
+      f_score, f_fatal, f_pass_cut, f_mode = evaluate_coin_fundamental_sync(t, prev, curr, current_regime_mode, fgi_val, btc_short['trend'], force_eval_mode=mode, mtf_data=mtf_res)
       return t, f_score, f_fatal, mtf_res, prev, curr, f_mode, f_pass_cut
     if passed_1st_stage:
       mtf_tasks = [_fetch_mtf_and_eval(*args) for args in passed_1st_stage]
@@ -2577,7 +2522,7 @@ async def send_score_debug_report():
       if isinstance(c, pd.Series): c = c.to_dict()
       if not isinstance(p, dict) or not isinstance(c, dict): return None
       #  [ 용 2] 버 모드  줄로 축 료!
-      score, fatal_reason, sug_cut, mode = await evaluate_coin_fundamental_sync(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
+      score, fatal_reason, sug_cut, mode = evaluate_coin_fundamental_sync(t, p, c, current_regime_mode, fgi_val, btc_short['trend'])
       return {"t": t, "score": score, "fatal_reason": fatal_reason, "mode": mode}
   tasks = [fetch_and_score(t) for t in tickers]
   results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -2888,7 +2833,7 @@ async def main():
         else:
           curr_ind_dict = curr_ind_raw if isinstance(curr_ind_raw, dict) else curr_ind_raw.to_dict()
         real_atr = curr_ind_dict.get('ATR', avg_p * 0.02) if curr_ind_dict else (avg_p * 0.02)
-        tier_params = get_coin_tier_params(t, curr_ind_dict) if curr_ind_dict else STRAT.get('major_params', {})
+        tier_params = get_coin_tier_params(t, curr_ind_dict, strat_config=get_strat_for_mode(initial_eval_mode))
         #  [ 양 로직 개선] 재 장 황 맞춰 strategy_mode 결정
         initial_eval_mode = "QUANTUM" if safe_float(curr_ind_dict.get('adx')) > 25 else "CLASSIC"
         if "Classic" in SYSTEM_STATUS: initial_eval_mode = "CLASSIC"
@@ -3037,8 +2982,11 @@ async def main():
                     analyze_payload = {
                         'pass_score': t_data.get('pass_score', 0),
                         'strategy_mode': eval_mode,
-                        'buy_reason': t_data.get('buy_reason', ''),
-                        'indicators': curr_ind
+                        'original_buy_reason': t_data.get('buy_reason', ''),
+                        'original_exit_plan': t_data.get('exit_plan', {}),
+                        'buy_ind': t_data.get('buy_ind', {}),
+                        'sell_ind': curr_ind,
+                        'actual_sell_reason': reason
                     }
                     asyncio.create_task(background_sell_report(ticker, real_price, sell_qty, p_krw, p_rate, reason, analyze_payload))
                     
@@ -3155,7 +3103,7 @@ class BacktestEngine:
       prev_i = df.iloc[i-1].to_dict()
       curr_i = df.iloc[i].to_dict()
       price = safe_float(curr_i.get('close'))
-      score, fatal, thr, _ = await evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, "HYBRID", 50, "상승", force_eval_mode=eval_mode)
+      score, fatal, thr, _ = evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, "HYBRID", 50, "상승", force_eval_mode=eval_mode)
       if not in_pos and score >= thr and not fatal:
         qty = (cash * 0.999) / price
         cash -= (qty * price * 1.0005)
