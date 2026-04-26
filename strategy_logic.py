@@ -9,10 +9,30 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
-from numba import njit, prange
-import pandas as pd
+
+# [최적화] PyPy 환경을 위해 Pandas 및 Pandas-TA 선택적 로드
+try:
+    import pandas as pd
+    import pandas_ta as ta # noqa: F401
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
+    # Pandas가 없는 환경(PyPy)을 위한 더미 클래스 정의 (타입 힌트 오류 방지)
+    class DummyPandas:
+        class DataFrame: pass
+        class Series: pass
+    pd = DummyPandas()
+    ta = Any # Dummy
+
 import numpy as np
-import pandas_ta as ta # noqa: F401
+
+# [최적화] Numba @njit 대체용 더미 데코레이터
+def njit(func=None, **kwargs):
+    if func is None:
+        return lambda f: f
+    return func
+def prange(start, stop=None, step=1):
+    return range(start, stop if stop is not None else start, step)
 
 @dataclass
 class ScoringParams:
