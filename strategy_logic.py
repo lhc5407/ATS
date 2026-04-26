@@ -9,25 +9,16 @@ import math
 import re
 from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
+from numba import njit, prange
 import pandas as pd
 import numpy as np
 import pandas_ta as ta # noqa: F401
 
-# ════════════════════════════════════════════════════════════════════════════
-#  ScoringParams  ── 점수 계산 로직의 모든 가변 파라미터
-#  (backtest_optimizer.py에서 중앙 관리로 이전)
-# ════════════════════════════════════════════════════════════════════════════
 @dataclass
 class ScoringParams:
-    """
-    점수 계산 방정식에서 조정 가능한 모든 파라미터.
-    """
-    # [A] 파운데이션 승수
     foundation_mult_q:   float = 0.5
     foundation_mult_c:   float = 3.684
     sniper_boost:        float = 0.016
-
-    # [B] 보너스 / 패널티
     mtf_bonus_q:         float = 0.0
     mtf_penalty_q:       float = 0.0
     wick_penalty:        float = 108.115
@@ -48,19 +39,13 @@ class ScoringParams:
     rsi_slope_penalty:   float = 0.0
     divergence_penalty:  float = 102.205
     fgi_bonus_dampen:    float = 0.259
-
-    # [C] 티어 승수
     vas_mult_major:      float = 1.0
     vas_mult_mid:        float = 8.0
     alt_accel_mult:      float = 2.621
-
-    # [D] 지표별 감쇄/승수
     rsi_overbought_mult: float = 0.571
     macd_negative_mult:  float = 3.937
     major_weak_mult:     float = 3.009
     meme_bad_mult:       float = 3.838
-
-    # [E] 지표 가중치 (Weights)
     w_zscore:        float = 0.747
     w_macd:          float = 0.0
     w_rsi:           float = 0.763
@@ -74,13 +59,9 @@ class ScoringParams:
     w_obv:           float = 0.0
     w_stoch:         float = 1.0
     w_bb_break:      float = 1.0
-
-    # [F] 시스템 제어 및 임계값
     pass_score_threshold: float = 83.586
     rsi_high_thr:         float = 50.0
     rsi_low_thr:          float = 5.0
-
-    # [G] 수익 극대화 파라미터 (새로 추가)
     sniper_confluence_bonus: float = 137.68
     tp_atr_mult:             float = 0.5
     sl_atr_mult:             float = 0.5
@@ -89,53 +70,39 @@ class ScoringParams:
     vol_adj_mult_high:       float = 2.693
     vol_adj_mult_low:        float = 0.53
     vol_multiple_small:    float = 1.5
-    vol_multiple_mid:      float = 0.8     # Mid 티어 전용 거래량 승수 추가
     vol_multiple_major:    float = 2.413
     cvd_penalty_q:         float = 186.787
     cvd_penalty_c:         float = 207.024
     cvd_slope_penalty_c:   float = 0.0
     vol_ratio_penalty_c:   float = 236.148
+    vol_idx_limit:         float = 0.3
+    bb_bw_limit:           float = 0.5
+    btc_drop_pct:          float = 0.005
 
-    # [H] Fatal Flaw 임계값 (옵티마이저 탐색 대상)
-    vol_idx_limit:         float = 0.3     # 변동성 지수 하한 (ATR/Price*100)
-    bb_bw_limit:           float = 0.5     # 볼린저 밴드 폭 하한
-    btc_drop_pct:          float = 0.005   # BTC 급락 차단 기준 (0.005 = -0.5%)
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items()}
 
-
-# ── [최적화 파라미터] ────────────────────────────────────────────────────────
-# Optimizer를 통해 발굴된 최적 파라미터 세트. 모든 엔진의 기본값으로 사용됩니다.
 OPTIMIZED_PARAMS = ScoringParams()
+GLOBAL_COMMISSION     = 0.0005
+GLOBAL_MAX_POSITIONS  = 10
+GLOBAL_RISK_PER_TRADE = 0.015
 
-# ── [전역 상수] ───────────────────────────────────────────────────────────────
-GLOBAL_COMMISSION     = 0.0005     # 0.05%
-GLOBAL_MAX_POSITIONS  = 10         # 최대 10종목 보유
-GLOBAL_RISK_PER_TRADE = 0.015      # 1회 최대 손실 허용률 1.5%
-
-# ── [공용 유틸리티 함수] ──────────────────────────────────────────────────────
 def safe_float(val: Any, default: float = 0.0) -> float:
     if val is None: return float(default)
     try: return float(val)
-    except (ValueError, TypeError):
-        cleaned = re.sub(r'[^0-9.\\-]', '', str(val))
-        if cleaned and cleaned != '-':
-            try: return float(cleaned)
-            except: pass
-        return float(default)
+    except: return float(default)
 
 def get_coin_tier(ticker: str, curr_i: dict) -> str:
-    # Tier 분류 로직 (backtest_optimizer.py 기준으로 통일)
     try:
-        if not isinstance(curr_i, dict): return "Major"
         close_val = safe_float(curr_i.get('close'))
         atr_val   = safe_float(curr_i.get('ATR') or curr_i.get('atr'))
-        if close_val <= 0 or atr_val <= 0: return "Major"
-        
+        if close_val <= 0: return "Major"
         vol_idx = (atr_val / close_val) * 100
-        if vol_idx > 3.5:   return "Small (High Vol)"
+        if vol_idx > 3.5: return "Small"
         elif vol_idx > 1.5: return "Mid"
-        else:               return "Major"
+        return "Major"
     except: return "Major"
-    
+
 def get_upbit_tick_size(price: float) -> float:
     if price >= 2_000_000: return 1000.0
     elif price >= 1_000_000: return 500.0
@@ -147,46 +114,19 @@ def get_upbit_tick_size(price: float) -> float:
     elif price >= 10:        return 0.01
     elif price >= 1:         return 0.001
     else:                    return 0.0001
-    
+
 def calculate_optimized_buy_amt(equity, cash, atr_pct):
-    """
-    고도화된 리스크 기반 투자 금액 계산 함수
-    :param atr_pct: ATR 비율 (단위: %, 예: 2.5)
-    """
-    # 1. 리스크 기반 금액 (ATR 대비 자산의 1.5%를 손실액으로 설정)
     risk_based_amt = equity * GLOBAL_RISK_PER_TRADE / (max(0.5, atr_pct) / 100)
-    
-    # 2. 균등 분할 한도 (총 자산을 최대 포지션 수로 나눈 뒤 1.2배 여유)
     equal_weight_cap = (equity / GLOBAL_MAX_POSITIONS) * 1.2
-    
-    # 3. 가용 현금 한도
     cash_cap = cash * 0.98
-    
-    # 세 가지 한도 중 최솟값 적용
     buy_amt = min(risk_based_amt, equal_weight_cap, cash_cap)
     return max(0, buy_amt)
 
-def evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, current_regime_mode="HYBRID",
-                                   fgi_val=50.0, btc_short_trend=None, force_eval_mode=None, mtf_data=None, p_dict=OPTIMIZED_PARAMS):
-    """
-    제온(실전), 러너, 옵티마이저가 공통으로 사용하는 최종 채점 인터페이스.
-    BTC 추세 객체를 자동 생성하여 하위 로직에 전달합니다.
-    """
-    btc_obj = {'trend': btc_short_trend} if isinstance(btc_short_trend, str) else (btc_short_trend or {})
-    
-    if force_eval_mode:
-        return run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, force_eval_mode, p_dict, btc_short=btc_obj)
-    
-    return evaluate_strategy_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, p_dict, btc_short=btc_obj)
 def get_coin_tier_params(ticker, curr_i, strat_config=None):
-    """종목 티어별 파라미터(TP/SL 무거운 설정 등)를 반환합니다."""
     tier = get_coin_tier(ticker, curr_i)
-    if not strat_config:
-        return {} # 기본값
-    if tier == "Small (High Vol)": 
-        return strat_config.get('high_vol_params', {})
-    elif tier == "Mid":
-        return strat_config.get('mid_vol_params', {})
+    if not strat_config: return {}
+    if tier == "Small": return strat_config.get('high_vol_params', {})
+    elif tier == "Mid": return strat_config.get('mid_vol_params', {})
     return strat_config.get('major_params', {})
 
 def clamp_value(val, min_v, max_v, default=0.0):
@@ -194,525 +134,350 @@ def clamp_value(val, min_v, max_v, default=0.0):
     return max(min_v, min(v, max_v))
 
 def get_constrained_value(key, p_dict, mode="QUANTUM"):
-    """
-    [로직 통합] 파라미터 객체/딕셔너리에서 값을 직접 반환합니다.
-    - Optimizer, Runner, Xeon 간의 파라미터 불일치 문제를 원천 차단합니다.
-    - 이전의 복잡한 clamping/제약 로직을 제거하여 일관성을 보장합니다.
-    """
-    default_val = 0.0
-    if hasattr(p_dict, key):
-        return getattr(p_dict, key, default_val)
-    elif isinstance(p_dict, dict):
-        return p_dict.get(key, default_val)
-    return default_val
+    if hasattr(p_dict, key): return getattr(p_dict, key, 0.0)
+    if isinstance(p_dict, dict): return p_dict.get(key, 0.0)
+    return 0.0
 
 def _calculate_ta_indicators_sync(df: pd.DataFrame, btc_df: pd.DataFrame = None, strat_params: dict = None) -> pd.DataFrame:
-    """모든 엔진이 공유하는 표준 지표 계산 로직입니다 (정적 버전)."""
     if df is None or len(df) < 50: return df
     p = strat_params or {}
-    
-
-    
-    # 기본 지표
     df['ATR'] = df.ta.atr(length=p.get('atr_len', 14))
     st = df.ta.supertrend(length=p.get('st_len', 20), multiplier=p.get('st_mult', 3.0))
     if st is not None: df['ST_DIR'] = st.iloc[:, 1]
-    # EMA
     df['ema20'] = df.ta.ema(length=20)
     df['ema60'] = df.ta.ema(length=60)
     df['sma_short'] = df.ta.sma(length=5)
-    
-    # Z-Score
     df['sma_50'] = df.ta.sma(length=50)
     df['std_50'] = df['close'].rolling(window=50).std()
     df['z_score'] = (df['close'] - df['sma_50']) / (df['std_50'] + 0.0001)
-    
-    # SSL Channel
-    ssl_len = p.get('ssl_len', 70)
-    sma_h, sma_l = df.ta.sma(close=df['high'], length=ssl_len), df.ta.sma(close=df['low'], length=ssl_len)
-    df['c'] = np.where(df['close'] > sma_h, 1, np.where(df['close'] < sma_l, -1, np.nan))
-    df['d'] = pd.Series(df['c']).ffill().fillna(1)
-    df['ssl_up'], df['ssl_down'] = np.where(df['d'] == 1, sma_h, sma_l), np.where(df['d'] == 1, sma_l, sma_h)
-    
-    # Relative Strength (RS)
-    if btc_df is not None and not btc_df.empty:
-        df['rs'] = ((df['close'].pct_change() - btc_df['close'].pct_change()) * 100).fillna(0)
-    else:
-        df['rs'] = 0
-    
-    # VWAP
     df['vwap'] = df.ta.vwap()
     df['vol_sma'] = df['volume'].rolling(window=20).mean()
-    
-    # CVD (Cumulative Volume Delta)
     hl = (df['high'] - df['low']).replace(0, 0.00001)
     df['vol_delta'] = df['volume'] * ((df['close'] - df['low']) / hl) - df['volume'] * ((df['high'] - df['close']) / hl)
     df['cvd'] = df['vol_delta'].rolling(window=20).sum()
-    
     df['obv'] = df.ta.obv()
-    df['rsi'] = df.ta.rsi(length=p.get('rsi_len', 14))
-    
-    # Stochastic RSI
-    st_rsi = df.ta.stochrsi(length=p.get('stoch_rsi_len', 14), k=p.get('stoch_rsi_k_len', 3), d=p.get('stoch_rsi_d_len', 3))
-    if st_rsi is not None:
-        df['st_rsi_k'], df['st_rsi_d'] = st_rsi.iloc[:, 0], st_rsi.iloc[:, 1]
-    
-    # Stochastics
-    stoch = df.ta.stoch(k=p.get('stochastics_k_len', 14), d=p.get('stochastics_d_len', 3))
-    if stoch is not None:
-        df['stoch_k'], df['stoch_d'] = stoch.iloc[:, 0], stoch.iloc[:, 1]
-        
-    # MACD
-    macd = df.ta.macd(fast=p.get('macd_fast_len', 12), slow=p.get('macd_slow_len', 26), signal=p.get('macd_signal_len', 9))
+    df['rsi'] = df.ta.rsi(length=14)
+    macd = df.ta.macd()
     if macd is not None:
         df['macd_h'] = macd.iloc[:, 1]
         df['macd_h_diff'] = df['macd_h'].diff()
         df['macd_h_diff_sma'] = df['macd_h_diff'].abs().rolling(window=10).mean()
-        
-    # ADX
-    adx_df = df.ta.adx(length=p.get('adx_len', 14))
-    if adx_df is not None: df['adx'] = adx_df.iloc[:, 0]
-    
-    # Bollinger Bands
-    bb = df.ta.bbands(length=p.get('bollinger_len', 20), std=p.get('bollinger_std_dev', 2))
-    if bb is not None:
-        df['bb_l'], df['bb_u'], df['bb_bw'] = bb.iloc[:, 0], bb.iloc[:, 2], bb.iloc[:, 3]
-        
-    # Keltner Channel
-    kc = df.ta.kc(length=p.get('keltner_channel_len', 20), scalar=p.get('keltner_channel_atr_mult', 1.5))
-    if kc is not None: df['kc_u'] = kc.iloc[:, 2]
-    
-    # Ichimoku
-    t_len, k_len, s_len = int(p.get('ichimoku_conversion_len', 9)), int(p.get('ichimoku_base_len', 26)), int(p.get('ichimoku_lead_span_b_len', 52))
-    tenkan_sen = (df['high'].rolling(window=t_len).max() + df['low'].rolling(window=t_len).min()) / 2
-    kijun_sen = (df['high'].rolling(window=k_len).max() + df['low'].rolling(window=k_len).min()) / 2
-    df['span_a'] = ((tenkan_sen + kijun_sen) / 2).shift(k_len - 1)
-    df['span_b'] = ((df['high'].rolling(window=s_len).max() + df['low'].rolling(window=s_len).min()) / 2).shift(k_len - 1)
-    
-    df['sma_long'] = df['close'].rolling(window=p.get('bollinger_len', 20)).mean()
-    
-    if btc_df is not None:
-        df['btc_close'] = btc_df['close'].reindex(df.index, method='ffill')
-        
+    bb = df.ta.bbands(length=20, std=2)
+    if bb is not None: df['bb_l'], df['bb_u'], df['bb_bw'] = bb.iloc[:, 0], bb.iloc[:, 2], bb.iloc[:, 3]
+    df['sma_long'] = df['close'].rolling(window=20).mean()
+    if btc_df is not None: df['btc_close'] = btc_df['close'].reindex(df.index, method='ffill')
     return df
 
 def calculate_grad(v, t, w2, md='DECREASE'):
     df = abs(v - t)
-    if md == 'DECREASE': 
-        return 1.0 - (df/w2) if t < v < t+w2 else (1.0 if v <= t else 0.0)
-    else: 
-        return 1.0 - (df/w2) if t-w2 < v < t else (1.0 if v >= t else 0.0)
+    if md == 'DECREASE': return 1.0 - (df/w2) if t < v < t+w2 else (1.0 if v <= t else 0.0)
+    return 1.0 - (df/w2) if t-w2 < v < t else (1.0 if v >= t else 0.0)
 
 def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: str = "QUANTUM") -> float:
     try:
-        if not isinstance(curr, dict) or not isinstance(prev, dict): return 0.0
-        
-        def calc_dist_score(val, baseline, weight=10.0, inverse=False):
-            if baseline <= 0: return 25.0
-            dist_pct = ((val - baseline) / max(1e-9, baseline)) * 100
-            raw_move = dist_pct * weight if not inverse else -dist_pct * weight
-            if raw_move > 0:
-                score = 50.0 + (35.0 * (raw_move / (raw_move + 15.0)))
-            else:
-                score = 50.0 + raw_move
-            return min(100.0, max(15.0, score))
+        is_q = (mode == "QUANTUM")
+        def calc_dist(v, b, w=15.0, inv=False):
+            if b <= 0: return 25.0
+            d = ((v - b) / b) * 100
+            m = d * w if not inv else -d * w
+            s = 50.0 + (35.0 * (m / (m + 15.0))) if m > 0 else 50.0 + m
+            return min(100.0, max(15.0, s))
 
-        is_quantum = (mode == "QUANTUM")
-        
         if name == "rsi":
-            curr_rsi = safe_float(curr.get('rsi'), 50.0)
-            if is_quantum:
-                if 50 <= curr_rsi <= 65: return 100.0
-                if curr_rsi > 85: return 30.0 
-                return max(0.0, curr_rsi - 10)
-            else:
-                base_rsi_s = min(100.0, max(0.0, (50.0 - curr_rsi) * 3.0 + 60))
-                rsi_prev = safe_float(prev.get('rsi'), curr_rsi)
-                if curr_rsi > rsi_prev and curr_rsi < 45:
-                    base_rsi_s = min(100.0, base_rsi_s + 15.0)
-                return base_rsi_s
-                
+            r = safe_float(curr.get('rsi'), 50.0)
+            if is_q:
+                if 50 <= r <= 65: return 100.0
+                if r > 85: return 30.0
+                return max(0.0, r - 10)
+            b = min(100.0, max(0.0, (50.0-r)*3.0 + 60))
+            if r > safe_float(prev.get('rsi'), r) and r < 45: return min(100.0, b+15.0)
+            return b
         if name == "bollinger":
-            bb_u = safe_float(curr.get('bb_u'), 1)
-            bb_l = safe_float(curr.get('bb_l'), 0)
-            bb_range = bb_u - bb_l
-            if bb_range <= 0: return 0.0 if is_quantum else 50.0
-            pos_pct = (price - bb_l) / bb_range
-            if is_quantum: return min(100.0, max(0.0, pos_pct * 100))
-            else:
-                base_bb_s = min(100.0, max(0.0, 110.0 - (pos_pct * 60)))
-                prev_close = safe_float(prev.get('close'), price)
-                bb_l_prev = safe_float(prev.get('bb_l'), 0)
-                if prev_close < bb_l_prev and price > bb_l: base_bb_s = min(100.0, base_bb_s + 35.0)
-                return base_bb_s
-                
+            u, l = safe_float(curr.get('bb_u'), 1), safe_float(curr.get('bb_l'), 0)
+            p = (price - l) / max(1e-9, u - l)
+            if is_q: return min(100.0, max(0.0, p * 100))
+            b = min(100.0, max(0.0, 110.0 - (p * 60)))
+            if safe_float(prev.get('close'), price) < safe_float(prev.get('bb_l'), 0) and price > l: return min(100.0, b+35.0)
+            return b
         if name == "z_score":
             z = safe_float(curr.get('z_score'), 0.0)
-            if is_quantum: return min(100.0, max(0.0, 95.0 - (abs(z - 0.5) * 25)))
-            else: return min(100.0, max(0.0, 75.0 + (z * -25.0)))
-                
+            if is_q: return min(100.0, max(0.0, 95.0 - (abs(z-0.5)*25)))
+            return min(100.0, max(0.0, 75.0 + (z*-25.0)))
         if name == "macd":
-            macd_h = safe_float(curr.get('macd_h'), 0.0)
-            macd_h_diff = safe_float(curr.get('macd_h_diff', 0), 0.0)
-            if is_quantum:
-                base_s = 65.0 if macd_h > 0 else 0.0
-                accel = min(1.0, macd_h_diff * 5.0) if macd_h_diff > 0 else 0.0
-                return min(100.0, base_s + (accel * 35.0))
-            else:
-                macd_diff_sma = safe_float(curr.get('macd_h_diff_sma'), 0.0001)
-                if macd_h_diff > 0: return min(100.0, max(50.0, (macd_h_diff / max(macd_diff_sma * 2, 0.0001)) * 100))
-                return 30.0
-                
+            h, d = safe_float(curr.get('macd_h'), 0.0), safe_float(curr.get('macd_h_diff'), 0.0)
+            if is_q:
+                base = 65.0 if h > 0 else 0.0
+                accel = min(1.0, d*5.0)*35.0 if d > 0 else 0.0
+                return min(100.0, base + accel)
+            if d > 0:
+                sma2 = max(safe_float(curr.get('macd_h_diff_sma'), 0.0001)*2, 1e-9)
+                return min(100.0, max(50.0, (d / sma2)*100))
+            return 30.0
         if name == "volume":
-            curr_vol = safe_float(curr.get('volume'))
-            vol_sma = safe_float(curr.get('vol_sma'), 0.0001)
-            v_s = min(100.0, (curr_vol / (vol_sma + 1)) * 50) if is_quantum else min(100.0, (curr_vol / (vol_sma + 1)) * 30 + 30)
-            if is_quantum and curr_vol > vol_sma * 1.5: v_s = min(100.0, v_s + 20.0)
-            return v_s
-
-        if name == "bollinger_breakout" and is_quantum:
-            bb_u = safe_float(curr.get('bb_u'), 0)
-            if price < bb_u: return 0.0
-            prev_bw = safe_float(prev.get('bb_bw'), 0.0001)
-            bw_expansion = max(0, (safe_float(curr.get('bb_bw'), 0) - prev_bw) / prev_bw)
-            return min(100.0, 70.0 + (bw_expansion * 500))
-
-        is_classic = (mode == "CLASSIC")
-        if name == "vwap": return calc_dist_score(price, curr.get('vwap', price), weight=15.0, inverse=is_classic)
-        if name == "ssl_channel": return calc_dist_score(price, curr.get('ssl_up', price), weight=15.0, inverse=is_classic)
+            v, s = safe_float(curr.get('volume')), safe_float(curr.get('vol_sma'), 0.0001)
+            base = min(100.0, (v/(s+1))*(50 if is_q else 30) + (0 if is_q else 30))
+            if is_q and v > s*1.5: return min(100.0, base+20.0)
+            return base
+        if name == "vwap": return calc_dist(price, curr.get('vwap', price), inv=(not is_q))
+        if name == "ssl_channel": return calc_dist(price, curr.get('ssl_up', price), inv=(not is_q))
         if name == "sma_crossover":
-            slv = safe_float(curr.get('sma_long', curr.get('ema60', 0.0001)))
-            sma_short = safe_float(curr.get('sma_short', curr.get('ema20', 0.0001)))
-            if is_classic: return min(100.0, max(0.0, 50.0 - (((price - slv) / max(slv, 1e-9)) * 100 * 6)))
-            if price > slv and slv > safe_float(curr.get('sma_50', 0)):
-                spread = ((sma_short - slv) / max(slv, 1e-9)) * 100
-                return min(100.0, 75.0 + (spread * 15.0))
-            return 50.0 if price > slv else 0.0
+            l, s = safe_float(curr.get('sma_long', curr.get('ema60', 1e-9))), safe_float(curr.get('sma_short', curr.get('ema20', 1e-9)))
+            if not is_q: return min(100.0, max(0.0, 50.0 - (((price-l)/l)*600)))
+            if price > l: return min(100.0, 75.0+(((s-l)/l)*1500))
+            return 50.0 if price > l else 0.0
         if name == "ichimoku":
-            span_a = safe_float(curr.get('span_a'), 0)
-            span_b = safe_float(curr.get('span_b'), 0)
-            if span_a == 0 or span_b == 0: return 50.0
-            kumo_top = max(span_a, span_b)
-            if price > kumo_top: return 100.0
-            if price < min(span_a, span_b): return 0.0
+            sa, sb = safe_float(curr.get('span_a'), 0), safe_float(curr.get('span_b'), 0)
+            if sa==0 or sb==0: return 50.0
+            if price > max(sa, sb): return 100.0
+            if price < min(sa, sb): return 0.0
             return 50.0
-
         if name == "stochastics":
-            st_k = safe_float(curr.get('stoch_k'), 50.0)
-            st_d = safe_float(curr.get('stoch_d'), 50.0)
-            if is_quantum:
-                if st_k > st_d and st_k < 80: return 90.0
-                return 40.0
-            else:
-                if st_k < 20: return 95.0
-                return 50.0
-
-        if name == "obv":
-            obv_now = safe_float(curr.get('obv'), 0)
-            obv_prev = safe_float(prev.get('obv'), 0)
-            return 100.0 if obv_now > obv_prev else 30.0
-
+            k, d = safe_float(curr.get('stoch_k'), 50.0), safe_float(curr.get('stoch_d'), 50.0)
+            if is_q: return 90.0 if k>d and k<80 else 40.0
+            return 95.0 if k<20 else 50.0
+        if name == "supertrend":
+            st = safe_float(curr.get('ST_DIR'))
+            if st == 1: return 100.0
+            if st == -1: return 0.0
+            return 50.0
+        if name == "obv": return 100.0 if safe_float(curr.get('obv')) > safe_float(prev.get('obv')) else 30.0
         return 50.0
     except: return 50.0
 
 def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score, curr_i, strat_config):
-    curr_p_rate = safe_float(p_rate, 0.0)
-    scale_out_step = t.get('scale_out_step', 0)
-    eval_mode = t.get('strategy_mode', 'QUANTUM')
-    curr_i_safe = curr_i if curr_i else t.get('buy_ind', {})
-    exit_plan = t.get('exit_plan', {})
-    
-    interval_sec = 900
-    elapsed_sec = now_ts - t.get('buy_ts', now_ts)
-    timeout_candles = exit_plan.get('timeout', strat_config.get('timeout_candles', 8))
-    full_timeout_sec = timeout_candles * interval_sec
-    
-    entry_score = safe_float(t.get('pass_score', 80), 80.0)
-    entry_atr = safe_float(t.get('entry_atr', 0))
-    target_atr_multiplier = exit_plan.get('target_atr_multiplier', strat_config.get('tp_atr_mult', 4.5))
-    if entry_score >= 90.0: target_atr_multiplier *= 1.2
-    
-    # ── [전략 로직 개선 2: 변동성 적응형 익절] ───────────────────────────
-    # 변동성이 높은 구간에서는 목표가를 높여 추세를 극대화 (ATR 비율 활용)
-    rel_vol = (entry_atr / avg_p * 100) if avg_p > 0 else 1.0
-    high_v_mult = strat_config.get('vol_adj_mult_high', 1.2)
-    low_v_mult = strat_config.get('vol_adj_mult_low', 0.8)
-    vol_adj_mult = high_v_mult if rel_vol > 2.0 else (low_v_mult if rel_vol < 0.8 else 1.0)
-    target_atr_multiplier *= vol_adj_mult
-    
-    base_tp_pct = (entry_atr * target_atr_multiplier / avg_p) * 100 if entry_atr > 0 and avg_p > 0 else 3.5
-    tp_target = base_tp_pct * (0.4 if scale_out_step == 0 else 1.0)
-    
-    max_p_rate = (t.get('high_p', avg_p) / avg_p - 1) * 100 if avg_p > 0 else 0
-    current_atr_mult = exit_plan.get('atr_mult', strat_config.get('sl_atr_mult', 2.0))
-    
-    # ── [전략 로직 개선 3: 지능형 수익 보존 (Step-Up Lock)] ──────────────
-    # 수익이 1.5 ATR(진입가 대비)에 도달하면 본절 확보, 3.0 ATR 도달하면 수익 50% 잠금
-    atr_pct_val = (entry_atr / avg_p * 100) if avg_p > 0 else 1.5
-    l1_thr = strat_config.get('step_up_l1_atr', 1.5)
-    l2_thr = strat_config.get('step_up_l2_atr', 3.0)
-    
-    hard_breakeven_floor = 0
-    if max_p_rate >= (atr_pct_val * l2_thr): 
-        hard_breakeven_floor = avg_p * (1 + (atr_pct_val * (l2_thr/2))/100) # 수익 절반 확정
-    elif max_p_rate >= (atr_pct_val * l1_thr): 
-        hard_breakeven_floor = avg_p * 1.005 # 본절+수수료 확보
-    
-    dynamic_mult = current_atr_mult * (0.3 if max_p_rate >= 5.0 else (0.5 if max_p_rate >= 3.0 else (0.7 if max_p_rate >= 1.0 else 1.0)))
-    
-    atr_stop = t.get('high_p', avg_p) - (entry_atr * dynamic_mult)
-    chandelier_stop = t.get('high_p', avg_p) * 0.965 if max_p_rate >= 3.0 else 0
-    
-    stop_p = max(atr_stop, chandelier_stop, hard_breakeven_floor, avg_p * 0.965)
-
-    sell_score_threshold = safe_float(strat_config.get('sell_score_threshold', 45.0))
-    is_fundamental_broken = (ma_live_score < sell_score_threshold and curr_p_rate < -1.0)
-
-    # =========================================================================
-    # 🟢 [누락 복구] 다이내믹 컷(휩소 방어막) 변수 정의
-    nano_timeout_sec = 180  # 3분
-    nano_drop_limit = -0.5  # -0.5%
-    micro_timeout_sec = 420 # 7분
-    micro_cut_limit = -0.8  # -0.8%
-    
-    macd_diff_val = safe_float(curr_i_safe.get('macd_h_diff', 0))
-    rsi_val = safe_float(curr_i_safe.get('rsi', 0))
-
-    is_nano_failed = elapsed_sec > nano_timeout_sec and max_p_rate < 0.3 and curr_p_rate <= nano_drop_limit
-    is_micro_failed = elapsed_sec > micro_timeout_sec and curr_p_rate <= micro_cut_limit
-    is_sideways_decay = elapsed_sec > (interval_sec * 2) and abs(curr_p_rate) < 0.3 and macd_diff_val < 0
-    early_hard_cut = elapsed_sec < interval_sec and curr_p_rate <= -1.2
-    is_rsi_overheated_drop = rsi_val > 75 and macd_diff_val < 0 and curr_p_rate < 0.0
-    # =========================================================================
-
-    sell_conditions = [
-        # 1. 치명적 위험 차단 (최우선 순위)
-        (curr_p_rate <= -1.5 or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
-        (is_fundamental_broken, "펀더멘탈 붕괴", 1.0, 0, "HIGH"),
-        
-        # 2. 다이내믹 휩소 방어막 (초단기 리스크 차단)
-        (early_hard_cut, "초단기 한계 손절", 1.0, 0, "HIGH"),
-        (is_nano_failed, "나노 컷 (매수세 실종)", 1.0, 9, "HIGH"),
-        (is_micro_failed, "마이크로 컷 (동력 상실)", 1.0, 9, "HIGH"),
-        (is_sideways_decay, "횡보 모멘텀 소멸", 1.0, 0, "NORMAL"),
-        (is_rsi_overheated_drop, "과열 꺾임 익절", 1.0, 0, "HIGH"),
-
-        # 3. 수익 실현 및 보존
-        (curr_p_rate >= tp_target and scale_out_step == 0, f"PARTIAL_TP({tp_target:.1f}%)", 0.5, 1, "NORMAL"),
-        (max_p_rate >= 1.0 and curr_p_rate < 0.1, "PROFIT_GUARD", 1.0, 9, "HIGH"),
-        
-        # 4. 시간 초과
-        (elapsed_sec > full_timeout_sec and curr_p_rate < 0.0, "TIME_OUT", 1.0, 9, "NORMAL")
-    ]
-    
-    for condition, reason, ratio, next_step, urgency in sell_conditions:
-        if condition: return True, (ratio < 1.0), ratio, reason, urgency, next_step
-            
+    p_rate = safe_float(p_rate, 0.0); scale_step = t.get('scale_out_step', 0); curr_i = curr_i or t.get('buy_ind', {}); elapsed = now_ts - t.get('buy_ts', now_ts)
+    entry_atr = safe_float(t.get('entry_atr', 0)); tp_mult = strat_config.get('tp_atr_mult', 4.5); rel_vol = (entry_atr / avg_p * 100) if avg_p > 0 else 1.0
+    vol_adj = strat_config.get('vol_adj_mult_high', 1.2) if rel_vol > 2.0 else (strat_config.get('vol_adj_mult_low', 0.8) if rel_vol < 0.8 else 1.0)
+    tp_target = (entry_atr * tp_mult * vol_adj / avg_p * 100) * (0.4 if scale_step == 0 else 1.0) if avg_p > 0 else 3.5
+    max_p = (t.get('high_p', avg_p) / avg_p - 1) * 100; atr_pct = (entry_atr / avg_p * 100) if avg_p > 0 else 1.5
+    stop_p = avg_p * 0.965
+    if max_p >= (atr_pct * strat_config.get('step_up_l2_atr', 3.0)):
+        stop_p = avg_p * (1 + (atr_pct * 1.5)/100)
+    elif max_p >= (atr_pct * strat_config.get('step_up_l1_atr', 1.5)):
+        stop_p = avg_p * 1.005
+    conds = [(p_rate <= -1.5 or real_price <= stop_p, "STOP_LOSS", 1.0, 9), (ma_live_score < strat_config.get('sell_score_threshold', 45) and p_rate < -1.0, "FUND_BROKEN", 1.0, 0), (p_rate >= tp_target and scale_step == 0, "PARTIAL_TP", 0.5, 1), (max_p >= 1.0 and p_rate < 0.1, "PROFIT_GUARD", 1.0, 9), (elapsed > (strat_config.get('timeout_candles', 8)*900) and p_rate < 0, "TIME_OUT", 1.0, 9)]
+    for c, r, ratio, n_s in conds:
+        if c: return True, (ratio < 1.0), ratio, r, "NORMAL", n_s
     return False, False, 0.0, "", "NORMAL", 0
 
-def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, btc_short=None):
-    """
-    ?? ?? ?? (FULL VER) - ATS_Xeon, Optimizer ??
-    p_dict: ScoringParams(????) ?? ?? ??? ??? dict
-    """
+def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p, btc_short=None):
     is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
     tier = get_coin_tier(ticker, curr_i)
-    
-    # ?? [1] ?? ??? ? ??? ?? ???????????????????????????????????
-    # (config?? ???? ??? ????? ???? p_dict? ???? ??? ??)
-    # ???? "True Elite" ?? ?? ???? ??
-    logic_list = ['z_score', 'macd', 'rsi', 'volume', 'supertrend', 'bollinger', 'vwap', 'ssl_channel', 'sma_crossover', 'ichimoku', 'obv', 'stochastics', 'bollinger_breakout']
-    
-    # [1] 가중치 맵핑 (p_dict 기반으로 동적 생성)
-    weights = {
-        "z_score":           get_constrained_value('w_zscore', p_dict, mode),
-        "macd":              get_constrained_value('w_macd', p_dict, mode),
-        "rsi":               get_constrained_value('w_rsi', p_dict, mode),
-        "volume":            get_constrained_value('w_volume', p_dict, mode),
-        "supertrend":        get_constrained_value('w_st', p_dict, mode),
-        "bollinger":         get_constrained_value('w_bb', p_dict, mode),
-        "vwap":              get_constrained_value('w_vwap', p_dict, mode),
-        "ssl_channel":       get_constrained_value('w_ssl', p_dict, mode),
-        "sma_crossover":     get_constrained_value('w_sma', p_dict, mode),
-        "ichimoku":          get_constrained_value('w_ichimoku', p_dict, mode),
-        "obv":               get_constrained_value('w_obv', p_dict, mode),
-        "stochastics":       get_constrained_value('w_stoch', p_dict, mode),
-        "bollinger_breakout": get_constrained_value('w_bb_break', p_dict, mode)
-    }
-    
-    curr_close = safe_float(curr_i.get('close'))
-    curr_vol = safe_float(curr_i.get('volume'))
-    vol_sma = safe_float(curr_i.get('vol_sma', 0.0001))
-
-    # ?? [2] ?? ??? ??? ???? ?? ??????????????????????????????
-    foundation_mult = get_constrained_value('foundation_mult_q' if mode == "QUANTUM" else 'foundation_mult_c', p_dict, mode)
-    vas_mult = get_constrained_value('vas_mult_major' if tier == "Major" else 'vas_mult_mid', p_dict, mode)
-    
-    # 단계 [3] Fatal Flaw 체크
-    fatal_reason = None
-    mtf_trend = mtf_data.get('1h_trend', 0) if mtf_data else 0
-    rsi_live = safe_float(curr_i.get('rsi', curr_i.get('RSI', 50)))
-    
-    # BTC 추세 체크 (인자로 전달받은 btc_short 활용)
-    btc_trend = btc_short.get('trend', "") if isinstance(btc_short, dict) else ""
-    if "하락" in btc_trend:
-        fatal_reason = "BTC 단기 하락(역추세)"
-    
-    # [참고] ATR/atr 대소문자 모두 대응
-    atr_val = safe_float(curr_i.get('atr', curr_i.get('ATR', 0)))
-    vol_idx = (atr_val / max(1e-9, curr_close)) * 100
-    
-    btc_p = safe_float(curr_i.get('btc_close', 0))
-    btc_prev_p = safe_float(prev_i.get('btc_close', 0))
-    btc_drop_limit = 1.0 - get_constrained_value('btc_drop_pct', p_dict, mode)
-    if btc_prev_p > 0 and btc_p < btc_prev_p * btc_drop_limit: fatal_reason = "BTC급락차단"
-
-    vol_mult = get_constrained_value('vol_multiple_small' if tier == "Small (High Vol)" else 'vol_multiple_major', p_dict, mode)
-    vol_idx_lim = get_constrained_value('vol_idx_limit', p_dict, mode)
-    bb_bw_lim = get_constrained_value('bb_bw_limit', p_dict, mode)
-    if curr_vol < vol_sma * vol_mult: fatal_reason = "거래량부족"
-    elif vol_idx < vol_idx_lim: fatal_reason = "변동성극저"
-    elif safe_float(curr_i.get('bb_bw', curr_i.get('bollinger_bandwidth', 0))) < bb_bw_lim: fatal_reason = "스퀴즈과도"
-    elif mode == "QUANTUM" and mtf_trend == -1: fatal_reason = "?????(Q)"
-    elif mode == "CLASSIC" and mtf_trend == 1: fatal_reason = "?????(C)"
-    elif mode == "CLASSIC" and mtf_trend == -1 and rsi_live > 25: fatal_reason = "???????"
-
-    # ?? [4] Foundation Score ?? ?????????????????????????????????????
-    earned_score, total_w = 0.0, 1e-9
-    valid_indicator_count = 0
-    
-    for name in logic_list:
-        w = safe_float(weights.get(name, 1.0), 1.0)
-        if tier not in ["Major", "Mid"] and name in ['supertrend', 'stochastics']: w *= 1.5
-        
-        s_raw = get_strategy_score(name, prev_i, curr_i, curr_close, mode=mode)
-        
-        # 지표별 조건 (임계값 가변화)
-        if name == 'rsi' and safe_float(curr_i.get('rsi', 50)) > get_constrained_value('rsi_high_thr', p_dict, mode):
-            s_raw *= get_constrained_value('rsi_overbought_mult', p_dict, mode)
-        if name == 'macd' and safe_float(curr_i.get('macd_h', 0)) <= 0:
-            s_raw *= get_constrained_value('macd_negative_mult', p_dict, mode)
-            
-        s = s_raw * vas_mult
-        
-        # ??? ?? ?? ??
-        if tier == "Major":
-            ema60 = safe_float(curr_i.get('ema60', 0))
-            if curr_close < ema60 or rsi_live < 50:
-                s *= get_constrained_value('major_weak_mult', p_dict, mode)
-        elif is_meme:
-            if curr_close < safe_float(curr_i.get('ema20', 0)):
-                s *= get_constrained_value('meme_bad_mult', p_dict, mode)
-                
-        earned_score += (s * w)
+    indicators = ['z_score', 'macd', 'rsi', 'volume', 'supertrend', 'bollinger', 'vwap', 'ssl_channel', 'sma_crossover', 'ichimoku', 'obv', 'stochastics', 'bollinger_breakout']
+    weights = {'z_score': p.w_zscore, 'macd': p.w_macd, 'rsi': p.w_rsi, 'volume': p.w_volume, 'supertrend': p.w_st, 'bollinger': p.w_bb, 'vwap': p.w_vwap, 'ssl_channel': p.w_ssl, 'sma_crossover': p.w_sma, 'ichimoku': p.w_ichimoku, 'obv': p.w_obv, 'stochastics': p.w_stoch, 'bollinger_breakout': p.w_bb_break}
+    f_mult = p.foundation_mult_q if mode == "QUANTUM" else p.foundation_mult_c
+    v_mult = p.vas_mult_major if tier == "Major" else p.vas_mult_mid
+    vol, v_sma = safe_float(curr_i.get('volume')), safe_float(curr_i.get('vol_sma'), 0.0001)
+    atr = safe_float(curr_i.get('atr', curr_i.get('ATR', 0)))
+    v_idx = (atr / max(1e-9, safe_float(curr_i.get('close')))) * 100
+    mtf = mtf_data.get('1h_trend', 0) if mtf_data else 0
+    if vol < v_sma * (p.vol_multiple_major if tier=="Major" else p.vol_multiple_small): return 0.0, "VOL_LOW", 0.0, mode
+    if v_idx < p.vol_idx_limit: return 0.0, "VOL_IDX_LOW", 0.0, mode
+    if mode == "QUANTUM" and mtf == -1: return 0.0, "MTF_DOWN", 0.0, mode
+    earned, total_w = 0.0, 1e-9
+    rsi_live = safe_float(curr_i.get('rsi', 50))
+    for name in indicators:
+        w = weights.get(name, 1.0)
+        if tier not in ["Major", "Mid"] and name in ['supertrend', 'stochastics']:
+            w *= 1.5
+        s = get_strategy_score(name, prev_i, curr_i, safe_float(curr_i.get('close')), mode) * v_mult
+        if name == 'rsi' and rsi_live > p.rsi_high_thr:
+            s *= p.rsi_overbought_mult
+        if name == 'macd' and safe_float(curr_i.get('macd_h')) <= 0:
+            s *= p.macd_negative_mult
+        if tier == "Major" and (safe_float(curr_i.get('close')) < safe_float(curr_i.get('ema60')) or rsi_live < 50):
+            s *= p.major_weak_mult
+        earned += (s * w)
         total_w += w
-        valid_indicator_count += 1
-
-    # Sniper Boost
-    if (earned_score / total_w) >= 85.0:
-        foundation_mult *= (1.0 + get_constrained_value('sniper_boost', p_dict, mode))
-        
-    foundation_score = (earned_score / total_w) * foundation_mult
-    if tier not in ["Major", "Mid"] and valid_indicator_count >= 2:
-        foundation_score *= get_constrained_value('alt_accel_mult', p_dict, mode)
-
-    # ?? [5] Bonus Score ?? ??????????????????????????????????????????
-    bonus_score = 0.0
-    cvd_improving = safe_float(curr_i.get('cvd', 0)) > safe_float(prev_i.get('cvd', 0))
-    
-    # MTF
-    if mode == "QUANTUM" and mtf_trend == 1: bonus_score += get_constrained_value('mtf_bonus_q', p_dict, mode)
-    if mode == "QUANTUM" and mtf_trend == -1: bonus_score -= get_constrained_value('mtf_penalty_q', p_dict, mode)
-    
-    # Wick
-    upper_shadow = safe_float(curr_i.get('high', 0)) - max(curr_close, safe_float(curr_i.get('open', 0)))
-    body_size = abs(curr_close - safe_float(curr_i.get('open', 0)))
-    wick_ratio_thr = get_constrained_value('wick_ratio_meme' if is_meme else 'wick_ratio_major', p_dict, mode)
-    if upper_shadow > body_size * wick_ratio_thr:
-        bonus_score -= get_constrained_value('wick_penalty', p_dict, mode)
-        
-    if mode == "QUANTUM":
-        # BB Breakout
-        bb_u = safe_float(curr_i.get('bb_u', 0))
-        if curr_close >= bb_u and bb_u > 0:
-            bonus_score += get_constrained_value('bb_breakout_bonus', p_dict, mode) * min(1.0, ((curr_close-bb_u)/bb_u)*100/3.0)
-        # SMA Align
-        sma_short = safe_float(curr_i.get('ema20', 0))
-        sma_long = safe_float(curr_i.get('ema60', 0))
-        if sma_short > sma_long and curr_close > sma_short:
-            bonus_score += get_constrained_value('sma_align_bonus', p_dict, mode)
-    else: # CLASSIC
-        # RSI Oversold
-        if rsi_live < 35:
-            bonus_score += get_constrained_value('rsi_oversold_bonus', p_dict, mode) * calculate_grad(rsi_live, 25, 10, 'DECREASE')
-        # SMA Gap
-        slv = safe_float(curr_i.get('sma_long', 0))
-        if slv > 0:
-            gap = ((curr_close - slv)/slv)*100
-            if gap < -7.0: bonus_score += get_constrained_value('sma_gap_bonus', p_dict, mode)
-        if cvd_improving: bonus_score += get_constrained_value('cvd_bonus', p_dict, mode)
-
-    # ?? ???
-    rsi_diff = rsi_live - safe_float(prev_i.get('rsi', 0))
-    if tier in ["Major", "Mid"] and 0 < rsi_diff < 2.0:
-        bonus_score -= get_constrained_value('rsi_slope_penalty', p_dict, mode)
-        
-    macd_conv = safe_float(curr_i.get('macd_h', 0)) > safe_float(prev_i.get('macd_h', 0))
-    if macd_conv and rsi_diff > 0:
-        bonus_score += get_constrained_value('osc_conv_bonus_alt' if tier not in ["Major", "Mid"] else 'osc_conv_bonus_maj', p_dict, mode)
-        
-    if safe_float(curr_i.get('bb_bw', 0)) > safe_float(prev_i.get('bb_bw', 0)):
-        bonus_score += get_constrained_value('squeeze_bonus_alt' if tier not in ["Major", "Mid"] else 'squeeze_bonus_maj', p_dict, mode)
-
-    if tier == "Mid" and curr_close < safe_float(curr_i.get('ema20', 0)) * 1.005:
-        bonus_score -= get_constrained_value('mid_sma_penalty', p_dict, mode)
-
-    if rsi_diff > 0 and safe_float(curr_i.get('macd_h', 0)) < safe_float(prev_i.get('macd_h', 0)):
-        bonus_score -= get_constrained_value('divergence_penalty', p_dict, mode)
-
+    avg_s = earned / total_w
+    if avg_s >= 85:
+        f_mult *= (1.0 + p.sniper_boost)
+    f_score = avg_s * f_mult
     if tier not in ["Major", "Mid"]:
-        st_val = safe_float(curr_i.get('ST_DIR', 0))
-        psar_val = safe_float(curr_i.get('psar', 0)) < curr_close
-        if st_val == 1 and psar_val:
-            bonus_score += get_constrained_value('st_psar_bonus', p_dict, mode)
-
-    bonus_impact = 1.0
-    if fgi_val >= 65 and tier in ["Major", "Mid"]:
-        bonus_impact = get_constrained_value('fgi_bonus_dampen', p_dict, mode)
-        
-    # ── [전략 로직 개선 1: 스나이퍼 컨플루언스 부스트] ─────────────────────
-    # RSI 과매도 + BB 하단 이탈 + CVD 개선이 동시에 발생하면 강력한 반등 신호로 간주
-    bb_l = safe_float(curr_i.get('bb_l', 0))
-    if rsi_live < 32 and curr_close <= bb_l and bb_l > 0:
-        if cvd_improving or (curr_vol / vol_sma) > 1.8:
-            bonus_score += get_constrained_value('sniper_confluence_bonus', p_dict, mode)
-
-    total_score = foundation_score + (bonus_score * bonus_impact)
-
-    # ?? [6] ?? CVD ??? ? ??? ?? ??????????????????????????????
+        f_score *= p.alt_accel_mult
+    bonus = 0.0
+    cvd_up = safe_float(curr_i.get('cvd')) > safe_float(prev_i.get('cvd'))
     if mode == "QUANTUM":
-        cvd_val = safe_float(curr_i.get('cvd', 0))
-        if cvd_val < 0:
-            total_score -= get_constrained_value('cvd_penalty_q', p_dict, mode) * min(1.0, abs(cvd_val)/1000.0)
+        bb_u = safe_float(curr_i.get('bb_u'))
+        if safe_float(curr_i.get('close')) >= bb_u and bb_u > 0:
+            bonus += p.bb_breakout_bonus
+        s20, s60 = safe_float(curr_i.get('ema20')), safe_float(curr_i.get('ema60'))
+        if s20 > s60 and safe_float(curr_i.get('close')) > s20:
+            bonus += p.sma_align_bonus
     else:
-        cvd_val = safe_float(curr_i.get('cvd', 0))
-        if cvd_val < 0: total_score -= get_constrained_value('cvd_penalty_c', p_dict, mode)
-        if cvd_val < safe_float(prev_i.get('cvd', 0)):
-            total_score -= get_constrained_value('cvd_slope_penalty_c', p_dict, mode)
-        if (curr_vol / vol_sma) < 1.1:
-            total_score -= get_constrained_value('vol_ratio_penalty_c', p_dict, mode)
+        if rsi_live < 35:
+            bonus += p.rsi_oversold_bonus
+        if cvd_up:
+            bonus += p.cvd_bonus
+        slv = safe_float(curr_i.get('ema60'))
+        if slv > 0 and ((safe_float(curr_i.get('close'))-slv)/slv)*100 < -7.0:
+            bonus += p.sma_gap_bonus
+    total = f_score + bonus
+    if mode == "QUANTUM" and safe_float(curr_i.get('cvd')) < 0:
+        total -= p.cvd_penalty_q
+    return round(max(0.0, min(100.0, total)), 1), None, p.pass_score_threshold + (5 if tier=="Small" or is_meme else 0), mode
 
-    suggested_threshold = get_constrained_value('pass_score_threshold', p_dict, mode)
-    if tier == "Small (High Vol)" or is_meme:
-        suggested_threshold += 5.0
+def evaluate_strategy_sync(ticker, prev_i, curr_i, fgi, mtf, p, btc=None):
+    c = run_sub_eval_logic(ticker, prev_i, curr_i, fgi, mtf, "CLASSIC", p)
+    q = run_sub_eval_logic(ticker, prev_i, curr_i, fgi, mtf, "QUANTUM", p)
+    if c[0] >= q[0]: return c
+    return q
 
-    return round(max(0.0, min(100.0, total_score)), 1), fatal_reason, suggested_threshold, mode
+def evaluate_coin_fundamental_sync(ticker, prev_i, curr_i, fgi_val=50.0, mtf_data=None, p_dict=OPTIMIZED_PARAMS, **kwargs):
+    return evaluate_strategy_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, p_dict)
 
-def evaluate_strategy_sync(ticker, prev_i, curr_i, fgi_val, mtf_data, p_dict, btc_short=None):
-    """
-    Classic/Quantum ? ??? ?? ??????? ? ?? ??? ??? ??? ?????.
-    """
-    c_res = run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "CLASSIC", p_dict, btc_short=btc_short)
-    q_res = run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, "QUANTUM", p_dict, btc_short=btc_short)
+@njit
+def _njit_rsi_score(rsi, prev_rsi, is_q):
+    n = len(rsi); s = np.full(n, 50.0)
+    for i in prange(n):
+        if is_q:
+            if 50 <= rsi[i] <= 65: s[i] = 100.0
+            elif rsi[i] > 85: s[i] = 30.0
+            else: s[i] = max(0.0, rsi[i] - 10)
+        else:
+            b = min(100.0, max(0.0, (50.0-rsi[i])*3.0 + 60))
+            if rsi[i] > prev_rsi[i] and rsi[i] < 45: s[i] = min(100.0, b+15.0)
+            else: s[i] = b
+    return s
+
+@njit
+def _njit_bb_score(close, u, l, p_close, p_l, is_q):
+    n = len(close); s = np.full(n, 50.0)
+    for i in prange(n):
+        p = (close[i]-l[i]) / max(1e-9, u[i]-l[i])
+        if is_q: s[i] = min(100.0, max(0.0, p*100))
+        else:
+            b = min(100.0, max(0.0, 110.0-(p*60)))
+            if p_close[i] < p_l[i] and close[i] > l[i]: s[i] = min(100.0, b+35.0)
+            else: s[i] = b
+    return s
+
+@njit
+def _njit_z_score(z, is_q):
+    n = len(z); s = np.full(n, 50.0)
+    for i in prange(n):
+        if is_q: s[i] = min(100.0, max(0.0, 95.0-(abs(z[i]-0.5)*25)))
+        else: s[i] = min(100.0, max(0.0, 75.0+(z[i]*-25.0)))
+    return s
+
+def get_strategy_score_vec(name, prev, curr, mode="QUANTUM"):
+    c = curr['close']; n = len(c); is_q = (mode == "QUANTUM")
+    def calc_dist_v(v, b, inv=False):
+        d = ((v - b) / np.maximum(1e-9, b)) * 100
+        m = np.where(inv, -d*15.0, d*15.0)
+        return np.where(m>0, 50.0+(35.0*(m/(m+15.0))), 50.0+m)
+
+    if name=="rsi": return _njit_rsi_score(curr.get('rsi', np.full(n,50.0)), prev.get('rsi', np.full(n,50.0)), is_q)
+    if name=="bollinger": return _njit_bb_score(c, curr.get('bb_u', np.ones(n)), curr.get('bb_l', np.zeros(n)), prev.get('close', c), prev.get('bb_l', np.zeros(n)), is_q)
+    if name=="z_score": return _njit_z_score(curr.get('z_score', np.zeros(n)), is_q)
+    if name=="macd":
+        h, d, sma = curr.get('macd_h', np.zeros(n)), curr.get('macd_h_diff', np.zeros(n)), curr.get('macd_h_diff_sma', np.full(n,0.0001))
+        if is_q:
+            base = np.where(h>0, 65.0, 0.0)
+            accel = np.where(d>0, np.minimum(1.0, d*5.0)*35.0, 0.0)
+            return np.minimum(100.0, base + accel)
+        return np.where(d>0, np.clip((d / (np.maximum(sma*2, 1e-9))) * 100, 50.0, 100.0), 30.0)
+    if name=="volume":
+        v, s = curr.get('volume', np.zeros(n)), curr.get('vol_sma', np.ones(n))
+        base = (v/(s+1))*(50 if is_q else 30) + (0 if is_q else 30)
+        if is_q: return np.minimum(100.0, np.where(v > s*1.5, base+20.0, base))
+        return np.minimum(100.0, base)
+    if name=="vwap": return calc_dist_v(c, curr.get('vwap', c), inv=(not is_q))
+    if name=="ssl_channel": return calc_dist_v(c, curr.get('ssl_up', c), inv=(not is_q))
+    if name=="sma_crossover":
+        l, s = curr.get('sma_long', curr.get('ema60', np.full(n,1e-9))), curr.get('sma_short', curr.get('ema20', np.full(n,1e-9)))
+        if not is_q: return np.clip(50.0-(((c-l)/l)*600), 0, 100)
+        return np.where(c>l, 75.0+(((s-l)/l)*1500), np.where(c>l, 50.0, 0.0))
+    if name=="ichimoku":
+        sa, sb = curr.get('span_a', np.zeros(n)), curr.get('span_b', np.zeros(n))
+        return np.where((sa==0)|(sb==0), 50.0, np.where(c>np.maximum(sa,sb), 100.0, np.where(c<np.minimum(sa,sb), 0.0, 50.0)))
+    if name=="stochastics":
+        k, d = curr.get('stoch_k', np.full(n,50.0)), curr.get('stoch_d', np.full(n,50.0))
+        if is_q: return np.where((k>d)&(k<80), 90.0, 40.0)
+        return np.where(k<20, 95.0, 50.0)
+    if name=="supertrend":
+        st = curr.get('ST_DIR', np.zeros(n))
+        return np.where(st==1, 100.0, np.where(st==-1, 0.0, 50.0))
+    if name=="obv": return np.where(curr.get('obv', np.zeros(n)) > prev.get('obv', np.zeros(n)), 100.0, 30.0)
+    return np.full(n, 50.0)
+
+def evaluate_strategy_vectorized(ticker: str, data: Dict[str, np.ndarray], p: ScoringParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    n = len(data['close'])
+    curr = data
+    prev = {k: np.roll(v, 1) for k, v in data.items()}
+    for k in prev:
+        prev[k][0] = prev[k][1]
+    closes = data['close']
+    atrs = np.maximum(1e-9, data.get('atr', data.get('ATR', np.zeros(n))))
+    v_idx = (atrs / np.maximum(1e-9, closes)) * 100
+    is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
+    tiers = np.where(v_idx > 3.5, "Small", np.where(v_idx > 1.5, "Mid", "Major"))
     
-    return c_res if c_res[0] >= q_res[0] else q_res
+    fatal_base = np.zeros(n, dtype=bool)
+    vol, vol_sma = data['volume'], np.maximum(1e-9, data.get('vol_sma', np.zeros(n)))
+    fatal_base |= (vol < vol_sma * np.where(tiers=="Major", p.vol_multiple_major, p.vol_multiple_small))
+    fatal_base |= (v_idx < p.vol_idx_limit)
+
+    def calc_mode_score(mode):
+        indicators = ['z_score', 'macd', 'rsi', 'volume', 'supertrend', 'bollinger', 'vwap', 'ssl_channel', 'sma_crossover', 'ichimoku', 'obv', 'stochastics', 'bollinger_breakout']
+        weights = {'z_score': p.w_zscore, 'macd': p.w_macd, 'rsi': p.w_rsi, 'volume': p.w_volume, 'supertrend': p.w_st, 'bollinger': p.w_bb, 'vwap': p.w_vwap, 'ssl_channel': p.w_ssl, 'sma_crossover': p.w_sma, 'ichimoku': p.w_ichimoku, 'obv': p.w_obv, 'stochastics': p.w_stoch, 'bollinger_breakout': p.w_bb_break}
+        f_mult = p.foundation_mult_q if mode == "QUANTUM" else p.foundation_mult_c
+        v_mult = np.where(tiers == "Major", p.vas_mult_major, p.vas_mult_mid)
+        
+        earned, total_w = np.zeros(n), np.full(n, 1e-9)
+        for name in indicators:
+            w = weights.get(name, 1.0)
+            if name in ['supertrend', 'stochastics']:
+                w = np.where((tiers != "Major") & (tiers != "Mid"), w * 1.5, w)
+            s = get_strategy_score_vec(name, prev, curr, mode=mode) * v_mult
+            if name == 'rsi':
+                s = np.where(curr.get('rsi', 50) > p.rsi_high_thr, s * p.rsi_overbought_mult, s)
+            if name == 'macd':
+                s = np.where(curr.get('macd_h', 0) <= 0, s * p.macd_negative_mult, s)
+            if (tiers == "Major").any():
+                s = np.where((tiers == "Major") & ((closes < curr.get('ema60',0)) | (curr.get('rsi',50) < 50)), s * p.major_weak_mult, s)
+            earned += (s * w)
+            total_w += w
+        
+        avg_s = earned / total_w
+        f_score = avg_s * np.where(avg_s >= 85.0, f_mult * (1.0 + p.sniper_boost), f_mult)
+        if (tiers != "Major").any():
+            f_score = np.where((tiers != "Major") & (tiers != "Mid"), f_score * p.alt_accel_mult, f_score)
+        
+        bonus = np.zeros(n)
+        cvd_up = curr.get('cvd', 0) > prev.get('cvd', 0)
+        rsi_live = curr.get('rsi', 50)
+        if mode == "QUANTUM":
+            bb_u = curr.get('bb_u', 0)
+            bonus = np.where((closes >= bb_u) & (bb_u > 0), bonus + p.bb_breakout_bonus, bonus)
+            s20, s60 = curr.get('ema20',0), curr.get('ema60',0)
+            bonus = np.where((s20>s60)&(closes>s20), bonus + p.sma_align_bonus, bonus)
+        else:
+            bonus = np.where(rsi_live < 35, bonus + p.rsi_oversold_bonus, bonus)
+            bonus = np.where(cvd_up, bonus + p.cvd_bonus, bonus)
+            slv = curr.get('ema60', 0)
+            gap = np.where(slv>0, ((closes-slv)/slv)*100, 0)
+            bonus = np.where((slv>0) & (gap < -7.0), bonus + p.sma_gap_bonus, bonus)
+        
+        total = f_score + bonus
+        if mode == "QUANTUM":
+            total = np.where(curr.get('cvd', 0) < 0, total - p.cvd_penalty_q, total)
+        
+        m_fatal = fatal_base.copy()
+        mtf = curr.get('1h_trend', np.zeros(n))
+        if mode == "QUANTUM":
+            m_fatal |= (mtf == -1)
+        
+        total = np.where(m_fatal, 0.0, total)
+        thr = np.full(n, p.pass_score_threshold)
+        thr = np.where((tiers == "Small") | is_meme, thr + 5.0, thr)
+        return total, m_fatal, thr
+
+    sq, fq, tq = calc_mode_score("QUANTUM")
+    sc, fc, tc = calc_mode_score("CLASSIC")
+    
+    is_classic_better = sc >= sq
+    final_scores = np.where(is_classic_better, sc, sq)
+    final_fatals = np.where(is_classic_better, fc, fq)
+    final_thrs = np.where(is_classic_better, tc, tq)
+    return final_scores, final_fatals, final_thrs

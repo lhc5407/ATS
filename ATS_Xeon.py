@@ -2842,12 +2842,11 @@ async def main():
           p_rate = ((real_price * 0.9995) / (avg_p * 1.0005) - 1) * 100
           
           # 실시간 지표 및 점수 확보
-          _, curr_ind = await get_indicators(ticker)
+          prev_ind, curr_ind = await get_indicators(ticker) # 과거 지표(prev_ind) 정상 수신
           current_live_score = 0
-          if curr_ind:
-              # 동기 함수이므로 await 제거, 4개 변수 언패킹, 명시적 파라미터 맵핑(mtf_data=None, btc_short=btc_short)
+          if curr_ind and prev_ind:
               current_live_score, _, _, _ = evaluate_strategy_sync(
-                  ticker, curr_ind, curr_ind, fgi_val, mtf_data=None, p_dict=OPTIMIZED_PARAMS, btc_short=btc_short
+                  ticker, prev_ind, curr_ind, fgi_val, mtf_data=None, p_dict=OPTIMIZED_PARAMS, btc_short=btc_short
               )
               t_data['score_history'] = t_data.get('score_history', [])[-19:] + [current_live_score]
           
