@@ -50,7 +50,7 @@ class ScoringParams:
     fgi_bonus_dampen:    float = 0.259
 
     # [C] 티어 승수
-    vas_mult_major:      float = 0.1
+    vas_mult_major:      float = 1.0
     vas_mult_mid:        float = 8.0
     alt_accel_mult:      float = 2.621
 
@@ -72,6 +72,8 @@ class ScoringParams:
     w_sma:           float = 0.0
     w_ichimoku:      float = 15.0
     w_obv:           float = 0.0
+    w_stoch:         float = 1.0
+    w_bb_break:      float = 1.0
 
     # [F] 시스템 제어 및 임계값
     pass_score_threshold: float = 83.586
@@ -86,12 +88,18 @@ class ScoringParams:
     step_up_l2_atr:          float = 10.896
     vol_adj_mult_high:       float = 2.693
     vol_adj_mult_low:        float = 0.53
-    vol_multiple_small:    float = 16.17
+    vol_multiple_small:    float = 1.5
+    vol_multiple_mid:      float = 0.8     # Mid 티어 전용 거래량 승수 추가
     vol_multiple_major:    float = 2.413
     cvd_penalty_q:         float = 186.787
     cvd_penalty_c:         float = 207.024
     cvd_slope_penalty_c:   float = 0.0
     vol_ratio_penalty_c:   float = 236.148
+
+    # [H] Fatal Flaw 임계값 (옵티마이저 탐색 대상)
+    vol_idx_limit:         float = 0.3     # 변동성 지수 하한 (ATR/Price*100)
+    bb_bw_limit:           float = 0.5     # 볼린저 밴드 폭 하한
+    btc_drop_pct:          float = 0.005   # BTC 급락 차단 기준 (0.005 = -0.5%)
 
 
 # ── [최적화 파라미터] ────────────────────────────────────────────────────────
@@ -301,7 +309,7 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         
         def calc_dist_score(val, baseline, weight=10.0, inverse=False):
             if baseline <= 0: return 25.0
-            dist_pct = ((val - baseline) / baseline) * 100
+            dist_pct = ((val - baseline) / max(1e-9, baseline)) * 100
             raw_move = dist_pct * weight if not inverse else -dist_pct * weight
             if raw_move > 0:
                 score = 50.0 + (35.0 * (raw_move / (raw_move + 15.0)))
@@ -460,11 +468,40 @@ def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, curre
     sell_score_threshold = safe_float(strat_config.get('sell_score_threshold', 45.0))
     is_fundamental_broken = (ma_live_score < sell_score_threshold and curr_p_rate < -1.0)
 
+    # =========================================================================
+    # 🟢 [누락 복구] 다이내믹 컷(휩소 방어막) 변수 정의
+    nano_timeout_sec = 180  # 3분
+    nano_drop_limit = -0.5  # -0.5%
+    micro_timeout_sec = 420 # 7분
+    micro_cut_limit = -0.8  # -0.8%
+    
+    macd_diff_val = safe_float(curr_i_safe.get('macd_h_diff', 0))
+    rsi_val = safe_float(curr_i_safe.get('rsi', 0))
+
+    is_nano_failed = elapsed_sec > nano_timeout_sec and max_p_rate < 0.3 and curr_p_rate <= nano_drop_limit
+    is_micro_failed = elapsed_sec > micro_timeout_sec and curr_p_rate <= micro_cut_limit
+    is_sideways_decay = elapsed_sec > (interval_sec * 2) and abs(curr_p_rate) < 0.3 and macd_diff_val < 0
+    early_hard_cut = elapsed_sec < interval_sec and curr_p_rate <= -1.2
+    is_rsi_overheated_drop = rsi_val > 75 and macd_diff_val < 0 and curr_p_rate < 0.0
+    # =========================================================================
+
     sell_conditions = [
-        (curr_p_rate <= -1.5 or real_price <= stop_p, "STOP_OR_PROFIT_LOCK", 1.0, 9, "HIGH"),
-        (is_fundamental_broken, "SCORE_DROP", 1.0, 0, "HIGH"),
+        # 1. 치명적 위험 차단 (최우선 순위)
+        (curr_p_rate <= -1.5 or real_price <= stop_p, "시스템 최종 손절", 1.0, 9, "HIGH"),
+        (is_fundamental_broken, "펀더멘탈 붕괴", 1.0, 0, "HIGH"),
+        
+        # 2. 다이내믹 휩소 방어막 (초단기 리스크 차단)
+        (early_hard_cut, "초단기 한계 손절", 1.0, 0, "HIGH"),
+        (is_nano_failed, "나노 컷 (매수세 실종)", 1.0, 9, "HIGH"),
+        (is_micro_failed, "마이크로 컷 (동력 상실)", 1.0, 9, "HIGH"),
+        (is_sideways_decay, "횡보 모멘텀 소멸", 1.0, 0, "NORMAL"),
+        (is_rsi_overheated_drop, "과열 꺾임 익절", 1.0, 0, "HIGH"),
+
+        # 3. 수익 실현 및 보존
         (curr_p_rate >= tp_target and scale_out_step == 0, f"PARTIAL_TP({tp_target:.1f}%)", 0.5, 1, "NORMAL"),
         (max_p_rate >= 1.0 and curr_p_rate < 0.1, "PROFIT_GUARD", 1.0, 9, "HIGH"),
+        
+        # 4. 시간 초과
         (elapsed_sec > full_timeout_sec and curr_p_rate < 0.0, "TIME_OUT", 1.0, 9, "NORMAL")
     ]
     
@@ -484,8 +521,7 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
     # ?? [1] ?? ??? ? ??? ?? ???????????????????????????????????
     # (config?? ???? ??? ????? ???? p_dict? ???? ??? ??)
     # ???? "True Elite" ?? ?? ???? ??
-    logic_list = ['supertrend', 'vwap', 'rsi', 'bollinger', 'macd', 'volume', 'ssl_channel', 'sma_crossover', 'ichimoku', 'stochastics', 'obv']
-    if mode == "QUANTUM": logic_list.append('bollinger_breakout')
+    logic_list = ['z_score', 'macd', 'rsi', 'volume', 'supertrend', 'bollinger', 'vwap', 'ssl_channel', 'sma_crossover', 'ichimoku', 'obv', 'stochastics', 'bollinger_breakout']
     
     # [1] 가중치 맵핑 (p_dict 기반으로 동적 생성)
     weights = {
@@ -500,7 +536,8 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
         "sma_crossover":     get_constrained_value('w_sma', p_dict, mode),
         "ichimoku":          get_constrained_value('w_ichimoku', p_dict, mode),
         "obv":               get_constrained_value('w_obv', p_dict, mode),
-        "bollinger_breakout": 1.0 # 고정 보너스 성격
+        "stochastics":       get_constrained_value('w_stoch', p_dict, mode),
+        "bollinger_breakout": get_constrained_value('w_bb_break', p_dict, mode)
     }
     
     curr_close = safe_float(curr_i.get('close'))
@@ -523,22 +560,25 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
     
     # [참고] ATR/atr 대소문자 모두 대응
     atr_val = safe_float(curr_i.get('atr', curr_i.get('ATR', 0)))
-    vol_idx = (atr_val / max(1.0, curr_close)) * 100
+    vol_idx = (atr_val / max(1e-9, curr_close)) * 100
     
     btc_p = safe_float(curr_i.get('btc_close', 0))
     btc_prev_p = safe_float(prev_i.get('btc_close', 0))
-    if btc_prev_p > 0 and btc_p < btc_prev_p * 0.995: fatal_reason = "BTC????"
+    btc_drop_limit = 1.0 - get_constrained_value('btc_drop_pct', p_dict, mode)
+    if btc_prev_p > 0 and btc_p < btc_prev_p * btc_drop_limit: fatal_reason = "BTC급락차단"
 
     vol_mult = get_constrained_value('vol_multiple_small' if tier == "Small (High Vol)" else 'vol_multiple_major', p_dict, mode)
-    if curr_vol < vol_sma * vol_mult: fatal_reason = "????????"
-    elif vol_idx < 0.3: fatal_reason = "??????" # 0.5 -> 0.3 ??
-    elif safe_float(curr_i.get('bb_bw', curr_i.get('bollinger_bandwidth', 0))) < 0.5: fatal_reason = "?????"
+    vol_idx_lim = get_constrained_value('vol_idx_limit', p_dict, mode)
+    bb_bw_lim = get_constrained_value('bb_bw_limit', p_dict, mode)
+    if curr_vol < vol_sma * vol_mult: fatal_reason = "거래량부족"
+    elif vol_idx < vol_idx_lim: fatal_reason = "변동성극저"
+    elif safe_float(curr_i.get('bb_bw', curr_i.get('bollinger_bandwidth', 0))) < bb_bw_lim: fatal_reason = "스퀴즈과도"
     elif mode == "QUANTUM" and mtf_trend == -1: fatal_reason = "?????(Q)"
     elif mode == "CLASSIC" and mtf_trend == 1: fatal_reason = "?????(C)"
     elif mode == "CLASSIC" and mtf_trend == -1 and rsi_live > 25: fatal_reason = "???????"
 
     # ?? [4] Foundation Score ?? ?????????????????????????????????????
-    earned_score, total_w = 0.0, 0.0001
+    earned_score, total_w = 0.0, 1e-9
     valid_indicator_count = 0
     
     for name in logic_list:
@@ -627,7 +667,7 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p_dict, 
     if tier == "Mid" and curr_close < safe_float(curr_i.get('ema20', 0)) * 1.005:
         bonus_score -= get_constrained_value('mid_sma_penalty', p_dict, mode)
 
-    if rsi_diff > 0 and safe_float(curr_i.get('macd', 0)) < safe_float(prev_i.get('macd', 0)):
+    if rsi_diff > 0 and safe_float(curr_i.get('macd_h', 0)) < safe_float(prev_i.get('macd_h', 0)):
         bonus_score -= get_constrained_value('divergence_penalty', p_dict, mode)
 
     if tier not in ["Major", "Mid"]:

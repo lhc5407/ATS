@@ -156,29 +156,6 @@ last_update = 0 # 실시간 소켓 업데이트 시간 기록
 original_stdout = sys.stdout
 original_stderr = sys.stderr
 
-async def get_performance_stats_db():
-    """DB에서 최근 매매 성과 및 연패 기록을 조회합니다."""
-    try:
-        async with aiosqlite.connect(DB_FILE, timeout=20.0) as db:
-            db.row_factory = aiosqlite.Row
-            # 최근 24시간 매도 내역 조회
-            last_24h = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S')
-            async with db.execute("SELECT * FROM trades WHERE side='SELL' AND timestamp > ?", (last_24h,)) as cursor:
-                rows = await cursor.fetchall()
-                recent_trades = [dict(r) for r in rows]
-            
-            total_profit = sum(t.get('profit_krw', 0) for t in recent_trades)
-            wins = [t for t in recent_trades if t.get('profit_krw', 0) > 0]
-            win_rate = (len(wins) / len(recent_trades) * 100) if recent_trades else 0
-            
-            # 연패 방어 로직용으로 손실 기록 리스트 반환
-            recent_losses = [t for t in recent_trades if t.get('profit_krw', 0) < 0]
-            
-            return 0, 0, total_profit, win_rate, 0, recent_losses
-    except Exception as e:
-        logging.error(f"통계 조회 오류: {e}")
-        return 0, 0, 0, 0, 0, []
-
 #  [FIX: 리   학 공식 교정] 화(KRW) 기 로  개의 코인   부 Volume)  여 확 VWAP 출
 async def calculate_expected_slippage(ticker, buy_amt_krw):
   """호가창 5호가 뎁스를 확인하여 체결 물량(Volume) 기반으로 예상 슬리피지(%)를 정확히 계산합니다."""
@@ -648,7 +625,7 @@ async def api_trade_manual(request: Request):
       await record_trade_db(ticker, 'BUY', cur_p, qty, profit_krw=0, reason="[대시보드 수동매수]", status="ENTERED", pass_score=manual_score, strategy_mode=eval_m) 
       # 어 라미터 미리 계산
       dummy_curr = {'close': cur_p, 'ATR': 0, 'volume': 0} # 단가 기 최소 보
-      t_params = get_coin_tier_params(ticker, dummy_curr, start_config=get_strat_for_mode(eval_m))
+      t_params = get_coin_tier_params(ticker, dummy_curr, strat_config=get_strat_for_mode(eval_m))
       #  [버그 스] 메인 진(evaluate_sell_conditions) 구 는 벽 규격 로 주입
       trade_data[ticker] = {
         'high_p': cur_p, 
@@ -1113,86 +1090,6 @@ def _calculate_ta_indicators(df: pd.DataFrame, btc_df: Optional[pd.DataFrame], s
   try:
     df = _calculate_ta_indicators_sync(df, btc_df, strat_params)
     if df is None or len(df) < 2: return None, None
-    return df.iloc[-2], df.iloc[-1]
-  except Exception as e:
-    logging.error(f"지표 계산 오류: {e}")
-    st = df.ta.supertrend(length=strat_params.get('st_len', 20), multiplier=strat_params.get('st_mult', 3.0))
-    if st is None or (isinstance(st, pd.DataFrame) and st.empty): 
-      return None, None
-    df['ST_DIR'] = st[st.columns[1]]
-    df['vwap'] = df.ta.vwap()
-    df['vol_sma'] = df['volume'].rolling(window=20).mean()
-    #  [추 1] CVD (Cumulative Volume Delta) 근사 계산 로직
-    # 고 - 가 범위 에 종 치 기반 로 매수/매도 력 분리 니 
-    high_low_range = df['high'] - df['low']
-    high_low_range = high_low_range.replace(0, 0.00001) # 0 로 누 방 
-    buy_pressure = df['volume'] * ((df['close'] - df['low']) / high_low_range)
-    sell_pressure = df['volume'] * ((df['high'] - df['close']) / high_low_range)
-    df['vol_delta'] = buy_pressure - sell_pressure
-    # 최근 20캔들 안 매 매 적 (CVD)
-    df['cvd'] = df['vol_delta'].rolling(window=20).sum()
-    df['obv'] = df.ta.obv()
-    df['rsi'] = df.ta.rsi(length=strat_params.get('rsi_len', 14))
-    st_rsi = df.ta.stochrsi(length=strat_params.get('stoch_rsi_len', 14), k=strat_params.get('stoch_rsi_k_len', 3), d=strat_params.get('stoch_rsi_d_len', 3))
-    if st_rsi is not None and isinstance(st_rsi, pd.DataFrame):
-      df['st_rsi_k'], df['st_rsi_d'] = st_rsi.iloc[:, 0], st_rsi.iloc[:, 1]
-    else:
-      df['st_rsi_k'], df['st_rsi_d'] = 50, 50
-    stoch = df.ta.stoch(k=strat_params.get('stochastics_k_len', 14), d=strat_params.get('stochastics_d_len', 3))
-    if stoch is not None and isinstance(stoch, pd.DataFrame):
-      df['stoch_k'], df['stoch_d'] = stoch.iloc[:, 0], stoch.iloc[:, 1]
-    macd = df.ta.macd(fast=strat_params.get('macd_fast_len', 12), slow=strat_params.get('macd_slow_len', 26), signal=strat_params.get('macd_signal_len', 9))
-    if macd is None or (isinstance(macd, pd.DataFrame) and macd.empty): 
-      return None, None
-    df['macd_h'] = macd[macd.columns[1]]
-    df['macd_h_diff'] = df['macd_h'].diff()
-    df['macd_h_diff_sma'] = df['macd_h_diff'].abs().rolling(window=10).mean()
-    adx_df = df.ta.adx(length=strat_params.get('adx_len', 14))
-    if adx_df is not None and isinstance(adx_df, pd.DataFrame):
-      df['adx'] = adx_df.iloc[:, 0]
-    bb = df.ta.bbands(length=strat_params.get('bollinger_len', 20), std=strat_params.get('bollinger_std_dev', 2))
-    if bb is not None and isinstance(bb, pd.DataFrame):
-      df['bb_l'], df['bb_u'], df['bb_bw'] = bb.iloc[:, 0], bb.iloc[:, 2], bb.iloc[:, 3]
-    kc = df.ta.kc(length=strat_params.get('keltner_channel_len', 20), scalar=strat_params.get('keltner_channel_atr_mult', 1.5))
-    if kc is not None and isinstance(kc, pd.DataFrame):
-      df['kc_u'] = kc.iloc[:, 2]
-    #  4. 목균형 Ichimoku) 동 계산 방어코드
-    #  [코드 벨 스] pandas-ta ichimoku 수 의 datetime offset('d') 미래 기(Deprecated) 
-    # 다 문법 천 차단 기 해 수 치 산만으 목균형   동 구현 습 다.
-    t_len = int(float(strat_params.get('ichimoku_conversion_len', 9)))
-    k_len = int(float(strat_params.get('ichimoku_base_len', 26)))
-    s_len = int(float(strat_params.get('ichimoku_lead_span_b_len', 52)))
-    tenkan_max = df['high'].rolling(window=t_len).max()
-    tenkan_min = df['low'].rolling(window=t_len).min()
-    tenkan_sen = (tenkan_max + tenkan_min) / 2
-    kijun_max = df['high'].rolling(window=k_len).max()
-    kijun_min = df['low'].rolling(window=k_len).min()
-    kijun_sen = (kijun_max + kijun_min) / 2
-    senkou_span_a_raw = (tenkan_sen + kijun_sen) / 2
-    senkou_b_max = df['high'].rolling(window=s_len).max()
-    senkou_b_min = df['low'].rolling(window=s_len).min()
-    senkou_span_b_raw = (senkou_b_max + senkou_b_min) / 2
-    # 행 팬: 으 동(과거 가격이 재 구름  성)
-    df['span_a'] = senkou_span_a_raw.shift(k_len - 1).fillna(df['close'])
-    df['span_b'] = senkou_span_b_raw.shift(k_len - 1).fillna(df['close'])
-    ssl_len = strat_params.get('ssl_len', 70)
-    sma_h, sma_l = df.ta.sma(close=df['high'], length=ssl_len), df.ta.sma(close=df['low'], length=ssl_len)
-    df['c'] = np.where(df['close'] > sma_h, 1, np.where(df['close'] < sma_l, -1, 0))
-    #  [코드 벨 스] .replace 묵 운캐스 경고 피 기 한 명시 마스 처리
-    df['c'] = df['c'].astype(float)
-    df.loc[df['c'] == 0.0, 'c'] = np.nan
-    df['d'] = df['c'].ffill().fillna(1)
-    df['ssl_up'], df['ssl_down'] = np.where(df['d'] == 1, sma_h, sma_l), np.where(df['d'] == 1, sma_l, sma_h)
-    df['sma_short'] = df.ta.sma(length=strat_params.get('sma_short_len', 5))
-    df['sma_long'] = df.ta.sma(length=strat_params.get('sma_long_len', 20))
-    df['ema_10'] = df.ta.ema(length=10)
-    df['sma_50'] = df.ta.sma(length=50)
-    df['std_50'] = df['close'].rolling(window=50).std()
-    df['z_score'] = (df['close'] - df['sma_50']) / (df['std_50'] + 0.0001)
-    if btc_df is not None and isinstance(btc_df, pd.DataFrame) and not btc_df.empty:
-      df['rs'] = ((df['close'].pct_change() - btc_df['close'].pct_change()) * 100).fillna(0)
-    else: 
-      df['rs'] = 0
     return df.iloc[-2], df.iloc[-1]
   except Exception as e:
     logging.error(f"TA 연산 중 스레드 오류: {e}")
@@ -2948,7 +2845,10 @@ async def main():
           _, curr_ind = await get_indicators(ticker)
           current_live_score = 0
           if curr_ind:
-              _, _, _, current_live_score, _, _ = await evaluate_strategy_sync(ticker, curr_ind, curr_ind, fgi_val, btc_short, p_dict=OPTIMIZED_PARAMS)
+              # 동기 함수이므로 await 제거, 4개 변수 언패킹, 명시적 파라미터 맵핑(mtf_data=None, btc_short=btc_short)
+              current_live_score, _, _, _ = evaluate_strategy_sync(
+                  ticker, curr_ind, curr_ind, fgi_val, mtf_data=None, p_dict=OPTIMIZED_PARAMS, btc_short=btc_short
+              )
               t_data['score_history'] = t_data.get('score_history', [])[-19:] + [current_live_score]
           
           ma_live_score = sum(t_data.get('score_history', [50])) / len(t_data.get('score_history', [50]))
