@@ -90,6 +90,7 @@ class ScoringParams:
     vol_adj_mult_high:       float = 2.693
     vol_adj_mult_low:        float = 0.53
     vol_multiple_small:    float = 1.5
+    vol_multiple_mid:      float = 1.691
     vol_multiple_major:    float = 2.413
     cvd_penalty_q:         float = 186.787
     cvd_penalty_c:         float = 207.024
@@ -102,7 +103,29 @@ class ScoringParams:
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
 
+    def update_from_dict(self, d: dict):
+        for k, v in d.items():
+            if hasattr(self, k):
+                try:
+                    setattr(self, k, float(v))
+                except: pass
+
+# ── 최적화 파라미터 로드 ──────────────────────────────────────────────────────────
 OPTIMIZED_PARAMS = ScoringParams()
+BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+OPT_PATH = os.path.join(BASE_PATH, "config_optimized.json")
+
+if os.path.exists(OPT_PATH):
+    try:
+        import json as _json
+        with open(OPT_PATH, "r", encoding="utf-8") as _f:
+            _loaded = _json.load(_f)
+            if _loaded:
+                OPTIMIZED_PARAMS.update_from_dict(_loaded)
+                print(f"  [System] {os.path.basename(OPT_PATH)} 로드 완료. 파라미터가 실시간 동기화되었습니다.")
+    except Exception as _e:
+        print(f"  [ERR-LoadOpt] {os.path.basename(OPT_PATH)} 로드 실패: {_e}")
+
 GLOBAL_COMMISSION     = 0.0005
 GLOBAL_MAX_POSITIONS  = 10
 GLOBAL_RISK_PER_TRADE = 0.015
