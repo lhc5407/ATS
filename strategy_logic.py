@@ -287,18 +287,77 @@ def get_strategy_score(name: str, prev: dict, curr: dict, price: float, mode: st
         return 50.0
     except: return 50.0
 
+# ── [Unified Logic] Initial Exit Plan Calculation ──────────────────────────
+def calculate_initial_exit_plan(ticker, price, curr_i, strat_config):
+    """
+    All engines must call this to ensure the same initial SL/TP setup.
+    """
+    atr = safe_float(curr_i.get('ATR', curr_i.get('atr', 0)))
+    atr_pct = (atr / price * 100) if price > 0 else 1.5
+    
+    from strategy_logic import get_coin_tier_params # Local import to avoid circularity if needed, though already in file
+    tier_params = get_coin_tier_params(ticker, curr_i, strat_config=strat_config)
+    sl_atr_mult = tier_params.get('atr_mult', 2.0)
+    target_mult = tier_params.get('target_atr_multiplier', 4.5)
+    
+    # ATR-based Stop Loss (with floor)
+    final_sl = max(-(atr_pct * sl_atr_mult), tier_params.get('stop_loss', -3.0))
+    # Target ATR Multiplier
+    expected_target = atr_pct * target_mult
+    
+    # Risk/Reward Protection: Stop loss shouldn't be wider than 70% of target
+    if abs(final_sl) > (expected_target * 0.7):
+        final_sl = -(expected_target * 0.7)
+        
+    return {
+        "target_atr_multiplier": target_mult,
+        "stop_loss": round(final_sl, 2),
+        "atr_mult": sl_atr_mult,
+        "timeout": tier_params.get('timeout_candles', 8),
+        "adaptive_breakeven_buffer": tier_params.get('adaptive_breakeven_buffer', 0.003),
+        "target": expected_target # Pre-calculated target pct
+    }
+
+
 def evaluate_sell_conditions(ticker, t, avg_p, real_price, p_rate, now_ts, current_live_score, ma_live_score, curr_i, strat_config):
     p_rate = safe_float(p_rate, 0.0); scale_step = t.get('scale_out_step', 0); curr_i = curr_i or t.get('buy_ind', {}); elapsed = now_ts - t.get('buy_ts', now_ts)
     entry_atr = safe_float(t.get('entry_atr', 0)); tp_mult = strat_config.get('tp_atr_mult', 4.5); rel_vol = (entry_atr / avg_p * 100) if avg_p > 0 else 1.0
     vol_adj = strat_config.get('vol_adj_mult_high', 1.2) if rel_vol > 2.0 else (strat_config.get('vol_adj_mult_low', 0.8) if rel_vol < 0.8 else 1.0)
     tp_target = (entry_atr * tp_mult * vol_adj / avg_p * 100) * (0.4 if scale_step == 0 else 1.0) if avg_p > 0 else 3.5
     max_p = (t.get('high_p', avg_p) / avg_p - 1) * 100; atr_pct = (entry_atr / avg_p * 100) if avg_p > 0 else 1.5
-    stop_p = avg_p * 0.965
+    initial_sl = t.get('exit_plan', {}).get('stop_loss', strat_config.get('stop_loss', -1.5))
+    stop_p = avg_p * (1 + initial_sl/100)
+    
     if max_p >= (atr_pct * strat_config.get('step_up_l2_atr', 3.0)):
         stop_p = avg_p * (1 + (atr_pct * 1.5)/100)
     elif max_p >= (atr_pct * strat_config.get('step_up_l1_atr', 1.5)):
         stop_p = avg_p * 1.005
-    conds = [(p_rate <= -1.5 or real_price <= stop_p, "STOP_LOSS", 1.0, 9), (ma_live_score < strat_config.get('sell_score_threshold', 45) and p_rate < -1.0, "FUND_BROKEN", 1.0, 0), (p_rate >= tp_target and scale_step == 0, "PARTIAL_TP", 0.5, 1), (max_p >= 1.0 and p_rate < 0.1, "PROFIT_GUARD", 1.0, 9), (elapsed > (strat_config.get('timeout_candles', 8)*900) and p_rate < 0, "TIME_OUT", 1.0, 9)]
+
+    # ── [7-Layer Dynamic Guards] ──────────────────────────────────────────
+    # 1. Nano Failed: Early profit decay
+    is_nano_failed = (max_p >= 0.5 and p_rate < 0.1)
+    # 2. Micro Failed: Small profit pullback
+    is_micro_failed = (max_p >= 1.2 and p_rate < 0.5)
+    # 3. Sideways Decay: Exit if flat for too long
+    is_sideways_decay = (elapsed > 3600 and abs(p_rate) < 0.3)
+    # 4. RSI Overheated Drop: RSI peak reversal
+    curr_rsi = safe_float(curr_i.get('rsi'))
+    high_rsi = safe_float(t.get('high_rsi', 0))
+    is_rsi_overheated_drop = (high_rsi > 75 and curr_rsi < 65)
+    # 5. Fundamental Broken: Score drop (already FUND_BROKEN)
+    is_fundamental_broken = (ma_live_score < strat_config.get('sell_score_threshold', 45) and p_rate < -0.5)
+
+    conds = [
+        (real_price <= stop_p, "STOP_LOSS", 1.0, 9),
+        (is_fundamental_broken, "FUND_BROKEN", 1.0, 0),
+        (is_rsi_overheated_drop, "RSI_OVERHEATED", 1.0, 9),
+        (is_nano_failed or is_micro_failed, "PROFIT_DECAY", 1.0, 9),
+        (is_sideways_decay, "SIDEWAYS_EXIT", 1.0, 9),
+        (p_rate >= tp_target and scale_step == 0, "PARTIAL_TP", 0.5, 1),
+        (elapsed > (strat_config.get('timeout_candles', 8)*900) and p_rate < 0, "TIME_OUT", 1.0, 9),
+        (max_p >= 1.0 and p_rate < 0.1, "PROFIT_GUARD", 1.0, 9)
+    ]
+    
     for c, r, ratio, n_s in conds:
         if c: return True, (ratio < 1.0), ratio, r, "NORMAL", n_s
     return False, False, 0.0, "", "NORMAL", 0
@@ -314,9 +373,11 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p, btc_s
     atr = safe_float(curr_i.get('atr', curr_i.get('ATR', 0)))
     v_idx = (atr / max(1e-9, safe_float(curr_i.get('close')))) * 100
     mtf = mtf_data.get('1h_trend', 0) if mtf_data else 0
-    if vol < v_sma * (p.vol_multiple_major if tier=="Major" else p.vol_multiple_small): return 0.0, "VOL_LOW", 0.0, mode
-    if v_idx < p.vol_idx_limit: return 0.0, "VOL_IDX_LOW", 0.0, mode
-    if mode == "QUANTUM" and mtf == -1: return 0.0, "MTF_DOWN", 0.0, mode
+    final_thr = p.pass_score_threshold + (5 if tier=="Small" or is_meme else 0)
+    vol_thr = p.vol_multiple_major if tier=="Major" else (p.vol_multiple_mid if tier=="Mid" else p.vol_multiple_small)
+    if vol < v_sma * vol_thr: return 0.0, "VOL_LOW", final_thr, mode
+    if v_idx < p.vol_idx_limit: return 0.0, "VOL_IDX_LOW", final_thr, mode
+    if mode == "QUANTUM" and mtf == -1: return 0.0, "MTF_DOWN", final_thr, mode
     earned, total_w = 0.0, 1e-9
     rsi_live = safe_float(curr_i.get('rsi', 50))
     for name in indicators:
@@ -355,10 +416,47 @@ def run_sub_eval_logic(ticker, prev_i, curr_i, fgi_val, mtf_data, mode, p, btc_s
         slv = safe_float(curr_i.get('ema60'))
         if slv > 0 and ((safe_float(curr_i.get('close'))-slv)/slv)*100 < -7.0:
             bonus += p.sma_gap_bonus
+    # ── [Unified Scoring Logic] ──────────────────────────────────────────
+    # 3. [ADD] Wick Penalty (Synchronized with Vectorized)
+    up_shadow = (safe_float(curr_i.get('high')) - max(safe_float(curr_i.get('close')), safe_float(curr_i.get('open')))) / max(1e-9, safe_float(curr_i.get('close'))) * 100
+    wick_r = p.wick_ratio_major if tier == "Major" else p.wick_ratio_meme
+    if up_shadow > wick_r:
+        bonus -= p.wick_penalty
+
+    # ── [Unified Scoring Logic] ──────────────────────────────────────────
     total = f_score + bonus
-    if mode == "QUANTUM" and safe_float(curr_i.get('cvd')) < 0:
-        total -= p.cvd_penalty_q
-    return round(max(0.0, min(100.0, total)), 1), None, p.pass_score_threshold + (5 if tier=="Small" or is_meme else 0), mode
+    
+    # 5. [ADD] MTF Bonus/Penalty (Synchronized with Vectorized)
+    if mtf == 1:
+        total += p.mtf_bonus_q
+    elif mtf == -1:
+        total -= p.mtf_penalty_q
+        
+    # 6. [ADD] Sniper Confluence Bonus (Synchronized with Vectorized)
+    if rsi_live < 30 and safe_float(curr_i.get('macd_h'), 0) > 0:
+        total += p.sniper_confluence_bonus
+
+    if mode == "QUANTUM":
+        if safe_float(curr_i.get('cvd')) < 0:
+            total -= p.cvd_penalty_q
+        # [ADD] Squeeze Bonus
+        bb_bw = safe_float(curr_i.get('bb_bw'))
+        if 0 < bb_bw < p.bb_bw_limit:
+            total += (p.squeeze_bonus_maj if tier == "Major" else p.squeeze_bonus_alt)
+    else:
+        if safe_float(curr_i.get('cvd')) < 0:
+            total -= p.cvd_penalty_c
+        # [ADD] Divergence Penalty
+        c_rsi, p_rsi = safe_float(curr_i.get('rsi')), safe_float(prev_i.get('rsi'))
+        c_price, p_price = safe_float(curr_i.get('close')), safe_float(prev_i.get('close'))
+        if c_rsi < p_rsi and c_price > p_price: # Bearish Divergence
+            total -= p.divergence_penalty
+        # [ADD] CVD Slope Penalty
+        if safe_float(curr_i.get('cvd')) < safe_float(prev_i.get('cvd')):
+            total -= p.cvd_slope_penalty_c
+
+    final_thr = p.pass_score_threshold + (5 if tier=="Small" or is_meme else 0)
+    return round(max(0.0, min(100.0, total)), 1), None, final_thr, mode
 
 def evaluate_strategy_sync(ticker, prev_i, curr_i, fgi, mtf, p, btc=None):
     c = run_sub_eval_logic(ticker, prev_i, curr_i, fgi, mtf, "CLASSIC", p)
@@ -444,21 +542,24 @@ def get_strategy_score_vec(name, prev, curr, mode="QUANTUM"):
     if name=="obv": return np.where(curr.get('obv', np.zeros(n)) > prev.get('obv', np.zeros(n)), 100.0, 30.0)
     return np.full(n, 50.0)
 
-def evaluate_strategy_vectorized(ticker: str, data: Dict[str, np.ndarray], p: ScoringParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    n = len(data['close'])
-    curr = data
-    prev = {k: np.roll(v, 1) for k, v in data.items()}
+def evaluate_strategy_vectorized(ticker: str, curr: Dict[str, Any], p: ScoringParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # [최적화] 이미 넘파이 배열인 경우 변환 생략 (메모리 복사 방지)
+    curr = {k: np.asanyarray(v, dtype=np.int64 if k == 'timestamp' else np.float32) for k, v in curr.items()}
+    n = len(curr['close'])
+    prev = {k: np.roll(v, 1) for k, v in curr.items()}
     for k in prev:
-        prev[k][0] = prev[k][1]
-    closes = data['close']
-    atrs = np.maximum(1e-9, data.get('atr', data.get('ATR', np.zeros(n))))
+        if len(prev[k]) > 1:
+            prev[k][0] = prev[k][1]
+    closes = curr['close']
+    atrs = np.maximum(1e-9, curr.get('atr', curr.get('ATR', np.zeros(n))))
     v_idx = (atrs / np.maximum(1e-9, closes)) * 100
     is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
     tiers = np.where(v_idx > 3.5, "Small", np.where(v_idx > 1.5, "Mid", "Major"))
     
     fatal_base = np.zeros(n, dtype=bool)
-    vol, vol_sma = data['volume'], np.maximum(1e-9, data.get('vol_sma', np.zeros(n)))
-    fatal_base |= (vol < vol_sma * np.where(tiers=="Major", p.vol_multiple_major, p.vol_multiple_small))
+    vol, vol_sma = curr['volume'], np.maximum(1e-9, curr.get('vol_sma', np.zeros(n)))
+    v_thr_v = np.where(tiers=="Major", p.vol_multiple_major, np.where(tiers=="Mid", p.vol_multiple_mid, p.vol_multiple_small))
+    fatal_base |= (vol < vol_sma * v_thr_v)
     fatal_base |= (v_idx < p.vol_idx_limit)
 
     def calc_mode_score(mode):
@@ -495,23 +596,50 @@ def evaluate_strategy_vectorized(ticker: str, data: Dict[str, np.ndarray], p: Sc
             bonus = np.where((closes >= bb_u) & (bb_u > 0), bonus + p.bb_breakout_bonus, bonus)
             s20, s60 = curr.get('ema20',0), curr.get('ema60',0)
             bonus = np.where((s20>s60)&(closes>s20), bonus + p.sma_align_bonus, bonus)
+            # [ADD] Squeeze Bonus (Vectorized)
+            bb_bw = curr.get('bb_bw', np.ones(n))
+            bonus = np.where((bb_bw > 0) & (bb_bw < p.bb_bw_limit), 
+                             bonus + np.where(tiers == "Major", p.squeeze_bonus_maj, p.squeeze_bonus_alt), bonus)
         else:
             bonus = np.where(rsi_live < 35, bonus + p.rsi_oversold_bonus, bonus)
             bonus = np.where(cvd_up, bonus + p.cvd_bonus, bonus)
             slv = curr.get('ema60', 0)
             gap = np.where(slv>0, ((closes-slv)/slv)*100, 0)
             bonus = np.where((slv>0) & (gap < -7.0), bonus + p.sma_gap_bonus, bonus)
+            # [ADD] Divergence Penalty (Vectorized)
+            p_rsi = prev.get('rsi', rsi_live)
+            p_closes = prev.get('close', closes)
+            bonus = np.where((rsi_live < p_rsi) & (closes > p_closes), bonus - p.divergence_penalty, bonus)
+            # [ADD] CVD Slope Penalty (Vectorized)
+            bonus = np.where(curr.get('cvd', 0) < prev.get('cvd', 0), bonus - p.cvd_slope_penalty_c, bonus)
         
+        # [ADD] Wick Penalty (Vectorized)
+        up_shadow = (curr.get('high', closes) - np.maximum(closes, curr.get('open', closes))) / np.maximum(1e-9, closes) * 100
+        wick_r = np.where(tiers=="Major", p.wick_ratio_major, p.wick_ratio_meme)
+        bonus = np.where(up_shadow > wick_r, bonus - p.wick_penalty, bonus)
+        
+        # ── [Unified Scoring Logic] ──────────────────────────────────────────
         total = f_score + bonus
+        
+        # [ADD] MTF Bonus/Penalty (Vectorized)
+        mtf_v = curr.get('1h_trend', np.zeros(n))
+        total = np.where(mtf_v == 1, total + p.mtf_bonus_q, np.where(mtf_v == -1, total - p.mtf_penalty_q, total))
+        
+        # [ADD] Sniper Confluence Bonus (Vectorized)
+        sniper_c = (curr.get('rsi', 50) < 30) & (curr.get('macd_h', 0) > 0)
+        total = np.where(sniper_c, total + p.sniper_confluence_bonus, total)
+
         if mode == "QUANTUM":
             total = np.where(curr.get('cvd', 0) < 0, total - p.cvd_penalty_q, total)
+        else:
+            total = np.where(curr.get('cvd', 0) < 0, total - p.cvd_penalty_c, total)
         
         m_fatal = fatal_base.copy()
         mtf = curr.get('1h_trend', np.zeros(n))
         if mode == "QUANTUM":
             m_fatal |= (mtf == -1)
         
-        total = np.where(m_fatal, 0.0, total)
+        total = np.where(m_fatal, 0.0, np.clip(total, 0.0, 100.0))
         thr = np.full(n, p.pass_score_threshold)
         thr = np.where((tiers == "Small") | is_meme, thr + 5.0, thr)
         return total, m_fatal, thr
@@ -523,4 +651,30 @@ def evaluate_strategy_vectorized(ticker: str, data: Dict[str, np.ndarray], p: Sc
     final_scores = np.where(is_classic_better, sc, sq)
     final_fatals = np.where(is_classic_better, fc, fq)
     final_thrs = np.where(is_classic_better, tc, tq)
-    return final_scores, final_fatals, final_thrs
+    final_modes = np.where(is_classic_better, "CLASSIC", "QUANTUM")
+    return final_scores, final_fatals, final_thrs, final_modes
+
+def warm_up_numba():
+    """Numba JIT 컴파일을 미리 수행하여 실제 계산 시 지연을 제거합니다."""
+    try:
+        dummy_data = {
+            'close': np.array([100.0, 101.0], dtype=np.float32),
+            'volume': np.array([1000.0, 1100.0], dtype=np.float32),
+            'rsi': np.array([50.0, 55.0], dtype=np.float32),
+            'macd_h': np.array([0.1, 0.2], dtype=np.float32),
+            'macd_h_diff': np.array([0.01, 0.02], dtype=np.float32),
+            'macd_h_diff_sma': np.array([0.01, 0.01], dtype=np.float32),
+            'bb_u': np.array([110.0, 110.0], dtype=np.float32),
+            'bb_l': np.array([90.0, 90.0], dtype=np.float32),
+            'z_score': np.array([0.5, 0.6], dtype=np.float32),
+            'ema20': np.array([100.0, 100.5], dtype=np.float32),
+            'ema60': np.array([99.0, 99.2], dtype=np.float32),
+            'atr': np.array([1.5, 1.5], dtype=np.float32),
+        }
+        p = ScoringParams()
+        evaluate_strategy_vectorized("WARMUP", dummy_data, p)
+    except:
+        pass
+
+if __name__ == "__main__":
+    warm_up_numba()

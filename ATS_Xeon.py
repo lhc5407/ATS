@@ -61,7 +61,8 @@ from strategy_logic import (
   OPTIMIZED_PARAMS,
   get_strategy_score,
   get_upbit_tick_size,
-  safe_float
+  safe_float,
+  calculate_initial_exit_plan
 )
 
 # --- [0. 시스템 규칙 및 전역 변수] ---
@@ -1580,22 +1581,18 @@ async def ai_analyze(ticker, data, mode="BUY", eval_mode="CLASSIC", no_trade_hou
         logging.info(f"📈 [AI Council - Trend]: {trend_opinion}")
         logging.info(f"🛡️ [AI Council - Risk]: {risk_opinion}")
         logging.info(f"📝 [AI Council - Final]: {extracted_reason}")
-        raw_plan = res_json.get('exit_plan', {})
+        
         strategy_mode = clean_data.get('strategy_mode', 'QUANTUM')
-        default_stop = -1.5 # [Sniper Upgrade] 기본 절 향
-        default_atr = 1.2  # [Sniper Upgrade] 목표가 1  기 
-        default_timeout = 8 # [Sniper Upgrade] 안전 장치선
-        exit_plan = {
-          "target_atr_multiplier": max(1.0, min(8.0, safe_float(raw_plan.get('target_atr_multiplier', 2.8)))),
-          "stop_loss": max(-3.5, min(-0.5, safe_float(raw_plan.get('stop_loss', default_stop)))),
-          "atr_mult": max(0.5, min(4.0, safe_float(raw_plan.get('atr_mult', default_atr)))),
-          "timeout": max(2, min(20, int(safe_float(raw_plan.get('timeout', default_timeout)))))
-        }
+        strat_config = get_strat_for_mode(strategy_mode)
+        
+        # [UNIFIED] Centralized Exit Plan Calculation
+        exit_plan = calculate_initial_exit_plan(ticker, buy_price, clean_data, strat_config)
+        
         return {
           "score": score, 
           "decision": decision, 
           "reason": str(extracted_reason), 
-          "tech_opinion": str(tech_opinion), #  반환 객체 추 
+          "tech_opinion": str(tech_opinion),
           "trend_opinion": str(trend_opinion),
           "risk_opinion": str(risk_opinion),
           "exit_plan": exit_plan
@@ -1951,21 +1948,9 @@ async def process_buy_order(ticker, score, reason, curr_data, total_asset, cash,
       final_buy_price = safe_float(coin_info.get('avg_buy_price')) if coin_info and safe_float(coin_info.get('avg_buy_price')) > 0 else safe_float(await execute_upbit_api(pyupbit.get_current_price, ticker))
       now_ts = time.time()
       last_buy_time[ticker], last_global_buy_time = now_ts, now_ts
-      tier_params = get_coin_tier_params(ticker, curr_data, strat_config=get_strat_for_mode(eval_mode))
-      if not exit_plan:
-        atr_pct_val = (curr_data.get('ATR', 0) / curr_data.get('close', 1)) * 100
-        target_mult = tier_params.get('target_atr_multiplier', 4.5)
-        sl_atr_mult = tier_params.get('atr_mult', 2.0) 
-        final_sl = max(-(atr_pct_val * sl_atr_mult), tier_params.get('stop_loss', -3.0))
-        expected_target = atr_pct_val * target_mult
-        if abs(final_sl) > (expected_target * 0.7): final_sl = -(expected_target * 0.7)
-        exit_plan = {
-          "target_atr_multiplier": target_mult, "stop_loss": round(final_sl, 2),
-          "atr_mult": sl_atr_mult, "timeout": tier_params.get('timeout_candles', 8)
-        }
-      exit_plan['adaptive_breakeven_buffer'] = tier_params.get('adaptive_breakeven_buffer', 0.007)
+      exit_plan = calculate_initial_exit_plan(ticker, final_buy_price, curr_data, get_strat_for_mode(eval_mode))
       trade_data[ticker] = {
-        'high_p': final_buy_price, 'entry_atr': curr_data.get('ATR', 0), 'guard': False,
+        'high_p': final_buy_price, 'high_rsi': safe_float(curr_data.get('rsi', 0)), 'entry_atr': curr_data.get('ATR', 0), 'guard': False,
         'buy_ind': curr_data if isinstance(curr_data, dict) else curr_data.to_dict(), 
         'last_notified_step': 0, 'buy_ts': now_ts, 'exit_plan': exit_plan, 'buy_reason': reason, 
         'btc_buy_price': REALTIME_PRICES.get('KRW-BTC', 0), 'pass_score': pass_score, 
@@ -2849,6 +2834,15 @@ async def main():
                   ticker, prev_ind, curr_ind, fgi_val, mtf_data=None, p_dict=OPTIMIZED_PARAMS, btc_short=btc_short
               )
               t_data['score_history'] = t_data.get('score_history', [])[-19:] + [current_live_score]
+              
+              # [Parity] Update state for 7-Layer Dynamic Guards
+              curr_rsi = safe_float(curr_ind.get('rsi', 0))
+              if curr_rsi > t_data.get('high_rsi', 0):
+                  t_data['high_rsi'] = curr_rsi
+                  TRADE_DATA_DIRTY = True
+              if real_price > t_data.get('high_p', 0):
+                  t_data['high_p'] = real_price
+                  TRADE_DATA_DIRTY = True
           
           ma_live_score = sum(t_data.get('score_history', [50])) / len(t_data.get('score_history', [50]))
           
