@@ -1,3 +1,4 @@
+from __future__ import annotations
 # strategy_logic.py
 # 모든 전략 로직의 중앙 저장소 (ATS_Xeon, Backtest, Optimizer 공통)
 # "True Elite" 전략 기반
@@ -7,7 +8,7 @@ import sys
 import logging
 import math
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from dataclasses import dataclass, field
 
 # [최적화] PyPy 환경을 위해 Pandas 및 Pandas-TA 선택적 로드
@@ -17,12 +18,12 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
-    # Pandas가 없는 환경(PyPy)을 위한 더미 클래스 정의 (타입 힌트 오류 방지)
-    class DummyPandas:
+    # Pylance "Variable cannot be used in a type expression" 에러 방지를 위해
+    # pd를 클래스로 정의하여 타입으로 인식되게 함
+    class pd: # type: ignore
         class DataFrame: pass
         class Series: pass
-    pd = DummyPandas()
-    ta = Any # Dummy
+    ta = Any # type: ignore
 
 import numpy as np
 
@@ -36,69 +37,69 @@ def prange(start, stop=None, step=1):
 
 @dataclass
 class ScoringParams:
-    foundation_mult_q:   float = 0.5
-    foundation_mult_c:   float = 3.684
-    sniper_boost:        float = 0.016
+    foundation_mult_q:   float = 6.216
+    foundation_mult_c:   float = 5.691
+    sniper_boost:        float = 0.804
     mtf_bonus_q:         float = 0.0
     mtf_penalty_q:       float = 0.0
-    wick_penalty:        float = 108.115
-    wick_ratio_major:    float = 0.641
-    wick_ratio_meme:     float = 1.715
-    bb_breakout_bonus:   float = 80.422
-    sma_align_bonus:     float = 59.2
-    rsi_oversold_bonus:  float = 0.0
-    sma_gap_bonus:       float = 0.0
+    wick_penalty:        float = 232.415
+    wick_ratio_major:    float = 12.515
+    wick_ratio_meme:     float = 5.932
+    bb_breakout_bonus:   float = 38.071
+    sma_align_bonus:     float = 193.048
+    rsi_oversold_bonus:  float = 211.629
+    sma_gap_bonus:       float = 81.207
     cvd_bonus:           float = 0.0
-    osc_conv_bonus_alt:  float = 46.195
-    osc_conv_bonus_maj:  float = 27.696
-    sma_above_bonus:     float = 30.255
-    squeeze_bonus_alt:   float = 83.595
+    osc_conv_bonus_alt:  float = 120.055
+    osc_conv_bonus_maj:  float = 0.0
+    sma_above_bonus:     float = 102.921
+    squeeze_bonus_alt:   float = 0.0
     squeeze_bonus_maj:   float = 0.0
-    st_psar_bonus:       float = 3.353
-    mid_sma_penalty:     float = 32.793
-    rsi_slope_penalty:   float = 0.0
-    divergence_penalty:  float = 102.205
-    fgi_bonus_dampen:    float = 0.259
-    vas_mult_major:      float = 1.0
-    vas_mult_mid:        float = 8.0
-    alt_accel_mult:      float = 2.621
-    rsi_overbought_mult: float = 0.571
-    macd_negative_mult:  float = 3.937
-    major_weak_mult:     float = 3.009
-    meme_bad_mult:       float = 3.838
-    w_zscore:        float = 0.747
-    w_macd:          float = 0.0
-    w_rsi:           float = 0.763
-    w_volume:        float = 9.932
-    w_st:            float = 0.0
-    w_bb:            float = 0.357
-    w_vwap:          float = 0.0
-    w_ssl:           float = 2.032
+    st_psar_bonus:       float = 0.0
+    mid_sma_penalty:     float = 78.607
+    rsi_slope_penalty:   float = 75.404
+    divergence_penalty:  float = 84.92
+    fgi_bonus_dampen:    float = 3.921
+    vas_mult_major:      float = 0.1
+    vas_mult_mid:        float = 0.1
+    alt_accel_mult:      float = 2.462
+    rsi_overbought_mult: float = 0.0
+    macd_negative_mult:  float = 2.679
+    major_weak_mult:     float = 3.906
+    meme_bad_mult:       float = 4.166
+    w_zscore:        float = 4.111
+    w_macd:          float = 3.73
+    w_rsi:           float = 4.843
+    w_volume:        float = 0.503
+    w_st:            float = 11.908
+    w_bb:            float = 0.0
+    w_vwap:          float = 4.265
+    w_ssl:           float = 5.495
     w_sma:           float = 0.0
-    w_ichimoku:      float = 15.0
+    w_ichimoku:      float = 0.062
     w_obv:           float = 0.0
-    w_stoch:         float = 1.0
-    w_bb_break:      float = 1.0
-    pass_score_threshold: float = 83.586
-    rsi_high_thr:         float = 50.0
-    rsi_low_thr:          float = 5.0
-    sniper_confluence_bonus: float = 137.68
-    tp_atr_mult:             float = 0.5
-    sl_atr_mult:             float = 0.5
-    step_up_l1_atr:          float = 4.424
-    step_up_l2_atr:          float = 10.896
-    vol_adj_mult_high:       float = 2.693
-    vol_adj_mult_low:        float = 0.53
-    vol_multiple_small:    float = 1.5
-    vol_multiple_mid:      float = 1.691
-    vol_multiple_major:    float = 2.413
-    cvd_penalty_q:         float = 186.787
-    cvd_penalty_c:         float = 207.024
-    cvd_slope_penalty_c:   float = 0.0
-    vol_ratio_penalty_c:   float = 236.148
-    vol_idx_limit:         float = 0.3
-    bb_bw_limit:           float = 0.5
-    btc_drop_pct:          float = 0.005
+    w_stoch:         float = 5.0
+    w_bb_break:      float = 2.112
+    pass_score_threshold: float = 82.728
+    rsi_high_thr:         float = 64.323
+    rsi_low_thr:          float = 43.363
+    sniper_confluence_bonus: float = 75.057
+    tp_atr_mult:             float = 8.352
+    sl_atr_mult:             float = 3.336
+    step_up_l1_atr:          float = 7.728
+    step_up_l2_atr:          float = 0.0
+    vol_adj_mult_high:       float = 3.85
+    vol_adj_mult_low:        float = 0.1
+    vol_multiple_small:    float = 0.1
+    vol_multiple_mid:      float = 1.589
+    vol_multiple_major:    float = 2.705
+    cvd_penalty_q:         float = 0.0
+    cvd_penalty_c:         float = 20.948
+    cvd_slope_penalty_c:   float = 136.151
+    vol_ratio_penalty_c:   float = 45.811
+    vol_idx_limit:         float = 0.785
+    bb_bw_limit:           float = 1.066
+    btc_drop_pct:          float = 0.008
 
     def to_dict(self):
         return {k: v for k, v in self.__dict__.items()}
@@ -110,9 +111,13 @@ class ScoringParams:
                     setattr(self, k, float(v))
                 except: pass
 
-# ── 최적화 파라미터 로드 ──────────────────────────────────────────────────────────
+# ── 최적화 파라미터 로드 (PyInstaller EXE 대응) ──────────────────────────────────
 OPTIMIZED_PARAMS = ScoringParams()
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+if getattr(sys, 'frozen', False):
+    BASE_PATH = os.path.dirname(sys.executable)
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
 OPT_PATH = os.path.join(BASE_PATH, "config_optimized.json")
 
 if os.path.exists(OPT_PATH):
@@ -181,7 +186,7 @@ def get_constrained_value(key, p_dict, mode="QUANTUM"):
     if isinstance(p_dict, dict): return p_dict.get(key, 0.0)
     return 0.0
 
-def _calculate_ta_indicators_sync(df: pd.DataFrame, btc_df: pd.DataFrame = None, strat_params: dict = None) -> pd.DataFrame:
+def _calculate_ta_indicators_sync(df: pd.DataFrame, btc_df: Optional[pd.DataFrame] = None, strat_params: Optional[dict] = None) -> pd.DataFrame:
     if df is None or len(df) < 50: return df
     p = strat_params or {}
     df['ATR'] = df.ta.atr(length=p.get('atr_len', 14))
@@ -542,20 +547,31 @@ def get_strategy_score_vec(name, prev, curr, mode="QUANTUM"):
     if name=="obv": return np.where(curr.get('obv', np.zeros(n)) > prev.get('obv', np.zeros(n)), 100.0, 30.0)
     return np.full(n, 50.0)
 
-def evaluate_strategy_vectorized(ticker: str, curr: Dict[str, Any], p: ScoringParams) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def evaluate_strategy_vectorized(ticker: str, curr: Dict[str, Any], p: ScoringParams, score_cache: Dict = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     # [최적화] 이미 넘파이 배열인 경우 변환 생략 (메모리 복사 방지)
     curr = {k: np.asanyarray(v, dtype=np.int64 if k == 'timestamp' else np.float32) for k, v in curr.items()}
     n = len(curr['close'])
+    
+    # [Parity] prev는 지표 점수 캐시가 있더라도 보너스/패널티 계산(CVD up 등)을 위해 항상 필요합니다.
     prev = {k: np.roll(v, 1) for k, v in curr.items()}
     for k in prev:
-        if len(prev[k]) > 1:
-            prev[k][0] = prev[k][1]
+        if len(prev[k]) > 0: prev[k][0] = prev[k][1]
+    
     closes = curr['close']
     atrs = np.maximum(1e-9, curr.get('atr', curr.get('ATR', np.zeros(n))))
     v_idx = (atrs / np.maximum(1e-9, closes)) * 100
     is_meme = any(m in ticker for m in ["DOGE", "SHIB", "PEPE"])
     tiers = np.where(v_idx > 3.5, "Small", np.where(v_idx > 1.5, "Mid", "Major"))
     
+    # [최적화] 반복적인 딕셔너리 조회를 피하기 위해 미리 추출
+    rsi_v = curr.get('rsi', np.full(n, 50.0))
+    macd_h_v = curr.get('macd_h', np.zeros(n))
+    ema20_v = curr.get('ema20', np.zeros(n))
+    ema60_v = curr.get('ema60', np.zeros(n))
+    cvd_v = curr.get('cvd', np.zeros(n))
+    bb_u_v = curr.get('bb_u', np.zeros(n))
+    bb_bw_v = curr.get('bb_bw', np.ones(n))
+
     fatal_base = np.zeros(n, dtype=bool)
     vol, vol_sma = curr['volume'], np.maximum(1e-9, curr.get('vol_sma', np.zeros(n)))
     v_thr_v = np.where(tiers=="Major", p.vol_multiple_major, np.where(tiers=="Mid", p.vol_multiple_mid, p.vol_multiple_small))
@@ -564,57 +580,75 @@ def evaluate_strategy_vectorized(ticker: str, curr: Dict[str, Any], p: ScoringPa
 
     def calc_mode_score(mode):
         indicators = ['z_score', 'macd', 'rsi', 'volume', 'supertrend', 'bollinger', 'vwap', 'ssl_channel', 'sma_crossover', 'ichimoku', 'obv', 'stochastics', 'bollinger_breakout']
-        weights = {'z_score': p.w_zscore, 'macd': p.w_macd, 'rsi': p.w_rsi, 'volume': p.w_volume, 'supertrend': p.w_st, 'bollinger': p.w_bb, 'vwap': p.w_vwap, 'ssl_channel': p.w_ssl, 'sma_crossover': p.w_sma, 'ichimoku': p.w_ichimoku, 'obv': p.w_obv, 'stochastics': p.w_stoch, 'bollinger_breakout': p.w_bb_break}
+        weights_dict = {'z_score': p.w_zscore, 'macd': p.w_macd, 'rsi': p.w_rsi, 'volume': p.w_volume, 'supertrend': p.w_st, 'bollinger': p.w_bb, 'vwap': p.w_vwap, 'ssl_channel': p.w_ssl, 'sma_crossover': p.w_sma, 'ichimoku': p.w_ichimoku, 'obv': p.w_obv, 'stochastics': p.w_stoch, 'bollinger_breakout': p.w_bb_break}
         f_mult = p.foundation_mult_q if mode == "QUANTUM" else p.foundation_mult_c
         v_mult = np.where(tiers == "Major", p.vas_mult_major, p.vas_mult_mid)
         
-        earned, total_w = np.zeros(n), np.full(n, 1e-9)
-        for name in indicators:
-            w = weights.get(name, 1.0)
-            if name in ['supertrend', 'stochastics']:
-                w = np.where((tiers != "Major") & (tiers != "Mid"), w * 1.5, w)
-            s = get_strategy_score_vec(name, prev, curr, mode=mode) * v_mult
-            if name == 'rsi':
-                s = np.where(curr.get('rsi', 50) > p.rsi_high_thr, s * p.rsi_overbought_mult, s)
-            if name == 'macd':
-                s = np.where(curr.get('macd_h', 0) <= 0, s * p.macd_negative_mult, s)
-            if (tiers == "Major").any():
-                s = np.where((tiers == "Major") & ((closes < curr.get('ema60',0)) | (curr.get('rsi',50) < 50)), s * p.major_weak_mult, s)
-            earned += (s * w)
-            total_w += w
+        m_cache = score_cache.get(mode, {}) if score_cache else {}
         
-        avg_s = earned / total_w
+        # [속도 향상] 루프를 돌며 각 지표 배열을 리스트에 모은 뒤 한 번에 연산
+        all_s = []
+        all_w = []
+        
+        major_mask = (tiers == "Major")
+        alt_mask = (tiers != "Major") & (tiers != "Mid")
+        
+        for name in indicators:
+            w = np.full(n, weights_dict.get(name, 1.0))
+            if name in ['supertrend', 'stochastics']:
+                w = np.where(alt_mask, w * 1.5, w)
+            
+            if name in m_cache:
+                s = m_cache[name] * v_mult
+            else:
+                s = get_strategy_score_vec(name, prev, curr, mode=mode) * v_mult
+            
+            # 파라미터 종속적 보정 (Vectorized)
+            if name == 'rsi':
+                s = np.where(rsi_v > p.rsi_high_thr, s * p.rsi_overbought_mult, s)
+            elif name == 'macd':
+                s = np.where(macd_h_v <= 0, s * p.macd_negative_mult, s)
+            
+            if major_mask.any():
+                s = np.where(major_mask & ((closes < ema60_v) | (rsi_v < 50)), s * p.major_weak_mult, s)
+            
+            all_s.append(s)
+            all_w.append(w)
+        
+        # [속도 향상] 리스트를 넘파이 행렬로 변환하여 벡터화된 가중 합계 계산
+        S = np.array(all_s)
+        W = np.array(all_w)
+        earned = np.sum(S * W, axis=0)
+        total_w = np.sum(W, axis=0)
+        
+        avg_s = earned / np.maximum(1e-9, total_w)
         f_score = avg_s * np.where(avg_s >= 85.0, f_mult * (1.0 + p.sniper_boost), f_mult)
-        if (tiers != "Major").any():
-            f_score = np.where((tiers != "Major") & (tiers != "Mid"), f_score * p.alt_accel_mult, f_score)
+        if alt_mask.any():
+            f_score = np.where(alt_mask, f_score * p.alt_accel_mult, f_score)
         
         bonus = np.zeros(n)
-        cvd_up = curr.get('cvd', 0) > prev.get('cvd', 0)
-        rsi_live = curr.get('rsi', 50)
+        cvd_up = cvd_v > prev.get('cvd', cvd_v)
         if mode == "QUANTUM":
-            bb_u = curr.get('bb_u', 0)
-            bonus = np.where((closes >= bb_u) & (bb_u > 0), bonus + p.bb_breakout_bonus, bonus)
-            s20, s60 = curr.get('ema20',0), curr.get('ema60',0)
-            bonus = np.where((s20>s60)&(closes>s20), bonus + p.sma_align_bonus, bonus)
-            # [ADD] Squeeze Bonus (Vectorized)
-            bb_bw = curr.get('bb_bw', np.ones(n))
-            bonus = np.where((bb_bw > 0) & (bb_bw < p.bb_bw_limit), 
+            bonus = np.where((closes >= bb_u_v) & (bb_u_v > 0), bonus + p.bb_breakout_bonus, bonus)
+            bonus = np.where((ema20_v > ema60_v) & (closes > ema20_v), bonus + p.sma_align_bonus, bonus)
+            bonus = np.where((bb_bw_v > 0) & (bb_bw_v < p.bb_bw_limit), 
                              bonus + np.where(tiers == "Major", p.squeeze_bonus_maj, p.squeeze_bonus_alt), bonus)
         else:
-            bonus = np.where(rsi_live < 35, bonus + p.rsi_oversold_bonus, bonus)
+            bonus = np.where(rsi_v < 35, bonus + p.rsi_oversold_bonus, bonus)
             bonus = np.where(cvd_up, bonus + p.cvd_bonus, bonus)
-            slv = curr.get('ema60', 0)
+            slv = ema60_v
             gap = np.where(slv>0, ((closes-slv)/slv)*100, 0)
             bonus = np.where((slv>0) & (gap < -7.0), bonus + p.sma_gap_bonus, bonus)
             # [ADD] Divergence Penalty (Vectorized)
-            p_rsi = prev.get('rsi', rsi_live)
+            p_rsi = prev.get('rsi', rsi_v)
             p_closes = prev.get('close', closes)
-            bonus = np.where((rsi_live < p_rsi) & (closes > p_closes), bonus - p.divergence_penalty, bonus)
+            bonus = np.where((rsi_v < p_rsi) & (closes > p_closes), bonus - p.divergence_penalty, bonus)
             # [ADD] CVD Slope Penalty (Vectorized)
-            bonus = np.where(curr.get('cvd', 0) < prev.get('cvd', 0), bonus - p.cvd_slope_penalty_c, bonus)
+            bonus = np.where(cvd_v < prev.get('cvd', cvd_v), bonus - p.cvd_slope_penalty_c, bonus)
         
         # [ADD] Wick Penalty (Vectorized)
-        up_shadow = (curr.get('high', closes) - np.maximum(closes, curr.get('open', closes))) / np.maximum(1e-9, closes) * 100
+        highs, opens = curr.get('high', closes), curr.get('open', closes)
+        up_shadow = (highs - np.maximum(closes, opens)) / np.maximum(1e-9, closes) * 100
         wick_r = np.where(tiers=="Major", p.wick_ratio_major, p.wick_ratio_meme)
         bonus = np.where(up_shadow > wick_r, bonus - p.wick_penalty, bonus)
         
@@ -626,13 +660,13 @@ def evaluate_strategy_vectorized(ticker: str, curr: Dict[str, Any], p: ScoringPa
         total = np.where(mtf_v == 1, total + p.mtf_bonus_q, np.where(mtf_v == -1, total - p.mtf_penalty_q, total))
         
         # [ADD] Sniper Confluence Bonus (Vectorized)
-        sniper_c = (curr.get('rsi', 50) < 30) & (curr.get('macd_h', 0) > 0)
+        sniper_c = (rsi_v < 30) & (macd_h_v > 0)
         total = np.where(sniper_c, total + p.sniper_confluence_bonus, total)
 
         if mode == "QUANTUM":
-            total = np.where(curr.get('cvd', 0) < 0, total - p.cvd_penalty_q, total)
+            total = np.where(cvd_v < 0, total - p.cvd_penalty_q, total)
         else:
-            total = np.where(curr.get('cvd', 0) < 0, total - p.cvd_penalty_c, total)
+            total = np.where(cvd_v < 0, total - p.cvd_penalty_c, total)
         
         m_fatal = fatal_base.copy()
         mtf = curr.get('1h_trend', np.zeros(n))

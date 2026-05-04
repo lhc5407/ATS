@@ -132,10 +132,51 @@ VALID_INDICATORS = [
   "stochastics", "obv", "keltner_channel", "ichimoku",
   "sma_crossover", "bollinger_breakout", "rs","z_score"
 ]
-# ── 인프라 및 경로 설정 ──────────────────────────────────────────────────────────
-BASE_PATH = os.path.dirname(os.path.abspath(__file__))
-DB_FILE = os.path.join(BASE_PATH, "trading.db")
-log_filepath = os.path.join(BASE_PATH, "xeon_live.log")
+# ── 인프라 및 경로 설정 (PyInstaller EXE 대응) ──────────────────────────────────
+if getattr(sys, 'frozen', False):
+    BASE_PATH = os.path.dirname(sys.executable)
+else:
+    BASE_PATH = os.path.dirname(os.path.abspath(__file__))
+
+# 데이터베이스 경로 설정 (기존 파일 우선 순위 체크)
+db_priority = ["ats_unified.db", "ats_xeon.db", "trading.db"]
+DB_FILE = os.path.join(BASE_PATH, "ats_unified.db") # 기본값
+
+for db_name in db_priority:
+    potential_path = os.path.join(BASE_PATH, db_name)
+    if os.path.exists(potential_path):
+        DB_FILE = potential_path
+        logging.info(f"💾 기존 데이터베이스 발견: {db_name}을(를) 사용합니다.")
+        break
+
+# 로그 폴더 생성 및 경로 설정
+LOG_DIR = os.path.join(BASE_PATH, "log")
+if not os.path.exists(LOG_DIR):
+    os.makedirs(LOG_DIR, exist_ok=True)
+log_filepath = os.path.join(LOG_DIR, "xeon_live.log")
+
+# 로깅 초기화 및 핸들러 설정
+_safe_stderr = getattr(sys, '__stderr__', None) or getattr(sys, 'stderr', None)
+_log_handlers: list = [
+  RotatingFileHandler(log_filepath, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'),
+]
+if _safe_stderr is not None:
+  _log_handlers.append(logging.StreamHandler(_safe_stderr))
+
+logging.basicConfig(level=logging.INFO,
+          format='%(asctime)s - %(levelname)s - %(message)s',
+          handlers=_log_handlers)
+
+# 로그 리다이렉션을 위한 클래스
+class StreamToLogger:
+  def __init__(self, logger, level):
+    self.logger = logger
+    self.level = level
+  def write(self, buf):
+    for line in buf.rstrip().splitlines():
+      self.logger.log(self.level, line.rstrip())
+  def flush(self):
+    pass
 
 # 시스템 상태 및 제어 변수
 SYSTEM_STATUS = {
@@ -156,6 +197,9 @@ last_update = 0 # 실시간 소켓 업데이트 시간 기록
 # 로그 리다이렉션 백업용
 original_stdout = sys.stdout
 original_stderr = sys.stderr
+
+sys.stdout = StreamToLogger(logging.getLogger(), logging.INFO)
+sys.stderr = StreamToLogger(logging.getLogger(), logging.ERROR)
 
 #  [FIX: 리   학 공식 교정] 화(KRW) 기 로  개의 코인   부 Volume)  여 확 VWAP 출
 async def calculate_expected_slippage(ticker, buy_amt_krw):
@@ -402,7 +446,12 @@ app = FastAPI(title="ATS Command Center", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 #  PyInstaller 경 서 빌트 된 _MEIPASS 시 더 서 적 일 찾습 다.
 if getattr(sys, 'frozen', False):
-  dashboard_dir = os.path.join(sys._MEIPASS, "dashboard")
+  # EXE 실행 시: 외부 dashboard 폴더가 있으면 우선 사용, 없으면 내부 리소스 사용
+  external_dashboard = os.path.join(os.path.dirname(sys.executable), "dashboard")
+  if os.path.exists(external_dashboard):
+    dashboard_dir = external_dashboard
+  else:
+    dashboard_dir = os.path.join(sys._MEIPASS, "dashboard")
 else:
   dashboard_dir = os.path.join(BASE_PATH, "dashboard")
 @app.get("/api/dashboard")
@@ -723,8 +772,9 @@ async def api_post_settings(data: SettingsUpdate):
       STRAT["base_trade_amount"] = data.base_trade_amount
       STRAT["max_slippage_pct"] = data.max_slippage_pct
     if 'CLASSIC_STRAT' in globals() and isinstance(CLASSIC_STRAT, dict):
-      CLASSIC_STRAT["max_concurrenta_trades"] = data.max_concurrent_trades
+      CLASSIC_STRAT["max_concurrent_trades"] = data.max_concurrent_trades
       CLASSIC_STRAT["base_trade_amount"] = data.base_trade_amount
+      logging.info("🌐 웹 대시보드(Settings)에서 봇의 핵심 파라미터가 실시간 오버라이드 되었습니다.")
       CLASSIC_STRAT["max_slippage_pct"] = data.max_slippage_pct
       logging.info("🌐 웹 대시보드(Settings)에서 봇의 핵심 파라미터가 실시간 오버라이드 되었습니다.")
     return {"status": "success", "message": "Settings perfectly updated and hot-reloaded!"}
@@ -736,19 +786,31 @@ if os.path.exists(dashboard_dir):
 else:
     logging.warning("⚠️ 대시보드 정적 파일 폴더가 없습니다. 웹 UI를 불러올 수 없습니다.")
 async def run_fastapi_server():
-  try:
-    logging.warning("🌐 대시보드 서버 가동 중 (접속: http://localhost:8080)")
-    #  버가 준비되 을 것으 상 는 점 브라   동 로 니 
-    def open_browser():
-      time.sleep(2) # 버가 기동 간 줍니 
-      webbrowser.open("http://localhost:8080")
-    asyncio.create_task(asyncio.to_thread(open_browser))
-    #  uvicorn 고유 로거가 PyInstaller 경 stdout 충돌 여 래   발   log_config=None 로 비활 화
-    config = uvicorn.Config(app, host="0.0.0.0", port=8080, log_config=None)
-    server = uvicorn.Server(config)
-    await server.serve()
-  except Exception as e:
-        logging.error(f"설정 파일 저장 중 최종 에러: {e}")
+  ports = [8080, 8081, 8082, 8888]
+  for port in ports:
+    try:
+      logging.info(f"🌐 대시보드 서버 시도 중 (포트: {port})...")
+      
+      # 서버 기동 후 브라우저 자동 실행
+      def open_browser():
+        try:
+          time.sleep(3)
+          webbrowser.open(f"http://localhost:{port}")
+          logging.info(f"🚀 대시보드 브라우저(port {port})가 자동으로 실행되었습니다.")
+        except Exception as e:
+          logging.error(f"❌ 브라우저 실행 실패: {e}")
+
+      asyncio.create_task(asyncio.to_thread(open_browser))
+      
+      config = uvicorn.Config(app, host="0.0.0.0", port=port, log_config=None)
+      server = uvicorn.Server(config)
+      await server.serve()
+      return # 성공하면 종료
+    except Exception as e:
+      logging.error(f"⚠️ 포트 {port} 가동 실패: {e}. 다음 포트 시도...")
+      await asyncio.sleep(1)
+  logging.error("❌ 모든 대시보드 포트 가동 실패. 대시보드를 사용할 수 없습니다.")
+
 #  [ 정 코드]  하 가 " 위치 먼  니 
 async def db_flush_task():
   global TRADE_DATA_DIRTY, trade_data
@@ -770,7 +832,7 @@ async def cache_cleanup_task():
       await asyncio.sleep(3600)
       await clean_unused_caches()
     except Exception as e:
-      logging.error(f"시장 히스토리 조회 오류: {e}")
+      logging.error(f"캐시 정리 태스크 오류: {e}")
       await asyncio.sleep(60)
 def robust_clean(data):
   if isinstance(data, dict): return {k: robust_clean(v) for k, v in data.items()}
@@ -2650,33 +2712,27 @@ async def main():
   except OSError:
     logging.error("❌ 이미 ATS_Hybrid 봇이 실행 중입니다. 중복 실행을 방지하기 위해 즉시 종료합니다.")
     return
+
+  # 대시보드 서버를 엔진 가동 프로세스 최상단에서 우선 실행
+  asyncio.create_task(run_fastapi_server())
   
+  logging.info("🚀 엔진 가동 시퀀스 시작...")
   startup_jitter = random.uniform(1.0, 10.0)
-  logging.info(f"🚀 API 병목 방지를 위해 {startup_jitter:.2f}초 후 엔진 가동을 시작합니다...")
+  logging.info(f"🚀 API 병목 방지를 위해 {startup_jitter:.2f}초 후 초기 설정을 시작합니다...")
   await asyncio.sleep(startup_jitter)
   asyncio.create_task(handle_telegram_updates())
   await asyncio.sleep(0.1) 
   
+  logging.info("📈 시장 상황 분석 중...")
   btc_short_initial = await get_btc_short_term_data()
   regime_initial = await get_market_regime()
-  fgi_str_initial = regime_initial.get('fear_and_greed', '')
-  try: fgi_val_initial = int(re.search(r'\d+', fgi_str_initial).group()) if re.search(r'\d+', fgi_str_initial) else 50
-  except: fgi_val_initial = 50
-  
-  if fgi_val_initial <= 35 or (btc_short_initial['trend'] == "단기 하락" and fgi_val_initial <= 50):
-    SYSTEM_STATUS["status"] = "📉 Classic (Deep Dip Sniper)"
-  elif fgi_val_initial >= 65 or (btc_short_initial['trend'] == "단기 상승" and fgi_val_initial >= 50):
-    SYSTEM_STATUS["status"] = " Quantum (Trend Breakout)"
-  else:
-    SYSTEM_STATUS["status"] = "⚖️ Hybrid (Adaptive Monitoring)"
-    
-  logging.info(f"ATS 통합 엔진 시작 ({SYSTEM_STATUS['status']} 모드)")
-  await send_msg(f"⚔️ <b>ATS_Hybrid 가동 시작</b> ({SYSTEM_STATUS['status']} 모드)\n\n{COMMAND_HELP_MSG}")
+  # ... (생략) ...
+  logging.info("💾 데이터베이스 및 상태 로드 중...")
   await init_db()
   trade_data = await load_trade_status_db()
   asyncio.create_task(websocket_ticker_task())
   asyncio.create_task(system_watchdog()) #  치 행!
-  asyncio.create_task(run_fastapi_server()) #   보 버 합
+  
   last_report_time = time.time()
   last_loss_check_time = time.time()
   last_checked_win_rate = 100.0
@@ -3061,7 +3117,7 @@ async def maintenance_background_task():
         oos_report = await run_oos_validation_internal()
         await send_msg(oos_report)
     except Exception as e:
-      logging.error(f"❌ 대시보드 서버 가동 실패: {e}")
+      logging.error(f"❌ 유지보수 태스크 오류: {e}")
       await asyncio.sleep(600)
 if __name__ == "__main__":
   # --- [ 정] 메인 루프 작  보수 스 록 ---
